@@ -135,6 +135,19 @@ public class ConvexDriver extends Driver {
 			SchemaPlus rootSchema = calciteConn.getRootSchema();
 			rootSchema.add(parsed.database, schema);
 			calciteConn.setSchema(parsed.database);
+
+			// Also mount every other currently-registered database as a
+			// sibling, so a qualified reference like "otherdb.table" resolves
+			// regardless of which database this connection is scoped to —
+			// not just the one hardcoded sibling a caller (e.g. PgServer)
+			// might otherwise mount by hand. Each gets its own registered
+			// ConvexDB instance (not necessarily this connection's cdb).
+			for (String otherName : ConvexDB.getRegisteredNames()) {
+				if (otherName.equals(parsed.database)) continue;
+				ConvexDB otherCdb = ConvexDB.lookup(otherName);
+				if (otherCdb == null) continue;
+				rootSchema.add(otherName, new ConvexSchema(otherCdb.database(otherName), otherName));
+			}
 		}
 
 		return conn;

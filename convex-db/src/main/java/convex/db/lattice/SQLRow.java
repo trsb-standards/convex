@@ -1,11 +1,15 @@
 package convex.db.lattice;
 
+import java.io.IOException;
+
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
+import convex.core.data.AString;
 import convex.core.data.AVector;
 import convex.core.data.Blob;
 import convex.core.data.CAD3Encoder;
 import convex.core.data.Cells;
+import convex.core.data.Strings;
 import convex.core.data.Vectors;
 import convex.core.data.prim.CVMLong;
 import convex.core.exceptions.BadFormatException;
@@ -79,24 +83,188 @@ public class SQLRow {
 	// ── Values codec (v3) ──────────────────────────────────────────────────
 
 	/**
-	 * Encodes column values to a compact Blob using standard CAD3 format.
-	 * For a 4-column row the Blob is typically 30–50 bytes vs ~160 bytes for
-	 * the equivalent AVector + child cells.
+	 * Marks the flat per-cell values encoding (see {@link #encodeFlat}), as
+	 * opposed to the legacy {@code Cells.encode(AVector)} format (v3, whose
+	 * first byte is always {@code Tag.VECTOR} = {@code 0x80}). Chosen to be
+	 * unambiguous with any real CAD3 tag.
+	 */
+	static final byte FLAT_MARKER = (byte) 0xFF;
+
+	/**
+	 * Encodes column values to a compact Blob.
+	 *
+	 * <p>If {@link BlobCAS#instance()} is active, any ABlob or AString cell
+	 * exceeding {@link BlobCAS#THRESHOLD} bytes is stored in the CAS and
+	 * replaced with a compact 35-byte CAS reference before encoding.
+	 *
+	 * <p>The result uses the flat per-cell layout (see {@link #encodeFlat}),
+	 * not a plain {@code Cells.encode(AVector)} — Convex vectors only embed
+	 * their last 16 elements directly; anything beyond that lives behind an
+	 * out-of-line "prefix" Ref once its own encoding exceeds the inline size
+	 * limit, which real tables with more than ~16 columns hit routinely,
+	 * independent of any single column's size. Since that Ref's target was
+	 * never persisted to a store (this encoding is a pure in-memory byte
+	 * computation), it can never be resolved later — a structural decode
+	 * failure, not something BlobCAS-style externalization or store access
+	 * at decode time could fix. The flat layout sidesteps this entirely by
+	 * encoding each cell independently, so no cross-cell Ref is ever produced.
 	 */
 	static Blob encodeValues(AVector<ACell> values) {
-		return Cells.encode(values);
+		BlobCAS cas = BlobCAS.instance();
+		if (cas != null) values = substituteLargeBlobs(values, cas);
+		return encodeFlat(values);
 	}
 
 	/**
-	 * Decodes column values from a compact Blob (v3 format).
+	 * Decodes column values from a compact Blob. Dispatches on the leading
+	 * byte: {@link #FLAT_MARKER} for the current flat per-cell format, or
+	 * anything else (i.e. {@code Tag.VECTOR}) for legacy {@code Cells.encode(AVector)}
+	 * data written before this format existed.
+	 *
+	 * <p>If {@link BlobCAS#instance()} is active, any CAS reference cells in
+	 * the decoded vector are resolved back to their original blob/string.
 	 */
 	@SuppressWarnings("unchecked")
 	static AVector<ACell> decodeValues(Blob blob) {
 		try {
-			return (AVector<ACell>) CAD3Encoder.INSTANCE.decode(blob);
+			AVector<ACell> values = (blob.count() > 0 && blob.byteAt(0) == FLAT_MARKER)
+					? decodeFlat(blob)
+					: (AVector<ACell>) CAD3Encoder.INSTANCE.decode(blob); // legacy v3
+			BlobCAS cas = BlobCAS.instance();
+			if (cas != null) values = resolveCasRefs(values, cas);
+			return values;
 		} catch (BadFormatException e) {
 			throw new IllegalStateException("Compact row decode failed", e);
 		}
+	}
+
+	/**
+	 * Encodes each cell independently — {@code [FLAT_MARKER][4-byte count]
+	 * {4-byte length + CAD3 bytes}*count}. After {@link #substituteLargeBlobs},
+	 * every remaining cell's own CAD3 encoding is small (SQL column types are
+	 * flat scalars/CAS-refs, never large nested structures), so each one is
+	 * guaranteed to decode standalone with the storeless encoder — no Ref
+	 * spanning multiple cells (like a vector's chunking prefix) is ever created.
+	 */
+	private static Blob encodeFlat(AVector<ACell> values) {
+		int n = (int) values.count();
+		Blob[] cellBytes = new Blob[n];
+		int total = 1 + 4;
+		for (int i = 0; i < n; i++) {
+			Blob b = Cells.encode(values.get(i));
+			cellBytes[i] = b;
+			total += 4 + (int) b.count();
+		}
+		byte[] out = new byte[total];
+		int pos = 0;
+		out[pos++] = FLAT_MARKER;
+		pos = writeInt(out, pos, n);
+		for (Blob b : cellBytes) {
+			pos = writeInt(out, pos, (int) b.count());
+			byte[] bytes = b.getBytes();
+			System.arraycopy(bytes, 0, out, pos, bytes.length);
+			pos += bytes.length;
+		}
+		return Blob.wrap(out);
+	}
+
+	/** Decodes the flat per-cell layout produced by {@link #encodeFlat}. */
+	private static AVector<ACell> decodeFlat(Blob blob) throws BadFormatException {
+		byte[] data = blob.getBytes();
+		int pos = 1; // skip marker
+		int n = readInt(data, pos);
+		pos += 4;
+		ACell[] cells = new ACell[n];
+		for (int i = 0; i < n; i++) {
+			int len = readInt(data, pos);
+			pos += 4;
+			cells[i] = CAD3Encoder.INSTANCE.decode(Blob.wrap(data, pos, len));
+			pos += len;
+		}
+		return Vectors.create(cells);
+	}
+
+	private static int writeInt(byte[] arr, int pos, int value) {
+		arr[pos]     = (byte) ((value >>> 24) & 0xFF);
+		arr[pos + 1] = (byte) ((value >>> 16) & 0xFF);
+		arr[pos + 2] = (byte) ((value >>> 8) & 0xFF);
+		arr[pos + 3] = (byte) (value & 0xFF);
+		return pos + 4;
+	}
+
+	private static int readInt(byte[] arr, int pos) {
+		return ((arr[pos] & 0xFF) << 24) | ((arr[pos + 1] & 0xFF) << 16)
+				| ((arr[pos + 2] & 0xFF) << 8) | (arr[pos + 3] & 0xFF);
+	}
+
+	/**
+	 * Replaces ABlob/AString cells above the CAS threshold with compact CAS
+	 * reference blobs. The reference is tagged so {@link #resolveCasRefs}
+	 * can reconstruct the correct CVM type.
+	 */
+	private static AVector<ACell> substituteLargeBlobs(AVector<ACell> values, BlobCAS cas) {
+		int n = (int) values.count();
+		ACell[] cells = null; // allocated lazily only if we actually substitute
+		for (int i = 0; i < n; i++) {
+			ACell cell = values.get(i);
+			if (cell instanceof ABlob blob && blob.count() > BlobCAS.THRESHOLD) {
+				if (cells == null) {
+					cells = new ACell[n];
+					for (int j = 0; j < i; j++) cells[j] = values.get(j);
+				}
+				try {
+					cells[i] = cas.storeAndRef(blob.getBytes());
+				} catch (IOException e) {
+					cells[i] = cell; // fall back to inline on CAS write error
+				}
+			} else if (cell instanceof AString str && str.count() > BlobCAS.THRESHOLD) {
+				if (cells == null) {
+					cells = new ACell[n];
+					for (int j = 0; j < i; j++) cells[j] = values.get(j);
+				}
+				try {
+					cells[i] = cas.storeAndRefForString(str.getBytes());
+				} catch (IOException e) {
+					cells[i] = cell; // fall back to inline on CAS write error
+				}
+			} else if (cells != null) {
+				cells[i] = cell;
+			}
+		}
+		return (cells != null) ? Vectors.of(cells) : values;
+	}
+
+	/** Resolves CAS reference blobs back to their original ABlob bytes or AString. */
+	private static AVector<ACell> resolveCasRefs(AVector<ACell> values, BlobCAS cas) {
+		int n = (int) values.count();
+		ACell[] cells = null; // allocated lazily
+		for (int i = 0; i < n; i++) {
+			ACell cell = values.get(i);
+			if (cell instanceof Blob ref && BlobCAS.isBlobRef(ref)) {
+				if (cells == null) {
+					cells = new ACell[n];
+					for (int j = 0; j < i; j++) cells[j] = values.get(j);
+				}
+				try {
+					cells[i] = Blob.wrap(cas.retrieve(ref));
+				} catch (IOException e) {
+					cells[i] = cell; // return CAS ref as-is on retrieval error
+				}
+			} else if (cell instanceof Blob ref && BlobCAS.isStringRef(ref)) {
+				if (cells == null) {
+					cells = new ACell[n];
+					for (int j = 0; j < i; j++) cells[j] = values.get(j);
+				}
+				try {
+					cells[i] = Strings.create(Blob.wrap(cas.retrieve(ref)));
+				} catch (IOException e) {
+					cells[i] = cell; // return CAS ref as-is on retrieval error
+				}
+			} else if (cells != null) {
+				cells[i] = cell;
+			}
+		}
+		return (cells != null) ? Vectors.of(cells) : values;
 	}
 
 	// ── Factory methods ────────────────────────────────────────────────────

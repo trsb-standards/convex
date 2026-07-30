@@ -156,6 +156,43 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		throw new IllegalArgumentException("Unsupported primary key type: " + key.getClass().getSimpleName());
 	}
 
+	/**
+	 * Converts the first {@code pkCount} columns of a row into a single composite
+	 * key blob by concatenating their individual byte encodings.
+	 *
+	 * <p>Each component is encoded as: [4-byte big-endian length][raw bytes].
+	 * This is unambiguous for all component types and lengths.
+	 *
+	 * <p>Falls back to {@link #toKey(ACell)} when pkCount == 1.
+	 *
+	 * @param row     Full row values (PK columns must be first)
+	 * @param pkCount Number of leading columns that form the key
+	 * @return Composite ABlob key
+	 */
+	protected ABlob toCompositeKey(AVector<ACell> row, int pkCount) {
+		if (pkCount == 1) return toKey(row.get(0));
+		// Collect byte encodings of each PK component
+		byte[][] parts = new byte[pkCount][];
+		int totalSize = 0;
+		for (int i = 0; i < pkCount; i++) {
+			parts[i] = toKey(row.get(i)).getBytes();
+			totalSize += 4 + parts[i].length;
+		}
+		// Concatenate with 4-byte big-endian length prefix per component
+		byte[] result = new byte[totalSize];
+		int pos = 0;
+		for (byte[] part : parts) {
+			int len = part.length;
+			result[pos++] = (byte) ((len >> 24) & 0xFF);
+			result[pos++] = (byte) ((len >> 16) & 0xFF);
+			result[pos++] = (byte) ((len >>  8) & 0xFF);
+			result[pos++] = (byte) (len & 0xFF);
+			System.arraycopy(part, 0, result, pos, len);
+			pos += len;
+		}
+		return Blob.wrap(result);
+	}
+
 	// ========== Table Operations ==========
 
 	/**
@@ -168,12 +205,22 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 
 	/** Creates a new table with explicitly typed columns (no precision/scale). */
 	public boolean createTable(String name, String[] columns, ConvexType[] types) {
-		return createTable(Strings.create(name), columns, types);
+		return createTable(Strings.create(name), columns, types, 1);
+	}
+
+	/** Creates a new table with explicitly typed columns and a composite PK spanning pkCount leading columns. */
+	public boolean createTable(String name, String[] columns, ConvexType[] types, int pkCount) {
+		return createTable(Strings.create(name), columns, types, pkCount);
 	}
 
 	/** Creates a new table with fully typed columns (including precision/scale). */
 	public boolean createTable(String name, String[] columns, ConvexColumnType[] types) {
-		return createTable(Strings.create(name), columns, types);
+		return createTable(Strings.create(name), columns, types, 1);
+	}
+
+	/** Creates a new table with fully typed columns and a composite PK spanning pkCount leading columns. */
+	public boolean createTable(String name, String[] columns, ConvexColumnType[] types, int pkCount) {
+		return createTable(Strings.create(name), columns, types, pkCount);
 	}
 
 	public boolean createTable(AString name, String[] columns) {
@@ -185,15 +232,23 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	}
 
 	public boolean createTable(AString name, String[] columns, ConvexType[] types) {
+		return createTable(name, columns, types, 1);
+	}
+
+	public boolean createTable(AString name, String[] columns, ConvexType[] types, int pkCount) {
 		ConvexColumnType[] columnTypes = new ConvexColumnType[types.length];
 		for (int i = 0; i < types.length; i++) {
 			columnTypes[i] = ConvexColumnType.of(types[i]);
 		}
-		return createTable(name, columns, columnTypes);
+		return createTable(name, columns, columnTypes, pkCount);
+	}
+
+	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types) {
+		return createTable(name, columns, types, 1);
 	}
 
 	@SuppressWarnings({"unchecked", "rawtypes"})
-	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types) {
+	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types, int pkCount) {
 		if (columns.length != types.length) {
 			throw new IllegalArgumentException("Columns and types must have same length");
 		}
@@ -212,19 +267,34 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (existing == null) {
 			// Table does not exist yet: create fresh
 			ALatticeCursor<AVector<ACell>> tableCursor = cursor.path(name);
-			tableCursor.set(SQLTable.createState((AVector<AVector<ACell>>) newSchema, now()));
+			tableCursor.set(SQLTable.createState((AVector<AVector<ACell>>) newSchema, now(), pkCount));
 			return true;
 		}
 
-		// Table already exists: append any new columns not present in stored schema
+		// Table already exists: append any new columns not present in stored
+		// schema. Matched by NAME, not by position/count — a naive "append
+		// everything past the existing count" would corrupt the schema (e.g.
+		// duplicate a column) if a new column is inserted in the middle of
+		// the desired column list rather than strictly appended at the end.
 		AVector<AVector<ACell>> existingSchema = existing.getSchema();
 		long existingCount = existingSchema != null ? existingSchema.count() : 0;
-		if (newSchema.count() <= existingCount) return false; // no new columns to add
+
+		java.util.Set<String> existingNames = new java.util.HashSet<>();
+		for (long i = 0; i < existingCount; i++) {
+			existingNames.add(existingSchema.get(i).get(0).toString());
+		}
 
 		AVector combinedSchema = existingSchema;
-		for (long i = existingCount; i < newSchema.count(); i++) {
-			combinedSchema = combinedSchema.append(newSchema.get(i));
+		boolean anyNew = false;
+		for (long i = 0; i < newSchema.count(); i++) {
+			AVector<ACell> col = (AVector<ACell>) newSchema.get(i);
+			if (!existingNames.contains(col.get(0).toString())) {
+				combinedSchema = combinedSchema.append(col);
+				anyNew = true;
+			}
 		}
+		if (!anyNew) return false; // no new columns to add
+
 		final AVector<AVector<ACell>> finalSchema = (AVector<AVector<ACell>>) combinedSchema;
 		ALatticeCursor<AVector<ACell>> tableCursor = cursor.path(name);
 		tableCursor.updateAndGet(state -> state.assoc(SQLTable.POS_SCHEMA, finalSchema));
@@ -340,7 +410,8 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	public boolean insert(AString tableName, AVector<ACell> row) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
-		ABlob pk = toKey(row.get(0));
+		int pkCount = SQLTable.getPkCount(table.getState());
+		ABlob pk = toCompositeKey(row, pkCount);
 		return table.insertRow(pk, row, now());
 	}
 
@@ -368,10 +439,11 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (rows == null || rows.isEmpty()) return 0;
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return 0;
+		int pkCount = SQLTable.getPkCount(table.getState());
 		CVMLong ts = now();
 		List<Map.Entry<ABlob, AVector<ACell>>> sorted = new ArrayList<>(rows.size());
 		for (AVector<ACell> row : rows) {
-			sorted.add(Map.entry(toKey(row.get(0)), row));
+			sorted.add(Map.entry(toCompositeKey(row, pkCount), row));
 		}
 		sorted.sort(Map.Entry.comparingByKey());
 		return table.insertRows(sorted, ts);
@@ -517,6 +589,24 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	}
 
 	/**
+	 * Finds all live rows whose {@code columnName} column equals {@code value}
+	 * using a secondary index (O(log n + k)) instead of a full table scan.
+	 *
+	 * @return matching rows as a list, or {@code null} if the table doesn't exist
+	 *         or has no index on {@code columnName} (caller should fall back to
+	 *         {@link #selectByColumn}/a scan in that case)
+	 */
+	public List<AVector<ACell>> selectByIndex(String tableName, String columnName, ACell value) {
+		return selectByIndex(Strings.create(tableName), Strings.create(columnName), value);
+	}
+
+	public List<AVector<ACell>> selectByIndex(AString tableName, AString columnName, ACell value) {
+		SQLTable table = getLiveTable(tableName);
+		if (table == null) return null;
+		return table.selectByIndex(columnName, value);
+	}
+
+	/**
 	 * Returns all live rows where the named column equals {@code value}.
 	 *
 	 * <p>If a secondary index exists on the column, uses the index to avoid a
@@ -542,24 +632,27 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (table == null) return Index.none();
 
 		// Try index-backed lookup first
-		Index<AString, Index<ABlob, ABlob>> allIndices =
+		Index<AString, Index<ABlob, AVector<ABlob>>> allIndices =
 			SQLTable.getIndicesFromState(table.getState());
 		if (allIndices != null) {
 			ACell rawColIdx = allIndices.get(columnName);
 			if (rawColIdx instanceof Index) {
-				Index<ABlob, ABlob> colIdx = (Index<ABlob, ABlob>) rawColIdx;
+				Index<ABlob, AVector<ABlob>> colIdx = (Index<ABlob, AVector<ABlob>>) rawColIdx;
 				Index<ABlob, AVector<ACell>>[] result = new Index[]{Index.none()};
-				colIdx.forEach((indexKey, pk) -> {
+				AVector<AVector<ACell>> schema = table.getSchema();
+				int ci = (schema != null)
+					? SQLTable.findColIdxInSchema(schema, columnName) : -1;
+				colIdx.forEach((indexKey, bucket) -> {
 					if (!ColumnIndex.matchesValue(indexKey, value)) return;
-					ABlob pkBlob = ColumnIndex.extractPk(indexKey);
-					AVector<ACell> row = table.selectByKeyBlob(pkBlob);
-					if (row == null) return; // tombstoned or missing
-					// Re-validate column value (guards against stale index entries)
-					AVector<AVector<ACell>> schema = table.getSchema();
-					int ci = (schema != null)
-						? SQLTable.findColIdxInSchema(schema, columnName) : -1;
-					if (ci >= 0 && ci < (int) row.count() && value.equals(row.get(ci))) {
-						result[0] = result[0].assoc(pkBlob, row);
+					for (long i = 0; i < bucket.count(); i++) {
+						ABlob pkBlob = bucket.get((int) i);
+						AVector<ACell> row = table.selectByKeyBlob(pkBlob);
+						if (row == null) continue; // tombstoned or missing
+						// Re-validate column value (guards against stale index entries
+						// and the residual chance of a pk-hash collision)
+						if (ci >= 0 && ci < (int) row.count() && value.equals(row.get(ci))) {
+							result[0] = result[0].assoc(pkBlob, row);
+						}
 					}
 				});
 				return result[0];
@@ -609,27 +702,29 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (table == null) return Index.none();
 
 		// Try index-backed lookup
-		Index<AString, Index<ABlob, ABlob>> allIndices =
+		Index<AString, Index<ABlob, AVector<ABlob>>> allIndices =
 			SQLTable.getIndicesFromState(table.getState());
 		if (allIndices != null) {
 			ACell rawColIdx = allIndices.get(columnName);
 			if (rawColIdx instanceof Index) {
-				Index<ABlob, ABlob> colIdx = (Index<ABlob, ABlob>) rawColIdx;
+				Index<ABlob, AVector<ABlob>> colIdx = (Index<ABlob, AVector<ABlob>>) rawColIdx;
 				Index<ABlob, AVector<ACell>>[] result = new Index[]{Index.none()};
 				AVector<AVector<ACell>> schema = table.getSchema();
 				int ci = (schema != null)
 					? SQLTable.findColIdxInSchema(schema, columnName) : -1;
-				colIdx.forEach((indexKey, pk) -> {
+				colIdx.forEach((indexKey, bucket) -> {
 					if (!ColumnIndex.matchesRange(indexKey, from, to)) return;
-					ABlob pkBlob = ColumnIndex.extractPk(indexKey);
-					AVector<ACell> row = table.selectByKeyBlob(pkBlob);
-					if (row == null) return;
-					// Re-validate (guards against stale index entries)
-					if (ci >= 0 && ci < (int) row.count()) {
-						ACell colVal = row.get(ci);
-						if (ColumnIndex.matchesRange(
-								ColumnIndex.indexKey(colVal, pkBlob), from, to)) {
-							result[0] = result[0].assoc(pkBlob, row);
+					for (long i = 0; i < bucket.count(); i++) {
+						ABlob pkBlob = bucket.get((int) i);
+						AVector<ACell> row = table.selectByKeyBlob(pkBlob);
+						if (row == null) continue;
+						// Re-validate (guards against stale index entries and pk-hash collisions)
+						if (ci >= 0 && ci < (int) row.count()) {
+							ACell colVal = row.get(ci);
+							if (ColumnIndex.matchesRange(
+									ColumnIndex.indexKey(colVal, pkBlob), from, to)) {
+								result[0] = result[0].assoc(pkBlob, row);
+							}
 						}
 					}
 				});

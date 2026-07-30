@@ -451,13 +451,20 @@ public class LatticePropagator implements Closeable {
 			long currentTime = Utils.getCurrentTimestamp();
 			if (!connectionManager.getPeers().isEmpty()
 					&& currentTime >= lastBroadcastTime + MIN_BROADCAST_DELAY) {
-				// Ensure root value is in the novelty list
-				if (novelty.isEmpty() || !novelty.get(novelty.size() - 1).equals(value)) {
-					novelty.add(value);
-				}
-				Blob deltaData = Format.encodeDelta(novelty);
 				AVector<ACell> emptyPath = Vectors.empty();
 				AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, emptyPath, value);
+
+				// The delta-encoded bytes are what actually gets sent over the wire —
+				// the receiver never sees the in-memory `payload` object, only these
+				// bytes decoded fresh via Message.getPayload(store). So the *envelope*
+				// (payload, tagged with MessageTag.LATTICE_VALUE) must be the "main"
+				// item encodeDelta writes first, not the bare `value` — otherwise the
+				// receiver decodes a bare lattice value with no :LV tag to recognise,
+				// and Message.inferType() falls through to UNKNOWN.
+				if (novelty.isEmpty() || !novelty.get(novelty.size() - 1).equals(payload)) {
+					novelty.add(payload);
+				}
+				Blob deltaData = Format.encodeDelta(novelty);
 				Message message = Message.create(MessageType.LATTICE_VALUE, payload, deltaData);
 				connectionManager.broadcast(message);
 				lastBroadcastTime = currentTime;
@@ -482,9 +489,12 @@ public class LatticePropagator implements Closeable {
 		if (connectionManager.getPeers().isEmpty()) return;
 
 		try {
-			Blob rootData = value.getEncoding();
 			AVector<ACell> emptyPath = Vectors.empty();
 			AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, emptyPath, value);
+			// Same fix as processValue(): must encode the [:LV path value] envelope
+			// itself, not the bare value — otherwise the receiver's inferType()
+			// can't recognise it as LATTICE_VALUE (see comment there for detail).
+			Blob rootData = payload.getEncoding();
 			Message message = Message.create(MessageType.LATTICE_VALUE, payload, rootData);
 			connectionManager.broadcast(message);
 			lastRootSyncTime = currentTime;

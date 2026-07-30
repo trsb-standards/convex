@@ -94,6 +94,18 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	}
 
 	/**
+	 * Returns the names of every database currently registered for JDBC/PG
+	 * access, across all ConvexDB instances in this JVM — e.g. so a new
+	 * connection can mount every reachable sibling database up front, not
+	 * just its own.
+	 *
+	 * @return An immutable snapshot of registered database names
+	 */
+	public static java.util.Set<String> getRegisteredNames() {
+		return java.util.Set.copyOf(registry.keySet());
+	}
+
+	/**
 	 * Looks up a registered database by name.
 	 *
 	 * @param dbName The database name

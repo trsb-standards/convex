@@ -60,6 +60,24 @@ public class RowBlock {
 	/** Absolute byte position of the DATA section for a block with N entries. */
 	private static int dataStart(int n) { return HDR + 4 * n; }
 
+	/**
+	 * Materialises a flat block's bytes, taking the zero-copy fast path for
+	 * {@link AArrayBlob} and falling back to a full copy ({@link ABlob#getBytes()})
+	 * for any other {@link ABlob} representation.
+	 *
+	 * <p>A block is built as a flat {@code Blob} (an {@code AArrayBlob}), but once
+	 * a single block accumulates enough entries to exceed Convex's inline chunking
+	 * threshold, persisting and reloading it turns it into a {@code BlobTree} —
+	 * same content, different Java representation. All block-reading methods must
+	 * accept either.
+	 */
+	private static RawBytes raw(ABlob block) {
+		if (block instanceof AArrayBlob ab) return new RawBytes(ab.getInternalArray(), ab.getInternalOffset());
+		return new RawBytes(block.getBytes(), 0);
+	}
+
+	private record RawBytes(byte[] bs, int base) {}
+
 	// ── Block key ─────────────────────────────────────────────────────────────
 
 	/**
@@ -80,7 +98,7 @@ public class RowBlock {
 	 * Returns true if block is a RowBlock (flat Blob v4 or legacy AVector v1).
 	 */
 	public static boolean isBlock(ACell block) {
-		if (block instanceof Blob) return true;
+		if (block instanceof ABlob) return true;
 		if (!(block instanceof AVector)) return false;
 		@SuppressWarnings("unchecked") AVector<ACell> v = (AVector<ACell>) block;
 		if (v.count() < 1) return false;
@@ -95,12 +113,10 @@ public class RowBlock {
 
 	/** Number of rows (live + tombstone) in this block. Returns 0 for null or non-block values. */
 	public static int count(ACell block) {
-		if (block instanceof AArrayBlob) {
-			AArrayBlob b = (AArrayBlob) block;
+		if (block instanceof ABlob b) {
 			if (b.count() < 4) return 0;
-			byte[] bs = b.getInternalArray();
-			int base = b.getInternalOffset();
-			return rInt(bs, base);
+			RawBytes r = raw(b);
+			return rInt(r.bs(), r.base());
 		}
 		if (!(block instanceof AVector)) return 0;
 		@SuppressWarnings("unchecked") AVector<ACell> v = (AVector<ACell>) block;
@@ -235,10 +251,10 @@ public class RowBlock {
 
 	@SuppressWarnings("unchecked")
 	private static void extractAll(ACell block, List<ABlob> pksOut, List<AVector<ACell>> rowsOut) {
-		if (block instanceof AArrayBlob) {
-			AArrayBlob blob = (AArrayBlob) block;
-			byte[] bs = blob.getInternalArray();
-			int base = blob.getInternalOffset();
+		if (block instanceof ABlob ablob) {
+			RawBytes r = raw(ablob);
+			byte[] bs = r.bs();
+			int base = r.base();
 			int n = rInt(bs, base);
 			int ds = base + dataStart(n);
 			for (int i = 0; i < n; i++) {
@@ -269,11 +285,11 @@ public class RowBlock {
 	 */
 	@SuppressWarnings("unchecked")
 	public static AVector<ACell> get(ACell block, ABlob pk) {
-		if (block instanceof AArrayBlob) {
-			AArrayBlob blob = (AArrayBlob) block;
-			if (blob.count() < 4) return null;
-			byte[] bs = blob.getInternalArray();
-			int base = blob.getInternalOffset();
+		if (block instanceof ABlob ablob) {
+			if (ablob.count() < 4) return null;
+			RawBytes r = raw(ablob);
+			byte[] bs = r.bs();
+			int base = r.base();
 			int n = rInt(bs, base);
 			if (n == 0) return null;
 			int ds = base + dataStart(n);
@@ -302,10 +318,10 @@ public class RowBlock {
 	/** Returns the pk at position i (0-based). */
 	@SuppressWarnings("unchecked")
 	public static ABlob getKey(ACell block, int i) {
-		if (block instanceof AArrayBlob) {
-			AArrayBlob blob = (AArrayBlob) block;
-			byte[] bs = blob.getInternalArray();
-			int base = blob.getInternalOffset();
+		if (block instanceof ABlob ablob) {
+			RawBytes r = raw(ablob);
+			byte[] bs = r.bs();
+			int base = r.base();
 			int n = rInt(bs, base);
 			int ds = base + dataStart(n);
 			int off = rInt(bs, base + HDR + 4*i);
@@ -321,10 +337,10 @@ public class RowBlock {
 	/** Returns the row entry at position i (0-based). */
 	@SuppressWarnings("unchecked")
 	public static AVector<ACell> getRow(ACell block, int i) {
-		if (block instanceof AArrayBlob) {
-			AArrayBlob blob = (AArrayBlob) block;
-			byte[] bs = blob.getInternalArray();
-			int base = blob.getInternalOffset();
+		if (block instanceof ABlob ablob) {
+			RawBytes r = raw(ablob);
+			byte[] bs = r.bs();
+			int base = r.base();
 			int n = rInt(bs, base);
 			int ds = base + dataStart(n);
 			int off = rInt(bs, base + HDR + 4*i);
@@ -422,10 +438,10 @@ public class RowBlock {
 	 */
 	@SuppressWarnings("unchecked")
 	public static void forEach(ACell block, BiConsumer<ABlob, AVector<ACell>> action) {
-		if (block instanceof AArrayBlob) {
-			AArrayBlob blob = (AArrayBlob) block;
-			byte[] bs = blob.getInternalArray();
-			int base = blob.getInternalOffset();
+		if (block instanceof ABlob ablob) {
+			RawBytes r = raw(ablob);
+			byte[] bs = r.bs();
+			int base = r.base();
 			int n = rInt(bs, base);
 			int ds = base + dataStart(n);
 			for (int i = 0; i < n; i++) {

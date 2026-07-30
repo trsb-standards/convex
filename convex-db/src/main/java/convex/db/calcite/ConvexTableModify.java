@@ -51,7 +51,15 @@ public class ConvexTableModify extends TableModify implements EnumerableRel {
 	@Override
 	public Result implement(EnumerableRelImplementor implementor, Prefer pref) {
 		final BlockBuilder builder = new BlockBuilder();
-		final Result inputResult = implementor.visitChild(this, 0, (EnumerableRel) getInput(), pref);
+		// Always request ARRAY row format for the input, regardless of the outer
+		// preference. executeInsert/executeUpdate/executeDelete below all assume
+		// Enumerable<Object[]> rows — but for a single-column table (e.g. one
+		// column in the VALUES/SELECT list), Calcite's default preference can
+		// compile the input to yield the scalar value directly instead of a
+		// 1-element Object[], which blows up as a ClassCastException the first
+		// time a row is read (String cannot be cast to Object[]). Forcing ARRAY
+		// here sidesteps that scalar-format case entirely.
+		final Result inputResult = implementor.visitChild(this, 0, (EnumerableRel) getInput(), Prefer.ARRAY);
 
 		Expression inputExp = builder.append("input", inputResult.block);
 

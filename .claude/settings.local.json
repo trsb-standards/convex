@@ -32,7 +32,12 @@
       "Bash(wmic process:*)",
       "Bash(mvn clean:*)",
       "Bash(rm:*)",
-      "Bash(mvn surefire:test:*)"
+      "Bash(mvn surefire:test:*)",
+      "Read(//usr/lib/jvm/**)",
+      "Read(//home/rob/.sdkman/candidates/**)",
+      "Bash(JAVA_HOME=/usr/lib/jvm/java-21 mvn compile -pl convex-db -am)",
+      "Bash(JAVA_HOME=/usr/lib/jvm/java-21 PATH=/usr/lib/jvm/java-21/bin:$PATH javac -version)",
+      "Bash(mvn --version)"
     ]
   },
   "enabledMcpjsonServers": [

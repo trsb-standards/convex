@@ -174,11 +174,28 @@ public class ConvexTable extends AbstractQueryableTable
 
 	// ========== DML Operations (called from generated code) ==========
 
-	public long executeInsert(Enumerable<Object[]> input) {
+	/**
+	 * Normalizes a row yielded by an input Enumerable to an {@code Object[]}.
+	 *
+	 * <p>Calcite's child relational node (e.g. a {@code VALUES}/{@code SELECT}
+	 * feeding an INSERT/UPDATE/DELETE) decides its own row format independently
+	 * of what the parent requests: for a single-column row it commonly yields
+	 * the scalar value directly rather than a 1-element {@code Object[]}. Since
+	 * that decision isn't something we can reliably override from the modify
+	 * side (tried forcing {@code Prefer.ARRAY} on the child — Calcite ignored
+	 * it for the single-column case), every DML entry point normalizes here
+	 * instead of assuming {@code Object[]} unconditionally.
+	 */
+	private static Object[] normalizeRow(Object rowObj) {
+		return (rowObj instanceof Object[] arr) ? arr : new Object[]{rowObj};
+	}
+
+	public long executeInsert(Enumerable<Object> input) {
 		try {
 			long count = 0;
-			for (Object[] row : input) {
-				if (row != null && insertRow(row)) {
+			for (Object rowObj : input) {
+				Object[] row = normalizeRow(rowObj);
+				if (insertRow(row)) {
 					count++;
 				}
 			}
@@ -188,7 +205,7 @@ public class ConvexTable extends AbstractQueryableTable
 		}
 	}
 
-	public long executeUpdate(Enumerable<Object[]> input, int columnCount, int[] updateIndices) {
+	public long executeUpdate(Enumerable<Object> input, int columnCount, int[] updateIndices) {
 		try {
 			boolean pkBeingUpdated = false;
 			for (int idx : updateIndices) {
@@ -201,8 +218,8 @@ public class ConvexTable extends AbstractQueryableTable
 			ConvexColumnType[] types = getColumnTypes();
 
 			long count = 0;
-			for (Object[] row : input) {
-				if (row == null) continue;
+			for (Object rowObj : input) {
+				Object[] row = normalizeRow(rowObj);
 
 				Object[] updatedRow = new Object[columnCount];
 				for (int i = 0; i < columnCount; i++) {
@@ -239,11 +256,12 @@ public class ConvexTable extends AbstractQueryableTable
 		}
 	}
 
-	public long executeDelete(Enumerable<Object[]> input) {
+	public long executeDelete(Enumerable<Object> input) {
 		try {
 			long count = 0;
-			for (Object[] row : input) {
-				if (row != null && row.length > 0) {
+			for (Object rowObj : input) {
+				Object[] row = normalizeRow(rowObj);
+				if (row.length > 0) {
 					ACell pk = toCell(row[0], 0);
 					if (schema.getTables().deleteByKey(tableName, pk)) {
 						count++;

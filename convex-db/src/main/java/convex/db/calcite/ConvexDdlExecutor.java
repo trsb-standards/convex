@@ -3,6 +3,10 @@ package convex.db.calcite;
 import java.io.Reader;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.calcite.jdbc.CalcitePrepare;
 import org.apache.calcite.jdbc.CalciteSchema;
@@ -15,6 +19,7 @@ import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlUtil;
 import org.apache.calcite.sql.ddl.SqlColumnDeclaration;
+import org.apache.calcite.sql.ddl.SqlCreateSchema;
 import org.apache.calcite.sql.ddl.SqlCreateTable;
 import org.apache.calcite.sql.ddl.SqlDropObject;
 import org.apache.calcite.sql.parser.SqlAbstractParserImpl;
@@ -25,6 +30,9 @@ import org.apache.calcite.sql.validate.SqlValidator;
 import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Util;
 
+import convex.db.ConvexDB;
+import convex.db.lattice.SQLDatabase;
+
 import static java.util.Objects.requireNonNull;
 import static org.apache.calcite.util.Static.RESOURCE;
 
@@ -32,12 +40,43 @@ import static org.apache.calcite.util.Static.RESOURCE;
  * DDL executor that creates Convex lattice-backed tables instead of
  * Calcite's default in-memory MutableArrayTable.
  *
- * <p>Supports CREATE TABLE and DROP TABLE via SQL. Tables are persisted
- * to the lattice cursor tree and participate in lattice replication.
+ * <p>Supports CREATE SCHEMA, CREATE TABLE and DROP TABLE via SQL. Schemas map
+ * 1:1 to named Convex databases (see {@link ConvexDB#database(String)}); tables
+ * and schemas alike are persisted to the lattice cursor tree and participate
+ * in lattice replication.
  */
 public class ConvexDdlExecutor extends DdlExecutorImpl {
 
+	private static final Logger LOG = LoggerFactory.getLogger(ConvexDdlExecutor.class);
+
 	public static final ConvexDdlExecutor INSTANCE = new ConvexDdlExecutor();
+
+	/**
+	 * Fired after a CREATE TABLE / CREATE SCHEMA / DROP TABLE statement has
+	 * successfully executed against a given {@link ConvexDB} — e.g. so a
+	 * caller can refresh its own metadata catalog (ot/otcol/otindex) and
+	 * re-announce the updated lattice state to peers, since neither happens
+	 * automatically. There's exactly one callback slot (not a list) since
+	 * this executor is a process-wide singleton with a single embedded
+	 * caller in practice; set to null to clear it.
+	 */
+	public static volatile Consumer<ConvexDB> onDdlExecuted;
+
+	/**
+	 * Invokes {@link #onDdlExecuted} if set, swallowing (and logging) any
+	 * exception it throws — the DDL statement itself already succeeded by
+	 * the time this runs, so a failing callback must not roll it back or
+	 * break the client's connection.
+	 */
+	private static void fireDdlExecuted(ConvexDB cdb) {
+		Consumer<ConvexDB> callback = onDdlExecuted;
+		if (callback == null || cdb == null) return;
+		try {
+			callback.accept(cdb);
+		} catch (Exception e) {
+			LOG.warn("onDdlExecuted callback failed", e);
+		}
+	}
 
 	public static final SqlParserImplFactory PARSER_FACTORY =
 		new SqlParserImplFactory() {
@@ -51,6 +90,72 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 		};
 
 	protected ConvexDdlExecutor() {}
+
+	/**
+	 * Executes CREATE SCHEMA by creating (and registering) a new named Convex
+	 * database, sharing the same underlying ConvexDB/lattice as the connection
+	 * this statement runs on — not a separate, disconnected instance. Mounted
+	 * into the current session's root schema immediately so it's usable by
+	 * subsequent statements on the same connection without reconnecting.
+	 *
+	 * <p>Requires that at least one of the root schema's current children is
+	 * itself backed by a registered ConvexDB (true for any normal
+	 * jdbc:convex:database=X or PgServer connection) — CREATE SCHEMA has no
+	 * other way to discover which lattice/ConvexDB instance to create the new
+	 * database in.
+	 */
+	public void execute(SqlCreateSchema create, CalcitePrepare.Context context) {
+		String name = create.name.getSimple();
+		CalciteSchema rootSchema = context.getMutableRootSchema();
+
+		// Calcite's default unquoted-identifier casing upper-cases "name" (e.g.
+		// "test" -> "TEST"), but the PG wire protocol's -d <name> / legacy
+		// jdbc:convex:database=<name> selector is a raw string with no case
+		// folding of its own — and real Postgres clients expect lower-case
+		// folding for unquoted identifiers. Register/store/mount the database
+		// under the lower-cased name so it's reachable the way a client
+		// actually typed it, both across a fresh reconnect AND for DML on
+		// this same connection (DML codegen resolves a table's schema by
+		// looking the mounted ConvexSchema's own name back up in the
+		// registry, so that name must match the registered one exactly).
+		// In-session qualified DDL/DML referencing the Calcite-parsed
+		// (upper-cased) name still resolves fine against this lower-case
+		// mount via schema()'s case-insensitive lookup below.
+		String registeredName = name.toLowerCase();
+
+		if (rootSchema.getSubSchema(registeredName, false) != null) {
+			if (create.ifNotExists) return;
+			if (!create.getReplace()) {
+				throw SqlUtil.newContextException(create.name.getParserPosition(),
+						RESOURCE.schemaExists(name));
+			}
+		}
+
+		ConvexDB cdb = findRegisteredConvexDB(rootSchema);
+		if (cdb == null) {
+			throw new IllegalStateException(
+					"CREATE SCHEMA requires an existing connection to a registered Convex database "
+					+ "(none of this connection's current schemas are backed by one)");
+		}
+
+		SQLDatabase newDb = cdb.database(registeredName);
+		cdb.register(registeredName);
+		rootSchema.add(registeredName, new ConvexSchema(newDb, registeredName));
+		fireDdlExecuted(cdb);
+	}
+
+	/**
+	 * Finds the ConvexDB backing whichever of the root schema's current
+	 * children is Convex-backed and registered, so a newly created sibling
+	 * database ends up in the same lattice instead of an unrelated one.
+	 */
+	private static ConvexDB findRegisteredConvexDB(CalciteSchema rootSchema) {
+		for (String subName : rootSchema.getSubSchemaMap().keySet()) {
+			ConvexDB cdb = ConvexDB.lookup(subName);
+			if (cdb != null) return cdb;
+		}
+		return null;
+	}
 
 	/**
 	 * Executes CREATE TABLE by creating a Convex lattice-backed table.
@@ -98,6 +203,7 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 					columnTypes.toArray(new ConvexColumnType[0]));
 			// Add to Calcite's schema so it's immediately visible
 			schema.plus().add(tableName, new ConvexTable(convexSchema, tableName));
+			fireDdlExecuted(ConvexDB.lookup(convexSchema.getName()));
 		} else {
 			throw new IllegalStateException(
 					"CREATE TABLE requires a ConvexSchema, got: " + schema.plus().getClass());
@@ -123,12 +229,24 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 			// Drop from lattice
 			Schema unwrapped = schema.plus().unwrap(ConvexSchema.class);
 			if (unwrapped instanceof ConvexSchema convexSchema) {
-				if (!convexSchema.dropTable(name)) {
+				// "name" is Calcite's parsed, upper-cased SQL identifier, but
+				// Convex's native table storage is case-preserving (whatever
+				// name the table was actually created with, e.g. lower-case
+				// via the native API) and dropTable() does an exact,
+				// case-sensitive lookup. Resolve the real stored name
+				// case-insensitively first, same as table/column resolution
+				// already does elsewhere — otherwise dropping a table created
+				// via the native API (any of dbase-meta's tables, e.g.) fails
+				// with "not found" even though it clearly exists.
+				CalciteSchema.TableEntry entry = schema.getTable(name, false);
+				String realName = (entry != null) ? entry.name : name;
+				if (!convexSchema.dropTable(realName)) {
 					if (!drop.ifExists) {
 						throw SqlUtil.newContextException(drop.name.getParserPosition(),
 								RESOURCE.objectNotFound(name));
 					}
 				}
+				fireDdlExecuted(ConvexDB.lookup(convexSchema.getName()));
 			}
 			// Remove from Calcite
 			schema.removeTable(name);
@@ -151,7 +269,19 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 		}
 		CalciteSchema schema = context.getMutableRootSchema();
 		for (String p : path) {
-			CalciteSchema sub = schema.getSubSchema(p, true);
+			// Case-insensitive: schema/database names are mounted at connect
+			// time using the raw string a client passed (e.g. "-d test",
+			// never SQL-parsed), while a qualified reference like "test.t" in
+			// SQL text goes through Calcite's own unquoted-identifier casing
+			// (upper-cased by default) before it ever reaches this method —
+			// so a case-sensitive match here would silently fail to find a
+			// schema the connection is otherwise perfectly able to reach
+			// (including a database qualifying itself, e.g. from a connection
+			// whose own default schema is "test", writing "test.t" instead of
+			// just "t"). Matches the caseSensitive=false already set on every
+			// Convex JDBC connection (see ConvexDriver.connect()) — this was
+			// simply not honoured here.
+			CalciteSchema sub = schema.getSubSchema(p, false);
 			if (sub == null) return Pair.of(null, name);
 			schema = sub;
 		}

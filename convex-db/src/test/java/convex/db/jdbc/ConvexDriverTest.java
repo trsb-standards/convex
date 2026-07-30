@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.File;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
 
@@ -189,5 +190,188 @@ public class ConvexDriverTest {
 		} finally {
 			cdb.unregister("legacy_test");
 		}
+	}
+
+	// ========== CREATE SCHEMA ==========
+
+	@Test
+	public void testCreateSchemaCreatesUsableSiblingDatabase() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("createschema_base").tables().createTable("t",
+				new String[]{"id"}, new ConvexType[]{ConvexType.INTEGER});
+		cdb.register("createschema_base");
+
+		try {
+			try (Connection conn = DriverManager.getConnection("jdbc:convex:database=createschema_base");
+					Statement stmt = conn.createStatement()) {
+				stmt.executeUpdate("CREATE SCHEMA createschema_new");
+			}
+
+			// The new schema must be a real, separately registered Convex database —
+			// not just a name mounted for this one connection — so other connections
+			// (e.g. a second PgServer client, or a client typing "-d createschema_new"
+			// on a fresh psql session) can reach it too. Registered lower-case:
+			// Calcite upper-cases the unquoted identifier in the CREATE SCHEMA
+			// statement itself, but a client reconnecting types the name as-is,
+			// with no case folding applied by the driver.
+			assertNotNull(ConvexDB.lookup("createschema_new"));
+			assertEquals(cdb, ConvexDB.lookup("createschema_new"));
+
+			// A fresh connection addressing it directly (as a real client would,
+			// rather than staying on the connection that ran CREATE SCHEMA and
+			// qualifying every reference) gets normal, unqualified table access.
+			try (Connection conn2 = DriverManager.getConnection("jdbc:convex:database=createschema_new");
+					Statement stmt2 = conn2.createStatement()) {
+				stmt2.executeUpdate("CREATE TABLE widgets (id INTEGER, name VARCHAR)");
+				stmt2.executeUpdate("INSERT INTO widgets VALUES (1, 'sprocket')");
+
+				ResultSet rs = stmt2.executeQuery("SELECT name FROM widgets WHERE id = 1");
+				assertTrue(rs.next());
+				assertEquals("sprocket", rs.getString(1));
+			}
+		} finally {
+			cdb.unregister("createschema_base");
+			cdb.unregister("createschema_new");
+		}
+	}
+
+	@Test
+	public void testCreateSchemaSupportsQualifiedDdlAndDmlOnSameConnection() throws Exception {
+		// A qualified reference like "newdb.widgets" must work regardless of
+		// which database the connection is actually scoped to — including
+		// right after CREATE SCHEMA, on the very connection that created it,
+		// without needing to reconnect first.
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("samesession_anchor").tables();
+		cdb.register("samesession_anchor");
+
+		try {
+			try (Connection conn = DriverManager.getConnection("jdbc:convex:database=samesession_anchor");
+					Statement stmt = conn.createStatement()) {
+				stmt.executeUpdate("CREATE SCHEMA samesession_new");
+				stmt.executeUpdate("CREATE TABLE samesession_new.widgets (id INTEGER, name VARCHAR)");
+
+				try (PreparedStatement ps = conn.prepareStatement(
+						"INSERT INTO samesession_new.widgets VALUES (?, ?)")) {
+					ps.setInt(1, 1);
+					ps.setString(2, "sprocket");
+					ps.executeUpdate();
+				}
+
+				ResultSet rs = stmt.executeQuery("SELECT name FROM samesession_new.widgets WHERE id = 1");
+				assertTrue(rs.next());
+				assertEquals("sprocket", rs.getString(1));
+			}
+		} finally {
+			cdb.unregister("samesession_anchor");
+			cdb.unregister("samesession_new");
+		}
+	}
+
+	@Test
+	public void testCreateSchemaIfNotExistsIsNoOpWhenSchemaAlreadyExists() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("createschema_idempotent").tables();
+		cdb.register("createschema_idempotent");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=createschema_idempotent")) {
+			try (Statement stmt = conn.createStatement()) {
+				stmt.executeUpdate("CREATE SCHEMA sibling_a");
+				// Must not throw the second time.
+				stmt.executeUpdate("CREATE SCHEMA IF NOT EXISTS sibling_a");
+			}
+		} finally {
+			cdb.unregister("createschema_idempotent");
+			cdb.unregister("sibling_a");
+		}
+	}
+
+	// ========== Re-registration after a restart ==========
+
+	@Test
+	public void testUnregisteredExistingDatabaseSilentlyFallsBackToEmptyInstance() throws Exception {
+		// Documents a real footgun: ConvexDB.registry is in-memory only and
+		// does NOT persist across a process restart, unlike the underlying
+		// data. If a database that already has persisted data is no longer
+		// registered (e.g. right after a fresh restart, before anything
+		// re-registers it), connecting to it by name does NOT error — it
+		// silently falls back to a brand-new, empty, disconnected ConvexDB
+		// (LEGACY mode's fallthrough to resolveMemInstance()). This is why
+		// dbase.DbaseServer.main() re-registers every existing database at
+		// startup rather than relying on ad-hoc re-registration.
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("unregistered_existing").tables().createTable("t",
+				new String[]{"id"}, new ConvexType[]{ConvexType.INTEGER});
+		cdb.register("unregistered_existing");
+
+		// Simulates what a fresh process's empty in-memory registry looks
+		// like, even though "unregistered_existing"'s data still exists.
+		cdb.unregister("unregistered_existing");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=unregistered_existing");
+				Statement stmt = conn.createStatement()) {
+			// Table "t" does not exist in the fallback empty instance —
+			// creating it here does NOT touch the original database's data.
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER)");
+		}
+
+		// The real data is untouched and still reachable via the native API,
+		// proving the JDBC connection above talked to a different instance.
+		assertEquals(0L, cdb.database("unregistered_existing").tables().selectAll("t").count());
+	}
+
+	@Test
+	public void testReRegisteringExistingDatabasesRestoresRealAccess() throws Exception {
+		// The fix pattern DbaseServer.main() now applies at startup: iterate
+		// every database that already has state and re-register each one,
+		// rather than leaving them to be silently shadowed by the
+		// empty-fallback behaviour above.
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("reregister_existing").tables().createTable("t",
+				new String[]{"id"}, new ConvexType[]{ConvexType.INTEGER});
+		cdb.database("reregister_existing").tables().insert("t", 1);
+		cdb.register("reregister_existing");
+
+		cdb.unregister("reregister_existing"); // simulate a fresh restart's empty registry
+
+		for (String existingDb : cdb.getDatabaseNames()) {
+			cdb.register(existingDb);
+		}
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=reregister_existing");
+				Statement stmt = conn.createStatement();
+				ResultSet rs = stmt.executeQuery("SELECT id FROM t")) {
+			assertTrue(rs.next(), "re-registering must restore access to the real, persisted data");
+			assertEquals(1, rs.getInt("id"));
+		} finally {
+			cdb.unregister("reregister_existing");
+		}
+	}
+
+	// ========== DROP TABLE on a natively-created table ==========
+
+	@Test
+	public void testDropTableFindsTableCreatedViaNativeApiDespiteCasing() throws Exception {
+		// Regression test: a table created via the native SQLSchema API keeps
+		// whatever literal name the caller used (e.g. lower-case "widgets",
+		// as dbase-meta's schema classes do), but DROP TABLE's SQL identifier
+		// gets upper-cased by Calcite's parser ("WIDGETS"). dropTable() does
+		// an exact/case-sensitive lookup against Convex's native storage, so
+		// this used to fail with "Object 'WIDGETS' not found" even though
+		// the table plainly exists.
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("droptest").tables().createTable("widgets",
+				new String[]{"id"}, new ConvexType[]{ConvexType.INTEGER});
+		cdb.register("droptest");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=droptest");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("DROP TABLE widgets");
+		} finally {
+			cdb.unregister("droptest");
+		}
+
+		assertEquals(0, cdb.database("droptest").tables().getTableNames().length,
+			"the natively-created table must actually be gone after DROP TABLE");
 	}
 }

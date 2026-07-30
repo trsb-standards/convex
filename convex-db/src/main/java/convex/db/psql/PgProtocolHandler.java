@@ -11,7 +11,7 @@ import java.sql.*;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * Handles the PostgreSQL wire protocol and executes SQL queries.
@@ -21,7 +21,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private static final Logger log = LoggerFactory.getLogger(PgProtocolHandler.class);
 	private static final AtomicInteger processIdCounter = new AtomicInteger(1000);
 
-	private final Supplier<Connection> connectionSupplier;
+	private final Function<String, Connection> connectionSupplier;
 	private final String requiredPassword;
 
 	private Connection connection;
@@ -34,10 +34,10 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	/**
 	 * Creates a handler that uses the given connection supplier.
 	 *
-	 * @param connectionSupplier Supplies JDBC connections for query execution
+	 * @param connectionSupplier Supplies JDBC connections for query execution, given the client's requested database name
 	 * @param requiredPassword Password required for authentication, or null for trust auth
 	 */
-	public PgProtocolHandler(Supplier<Connection> connectionSupplier, String requiredPassword) {
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword) {
 		this.connectionSupplier = connectionSupplier;
 		this.requiredPassword = requiredPassword;
 		this.processId = processIdCounter.incrementAndGet();
@@ -111,9 +111,9 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private void completeAuthentication(ChannelHandlerContext ctx) {
 		authenticated = true;
 
-		// Get a connection
+		// Get a connection, honouring whichever database this client requested
 		try {
-			connection = connectionSupplier.get();
+			connection = connectionSupplier.apply(database);
 		} catch (Exception e) {
 			log.error("Failed to get connection", e);
 			write(ctx, ErrorResponse.fromException(e));
@@ -182,16 +182,21 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			try {
 				executeQuery(ctx, sql);
 			} catch (SQLException e) {
-				log.warn("Query error: {}", e.getMessage(), e);
+				// Expected client-caused error (bad SQL, missing table, etc.) — the
+				// client already gets the real message via ErrorResponse below;
+				// a stack trace here would just be log noise for an ordinary typo.
+				log.warn("Query error: {}", e.getMessage());
 				write(ctx, ErrorResponse.fromException(e));
 				// Stop processing on error
 				break;
 			} catch (RuntimeException e) {
 				// Runtime exceptions from Calcite (type coercion, etc.) are query errors
-				log.warn("Query execution error: {}", e.getMessage(), e);
+				log.warn("Query execution error: {}", e.getMessage());
 				write(ctx, ErrorResponse.fromException(e));
 				break;
 			} catch (Exception e) {
+				// Not a recognised query-error type — genuinely unexpected, so the
+				// stack trace is worth keeping here.
 				log.error("Unexpected error", e);
 				write(ctx, ErrorResponse.fromException(e));
 				break;
@@ -203,6 +208,18 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void executeQuery(ChannelHandlerContext ctx, String sql) throws SQLException {
+		executeQuery(ctx, sql, true);
+	}
+
+	/**
+	 * @param includeRowDescription Whether to send a RowDescription before the
+	 *   data rows. Must be false when called from the extended-protocol Execute
+	 *   path for a portal that was already Described — Describe already sent the
+	 *   RowDescription, and sending it again desyncs pgjdbc's internal
+	 *   pendingDescribePortalQueue bookkeeping (manifests client-side as a
+	 *   NoSuchElementException in QueryExecutorImpl.processResults).
+	 */
+	private void executeQuery(ChannelHandlerContext ctx, String sql, boolean includeRowDescription) throws SQLException {
 		sql = rewriteQuery(sql);
 
 		// Null means return empty result (e.g., for system catalog queries)
@@ -216,7 +233,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 			if (hasResultSet) {
 				try (ResultSet rs = stmt.getResultSet()) {
-					sendResultSet(ctx, rs);
+					sendResultSet(ctx, rs, includeRowDescription);
 				}
 			} else {
 				int updateCount = stmt.getUpdateCount();
@@ -333,12 +350,14 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		return sql;
 	}
 
-	private void sendResultSet(ChannelHandlerContext ctx, ResultSet rs) throws SQLException {
+	private void sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean includeRowDescription) throws SQLException {
 		ResultSetMetaData meta = rs.getMetaData();
 		int columnCount = meta.getColumnCount();
 
 		// Send row description
-		write(ctx, RowDescription.fromMetaData(meta));
+		if (includeRowDescription) {
+			write(ctx, RowDescription.fromMetaData(meta));
+		}
 
 		// Send data rows
 		long rowCount = 0;
@@ -367,6 +386,9 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private final Map<String, PreparedStmt> statements = new java.util.HashMap<>();
 	// Portals are bound statements ready to execute (Bind creates these)
 	private final Map<String, Portal> portals = new java.util.HashMap<>();
+	// Portal names for which Describe already sent a RowDescription to the client
+	// — Execute must not resend it (see executeQuery's includeRowDescription doc).
+	private final java.util.Set<String> describedPortals = new java.util.HashSet<>();
 
 	private void handleParse(ChannelHandlerContext ctx, PgMessageDecoder.Parse parse) {
 		if (!authenticated) {
@@ -387,7 +409,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 			write(ctx, ParseComplete.INSTANCE);
 		} catch (Exception e) {
-			log.warn("Parse error: {}", e.getMessage(), e);
+			log.warn("Parse error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		}
 	}
@@ -416,13 +438,14 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 			// Close existing portal with same name (PostgreSQL behavior)
 			portals.remove(portalName);
+			describedPortals.remove(portalName);
 
 			// Create the portal with bound parameters
 			portals.put(portalName, new Portal(stmt, bind.paramValues(), bind.paramFormats(), bind.resultFormats()));
 
 			write(ctx, BindComplete.INSTANCE);
 		} catch (Exception e) {
-			log.warn("Bind error: {}", e.getMessage(), e);
+			log.warn("Bind error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		}
 	}
@@ -483,6 +506,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 					try (Statement s = connection.createStatement();
 						 ResultSet rs = s.executeQuery(metaQuery)) {
 						write(ctx, RowDescription.fromMetaData(rs.getMetaData()));
+						describedPortals.add(describe.name());
 					} catch (SQLException e) {
 						write(ctx, NoData.INSTANCE);
 					}
@@ -491,7 +515,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				}
 			}
 		} catch (Exception e) {
-			log.warn("Describe error: {}", e.getMessage(), e);
+			log.warn("Describe error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		}
 	}
@@ -522,15 +546,20 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				return;
 			}
 
-			executeWithParameters(ctx, query, portal.paramValues(), portal.paramFormats());
+			// If Describe already sent this portal's RowDescription, Execute must not
+			// resend it — doing so desyncs pgjdbc's client-side bookkeeping.
+			boolean alreadyDescribed = describedPortals.remove(portalName);
+			executeWithParameters(ctx, query, portal.paramValues(), portal.paramFormats(), !alreadyDescribed);
 		} catch (SQLException e) {
-			log.warn("Execute error: {}", e.getMessage(), e);
+			log.warn("Execute error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		} catch (RuntimeException e) {
 			// Runtime exceptions from Calcite (type coercion, etc.) are query errors
-			log.warn("Query execution error: {}", e.getMessage(), e);
+			log.warn("Query execution error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		} catch (Exception e) {
+			// Not a recognised query-error type — genuinely unexpected, so the
+			// stack trace is worth keeping here.
 			log.error("Unexpected error during execute", e);
 			write(ctx, ErrorResponse.fromException(e));
 		}
@@ -539,7 +568,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	/**
 	 * Execute a query with bound parameters.
 	 */
-	private void executeWithParameters(ChannelHandlerContext ctx, String sql, byte[][] paramValues, short[] paramFormats) throws SQLException {
+	private void executeWithParameters(ChannelHandlerContext ctx, String sql, byte[][] paramValues, short[] paramFormats, boolean includeRowDescription) throws SQLException {
 		sql = rewriteQuery(sql);
 
 		if (sql == null) {
@@ -549,7 +578,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 		// If no parameters, execute directly
 		if (paramValues == null || paramValues.length == 0) {
-			executeQuery(ctx, sql);
+			executeQuery(ctx, sql, includeRowDescription);
 			return;
 		}
 
@@ -561,7 +590,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			lowerSql.contains("pg_namespace") || lowerSql.contains("pg_attribute") ||
 			lowerSql.contains("pg_tables")) {
 			String substituted = substituteParameters(sql, paramValues, paramFormats);
-			executeQuery(ctx, substituted);
+			executeQuery(ctx, substituted, includeRowDescription);
 			return;
 		}
 
@@ -594,7 +623,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			boolean hasResultSet = pstmt.execute();
 			if (hasResultSet) {
 				try (ResultSet rs = pstmt.getResultSet()) {
-					sendResultSet(ctx, rs);
+					sendResultSet(ctx, rs, includeRowDescription);
 				}
 			} else {
 				int updateCount = pstmt.getUpdateCount();
@@ -677,6 +706,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			statements.remove(close.name());
 		} else {
 			portals.remove(close.name());
+			describedPortals.remove(close.name());
 		}
 
 		write(ctx, CloseComplete.INSTANCE);

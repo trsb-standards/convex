@@ -1,6 +1,8 @@
 package convex.db.lattice;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
@@ -11,12 +13,29 @@ import convex.core.data.prim.CVMLong;
 /**
  * Utility class for secondary column index key encoding and matching.
  *
- * <p>Index key format: {@code [valueLenHi, valueLenLo, value_bytes..., pk_bytes...]}
+ * <p>Index key format: {@code [valueLenHi, valueLenLo, value_bytes..., pkHash_bytes...]}
  * <ul>
  *   <li>Bytes 0–1: big-endian unsigned length of the encoded value (max 65535 bytes)</li>
  *   <li>Bytes 2 to 2+valueLen: sortable encoding of the column value</li>
- *   <li>Remaining bytes: primary key bytes (as produced by {@link SQLSchema#toKey})</li>
+ *   <li>Remaining {@link #PK_HASH_BYTES} bytes: truncated SHA-256 hash of the pk bytes</li>
  * </ul>
+ *
+ * <p><b>Why the pk is hashed, not stored raw:</b> {@link convex.core.data.Index} is a radix
+ * trie hard-capped at {@code MAX_DEPTH = 64} hex digits (32 bytes) — it can only distinguish
+ * keys up to that many bytes of common prefix; beyond that, all such keys silently collapse
+ * into a single trie entry (see {@code Index.assoc}/{@code MAX_DEPTH} javadoc). A raw
+ * {@code [valueLen][value][full pk]} key easily exceeds 32 bytes once real composite PKs are
+ * involved, and for exactly the case these indices exist for — many rows sharing the same
+ * indexed value — the bytes that actually differ between rows are the pk bytes, which would
+ * land past the cutoff. Hashing the pk down to a small fixed size keeps every key well under
+ * the limit regardless of PK width.
+ *
+ * <p>Because the key no longer contains the literal pk, and two different pks can (rarely)
+ * hash to the same {@link #PK_HASH_BYTES}, the column index's value is a <b>bucket</b>
+ * ({@code AVector<ABlob>} of pks) rather than a single pk — see {@link SQLTable#indexAddRow}/
+ * {@link SQLTable#indexRemoveRow}. Readers must resolve every pk in a matching bucket and
+ * verify the actual row's column value before accepting it, rather than trusting the key
+ * match alone.
  *
  * <p>The value encoding is sortable, enabling range queries:
  * <ul>
@@ -26,6 +45,13 @@ import convex.core.data.prim.CVMLong;
  * </ul>
  */
 public class ColumnIndex {
+
+	/**
+	 * Number of bytes the pk is hashed down to. 16 bytes (128 bits) makes accidental
+	 * collisions between two different pks negligible for any realistic table size,
+	 * and genuine collisions are handled correctly regardless (see class javadoc).
+	 */
+	public static final int PK_HASH_BYTES = 16;
 
 	private ColumnIndex() {}
 
@@ -56,17 +82,30 @@ public class ColumnIndex {
 
 	/**
 	 * Builds the index key for a (value, pk) pair.
-	 * Format: 2-byte-big-endian(valueLen) ++ value_bytes ++ pk_bytes
+	 * Format: 2-byte-big-endian(valueLen) ++ value_bytes ++ hash(pk_bytes)
 	 */
 	public static ABlob indexKey(ACell value, ABlob pk) {
-		byte[] vb  = encodeValue(value);
-		byte[] pkb = blobBytes(pk);
-		byte[] key = new byte[2 + vb.length + pkb.length];
+		byte[] vb   = encodeValue(value);
+		byte[] pkh  = hashPk(pk);
+		byte[] key = new byte[2 + vb.length + PK_HASH_BYTES];
 		key[0] = (byte) (vb.length >> 8);
 		key[1] = (byte) (vb.length);
-		System.arraycopy(vb,  0, key, 2,              vb.length);
-		System.arraycopy(pkb, 0, key, 2 + vb.length,  pkb.length);
+		System.arraycopy(vb,  0, key, 2,             vb.length);
+		System.arraycopy(pkh, 0, key, 2 + vb.length, PK_HASH_BYTES);
 		return Blob.wrap(key);
+	}
+
+	/** Truncated SHA-256 hash of the pk's bytes, {@link #PK_HASH_BYTES} bytes long. */
+	static byte[] hashPk(ABlob pk) {
+		try {
+			MessageDigest md = MessageDigest.getInstance("SHA-256");
+			byte[] full = md.digest(blobBytes(pk));
+			byte[] truncated = new byte[PK_HASH_BYTES];
+			System.arraycopy(full, 0, truncated, 0, PK_HASH_BYTES);
+			return truncated;
+		} catch (NoSuchAlgorithmException e) {
+			throw new IllegalStateException("SHA-256 not available", e);
+		}
 	}
 
 	// ── Key inspection ───────────────────────────────────────────────────────
@@ -77,19 +116,6 @@ public class ColumnIndex {
 	public static int getValueLen(ABlob indexKey) {
 		return ((indexKey.byteAtUnchecked(0) & 0xFF) << 8)
 			| (indexKey.byteAtUnchecked(1) & 0xFF);
-	}
-
-	/**
-	 * Extracts the primary key blob from an index key.
-	 */
-	public static ABlob extractPk(ABlob indexKey) {
-		int valueLen = getValueLen(indexKey);
-		int pkStart  = 2 + valueLen;
-		int pkLen    = (int) indexKey.count() - pkStart;
-		if (pkLen <= 0) return Blob.EMPTY;
-		byte[] pkb = new byte[pkLen];
-		for (int i = 0; i < pkLen; i++) pkb[i] = indexKey.byteAtUnchecked(pkStart + i);
-		return Blob.wrap(pkb);
 	}
 
 	// ── Match predicates ─────────────────────────────────────────────────────

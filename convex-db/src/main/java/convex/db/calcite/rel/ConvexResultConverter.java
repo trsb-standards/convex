@@ -5,9 +5,11 @@ import java.util.Iterator;
 import org.apache.calcite.DataContext;
 import org.apache.calcite.linq4j.Enumerable;
 import org.apache.calcite.linq4j.Linq4j;
+import org.apache.calcite.sql.type.SqlTypeName;
 
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
+import convex.core.data.prim.CVMLong;
 import convex.core.lang.RT;
 import convex.db.calcite.convention.ConvexEnumerable;
 import convex.db.calcite.convention.ConvexRel;
@@ -53,6 +55,37 @@ public class ConvexResultConverter {
 	}
 
 	/**
+	 * Type-aware variant of {@link #execute}: converts each cell using the
+	 * declared SQL type so that Calcite's generated casts always succeed.
+	 *
+	 * <p>For example, {@code MOD(BIGINT, INTEGER)} returns {@code INTEGER} in
+	 * Calcite's type system, so the generated GROUP-BY key extractor emits
+	 * {@code (Integer) row[i]}.  Without this overload the converter returns
+	 * {@code Long} for every CVMLong, causing a ClassCastException at runtime.
+	 *
+	 * @param sqlTypeOrdinals  {@code SqlTypeName.ordinal()} for each projected
+	 *                         field, in field order
+	 */
+	public static Enumerable<Object[]> execute(ConvexRel rel, int fieldCount,
+			int[] sqlTypeOrdinals, DataContext ctx) {
+		ConvexEnumerable convexResult = rel.execute(ctx);
+		return Linq4j.asEnumerable(() -> {
+			Iterator<ACell[]> it = convexResult.iterator();
+			return new Iterator<Object[]>() {
+				@Override public boolean hasNext() { return it.hasNext(); }
+				@Override public Object[] next() {
+					ACell[] row = it.next();
+					Object[] javaRow = new Object[fieldCount];
+					for (int i = 0; i < Math.min(row.length, fieldCount); i++) {
+						javaRow[i] = cellToJavaTyped(row[i], sqlTypeOrdinals[i]);
+					}
+					return javaRow;
+				}
+			};
+		});
+	}
+
+	/**
 	 * Executes in SCALAR format — each element is the column value directly.
 	 * Used for single-column results.
 	 *
@@ -77,6 +110,23 @@ public class ConvexResultConverter {
 	 */
 	public static Object cellToJava(ACell cell) {
 		if (cell == null) return null;
+		if (cell instanceof ABlob blob) return blob.getBytes();
+		return RT.jvm(cell);
+	}
+
+	/**
+	 * Type-aware cell conversion: returns the Java type that matches the
+	 * declared SQL type so Calcite's generated casts never fail.
+	 */
+	public static Object cellToJavaTyped(ACell cell, int sqlTypeOrdinal) {
+		if (cell == null) return null;
+		if (cell instanceof CVMLong l) {
+			SqlTypeName t = SqlTypeName.values()[sqlTypeOrdinal];
+			return switch (t) {
+				case INTEGER, SMALLINT, TINYINT -> (int) l.longValue();
+				default -> l.longValue();
+			};
+		}
 		if (cell instanceof ABlob blob) return blob.getBytes();
 		return RT.jvm(cell);
 	}

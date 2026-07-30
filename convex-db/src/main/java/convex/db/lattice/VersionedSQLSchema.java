@@ -118,7 +118,21 @@ public class VersionedSQLSchema extends SQLSchema {
 	/**
 	 * Creates a versioned table. The state vector includes an empty history slot.
 	 * All other {@code createTable} overloads delegate here through the parent class.
+	 *
+	 * <p>Versioned tables don't support composite primary keys yet — {@code VersionedSQLTable}'s
+	 * history model treats the pk as an opaque single blob (see {@code HistoryKey}), so
+	 * this rejects anything other than the default single-column case rather than silently
+	 * building a table that can't be queried by its individual key components.
 	 */
+	@Override
+	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types, int pkCount) {
+		if (pkCount != 1) {
+			throw new UnsupportedOperationException(
+				"VersionedSQLSchema does not yet support composite primary keys (pkCount=" + pkCount + ")");
+		}
+		return createTable(name, columns, types);
+	}
+
 	@Override
 	@SuppressWarnings({"unchecked", "rawtypes"})
 	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types) {

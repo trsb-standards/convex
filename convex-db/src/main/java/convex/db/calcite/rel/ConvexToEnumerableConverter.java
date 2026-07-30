@@ -18,6 +18,7 @@ import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.convert.ConverterImpl;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.rel.type.RelDataTypeField;
 
 import convex.db.calcite.convention.ConvexConvention;
 import convex.db.calcite.convention.ConvexRel;
@@ -73,6 +74,14 @@ public class ConvexToEnumerableConverter extends ConverterImpl implements Enumer
 		final PhysType physType = PhysTypeImpl.of(
 			implementor.getTypeFactory(), getRowType(), format);
 
+		// Extract SQL type ordinals so the converter can return the correct Java type
+		// (e.g. Integer vs Long) matching what Calcite's generated casts expect.
+		List<RelDataTypeField> fields = getRowType().getFieldList();
+		int[] typeOrdinals = new int[fields.size()];
+		for (int i = 0; i < fields.size(); i++) {
+			typeOrdinals[i] = fields.get(i).getType().getSqlTypeName().ordinal();
+		}
+
 		Expression executeExpr;
 		if (format == JavaRowFormat.SCALAR) {
 			executeExpr = Expressions.call(
@@ -84,6 +93,7 @@ public class ConvexToEnumerableConverter extends ConverterImpl implements Enumer
 				ConvexResultConverter.class, "execute",
 				relExpr,
 				Expressions.constant(fieldCount),
+				Expressions.constant(typeOrdinals),
 				implementor.getRootExpression());
 		}
 

@@ -12,7 +12,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * PostgreSQL wire protocol server backed by Convex SQL.
@@ -45,7 +45,7 @@ public class PgServer {
 	private int port;
 	private final String database;
 	private final String password;
-	private final Supplier<Connection> connectionSupplier;
+	private final Function<String, Connection> connectionSupplier;
 
 	private EventLoopGroup bossGroup;
 	private EventLoopGroup workerGroup;
@@ -60,12 +60,16 @@ public class PgServer {
 		if (builder.connectionSupplier != null) {
 			this.connectionSupplier = builder.connectionSupplier;
 		} else {
-			// Default: connect via Convex JDBC driver
-			this.connectionSupplier = () -> {
+			// Default: connect via Convex JDBC driver, honouring whichever
+			// database the connecting client actually requested (falling back
+			// to the server's configured default if the client didn't specify
+			// one — StartupMessage's "database" param is technically optional).
+			this.connectionSupplier = requestedDb -> {
+				String dbName = (requestedDb != null) ? requestedDb : database;
 				try {
-					return DriverManager.getConnection("jdbc:convex:database=" + database);
+					return DriverManager.getConnection("jdbc:convex:database=" + dbName);
 				} catch (SQLException e) {
-					throw new RuntimeException("Failed to connect to database: " + database, e);
+					throw new RuntimeException("Failed to connect to database: " + dbName, e);
 				}
 			};
 		}
@@ -198,7 +202,7 @@ public class PgServer {
 		private int port = 5432;
 		private String database = "convex";
 		private String password = null;
-		private Supplier<Connection> connectionSupplier = null;
+		private Function<String, Connection> connectionSupplier = null;
 
 		/**
 		 * Sets the port to listen on. Default is 5432.
@@ -225,10 +229,12 @@ public class PgServer {
 		}
 
 		/**
-		 * Sets a custom connection supplier. If not set, connections are
-		 * obtained via the Convex JDBC driver.
+		 * Sets a custom connection supplier, invoked with the database name the
+		 * connecting client actually requested (from the startup message's
+		 * "database" parameter). If not set, connections are obtained via the
+		 * Convex JDBC driver against that requested database name.
 		 */
-		public Builder connectionSupplier(Supplier<Connection> supplier) {
+		public Builder connectionSupplier(Function<String, Connection> supplier) {
 			this.connectionSupplier = supplier;
 			return this;
 		}
