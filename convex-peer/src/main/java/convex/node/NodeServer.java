@@ -16,6 +16,7 @@ import convex.core.ErrorCodes;
 import convex.core.Result;
 import convex.core.data.ACell;
 import convex.core.data.AVector;
+import convex.core.data.Cells;
 import convex.core.data.Strings;
 import convex.core.data.prim.CVMLong;
 import convex.core.exceptions.BadFormatException;
@@ -446,10 +447,26 @@ public class NodeServer<V extends ACell> implements Closeable {
 	/**
 	 * Processes an incoming LATTICE_VALUE message from a peer.
 	 *
+	 * <p>Announces the incoming value to this node's own store *before*
+	 * merging it into the cursor — closes a GC race (found live 2026-08-05,
+	 * see dbase's CLAUDE.md "RefSoft/GC race" writeup) where a freshly-decoded
+	 * value is only reachable via {@code RefSoft} (soft references, per its
+	 * own javadoc: "should usually be STORED, otherwise data loss") until the
+	 * propagator's background thread gets around to announcing it later. If
+	 * GC reclaims those cells first, both this merge and any later read of
+	 * that exact update throw {@code MissingDataException}, silently swallowed
+	 * by {@link #mergeIncoming}. Announcing here is safe and cheap: {@code
+	 * value} is still strongly reachable via this local variable (freshly
+	 * decoded by {@code message.getPayload(store)} in
+	 * {@link #handleIncomingMessage} moments ago), so {@code Cells.announce}
+	 * cannot itself hit missing data — it only ever needs to walk cells that
+	 * are still definitely alive on this call stack.
+	 *
 	 * <p>Navigates to the target path via {@code cursor.path()}, merges the
-	 * received value, then calls {@code cursor.sync()} to notify propagators. The
-	 * sync is cheap (non-blocking queue offer) and the {@code LatestUpdateQueue}
-	 * coalesces rapid incoming merges, so high-velocity messages are safe.
+	 * (now store-backed) value, then calls {@code cursor.sync()} to notify
+	 * propagators. The sync is cheap (non-blocking queue offer) and the
+	 * {@code LatestUpdateQueue} coalesces rapid incoming merges, so
+	 * high-velocity messages are safe.
 	 *
 	 * <p>Payload format: [:LV [*path*] value]
 	 *
@@ -468,6 +485,13 @@ public class NodeServer<V extends ACell> implements Closeable {
 
 		if (value == null) {
 			log.warn("LATTICE_VALUE message missing value");
+			return;
+		}
+
+		try {
+			value = Cells.announce(value, r -> {}, store);
+		} catch (IOException e) {
+			log.warn("Failed to announce incoming lattice value, dropping this update: {}", e.getMessage());
 			return;
 		}
 
@@ -550,6 +574,46 @@ public class NodeServer<V extends ACell> implements Closeable {
 		}
 		// Delegate to primary propagator; return cursor value after merge callback has run
 		return propagators.get(0).pull(convex).thenApply(v -> cursor.get());
+	}
+
+	/**
+	 * Pulls just a sub-path of a peer's lattice value (e.g. one database)
+	 * rather than its entire lattice, and merges it locally at the matching
+	 * cursor path — for partial/selective replication (a node syncing only
+	 * "meta", or only one specific database, without transitively pulling in
+	 * every other database the peer happens to host too).
+	 *
+	 * <p>Unlike {@link #pull(Convex)}, which feeds the pulled value through
+	 * the primary propagator's merge callback (hardwired to the full-root
+	 * lattice type {@code V}), this merges directly via
+	 * {@code cursor.path(path).merge(value)} — the same mechanism
+	 * {@link #processLatticeValue} uses for incoming broadcasts. That either
+	 * applies the sub-lattice's own merge semantics if one is registered at
+	 * this path, or bubbles the value up to the nearest ancestor lattice via
+	 * assocIn otherwise (see {@code DescendedCursor#merge}).
+	 *
+	 * <p>Calls {@code cursor.sync()} after merging so the pulled data is
+	 * queued for this node's own announce/persist/re-broadcast, same as an
+	 * incoming LATTICE_VALUE. Does not itself register the peer for ongoing
+	 * broadcast sync — callers wanting continuous sync still call
+	 * {@code propagator.addPeer(...)} separately.
+	 *
+	 * @param convex Convex connection to the peer node
+	 * @param path Path within the peer's lattice to pull (e.g. a single database-name key)
+	 * @return CompletableFuture completing with the local value at that path after merge (or null if the peer had nothing there)
+	 */
+	public CompletableFuture<ACell> pullPath(Convex convex, ACell... path) {
+		if (propagators.isEmpty()) {
+			return CompletableFuture.failedFuture(new IllegalStateException("No propagators configured"));
+		}
+		return propagators.get(0).pullPath(convex, path).thenApply(value -> {
+			if (value != null) {
+				ALatticeCursor<ACell> target = cursor.path(path);
+				mergeIncoming(target, value);
+				cursor.sync();
+			}
+			return cursor.path(path).get();
+		});
 	}
 
 	/**

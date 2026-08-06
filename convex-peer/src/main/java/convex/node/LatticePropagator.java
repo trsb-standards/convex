@@ -432,9 +432,27 @@ public class LatticePropagator implements Closeable {
 	 */
 	private void processValue(ACell value) {
 		try {
-			// 1. Announce to store (writes cells, collects novelty for delta)
+			// 1. Announce to store (writes cells, collects novelty for delta).
+			// Skip embedded cells: Cells.announce's novelty callback fires for
+			// the top-level cell regardless of whether it itself is
+			// embeddable (a store's persistRef records novelty at "topLevel
+			// || !embedded"), but Format.encodeDelta's decode side
+			// (readChildCells) explicitly rejects an embedded cell showing up
+			// as a "child" entry ("Embedded Cell as child") — only the FIRST
+			// (main) item in a delta may be embedded, and that's `payload`,
+			// added explicitly below, not anything from this handler. Found
+			// live 2026-08-05: a small lattice value (e.g. one node's own
+			// handful of self-registration rows, common early in a node's
+			// life before much data accumulates) is itself embeddable, so
+			// its own top-level novelty entry silently broke every ambient
+			// broadcast containing it — the receiver's message decode threw
+			// before processLatticeValue ever ran, discarding the whole
+			// update. Not a race: 100% reproducible whenever the top-level
+			// value happens to be embeddable.
 			ArrayList<ACell> novelty = new ArrayList<>();
-			Consumer<Ref<ACell>> noveltyHandler = r -> novelty.add(r.getValue());
+			Consumer<Ref<ACell>> noveltyHandler = r -> {
+				if (!r.isEmbedded()) novelty.add(r.getValue());
+			};
 			value = Cells.announce(value, noveltyHandler, store);
 
 			// 2. Set root data for restore (if persist enabled)
@@ -593,6 +611,71 @@ public class LatticePropagator implements Closeable {
 			} catch (Exception e) {
 				log.warn("Pull failed from peer: {}", peer.getHostAddress(), e);
 				throw new RuntimeException("Pull failed from peer", e);
+			}
+		});
+	}
+
+	/**
+	 * Pulls just a sub-path of a peer's lattice value (e.g. one database)
+	 * instead of the peer's entire lattice tree — for selective/partial
+	 * replication. Sends a LATTICE_QUERY with a real path (the server side,
+	 * {@code NodeServer#processLatticeQuery}, already honours this — only the
+	 * client convenience methods previously always queried the full root).
+	 *
+	 * <p>Unlike {@link #pull(Convex)}, this does <b>not</b> invoke the merge
+	 * callback (which is wired to expect a full-root value of type {@code V};
+	 * a value scoped to an arbitrary sub-path doesn't fit that type) and does
+	 * <b>not</b> queue the result for announce/persist/broadcast — merging a
+	 * partial value into the right place in the local cursor, and deciding
+	 * whether to propagate it further, is the caller's responsibility (see
+	 * {@code NodeServer#pullPath}, which merges via
+	 * {@code cursor.path(path).merge(value)}, the same mechanism used for
+	 * incoming LATTICE_VALUE broadcasts).
+	 *
+	 * @param peer Convex connection to the peer node
+	 * @param path Path within the peer's lattice to fetch (e.g. a single database-name key)
+	 * @return CompletableFuture completing with the value at that path (or null if absent there)
+	 */
+	public CompletableFuture<ACell> pullPath(Convex peer, ACell... path) {
+		if (peer == null) {
+			return CompletableFuture.failedFuture(new IllegalArgumentException("Peer cannot be null"));
+		}
+
+		return CompletableFuture.supplyAsync(() -> {
+			try {
+				if (!peer.isConnected()) {
+					throw new RuntimeException("Peer is not connected");
+				}
+
+				CVMLong queryId = CVMLong.create(System.currentTimeMillis());
+				AVector<ACell> pathVector = Vectors.of((Object[]) path);
+				AVector<?> queryPayload = Vectors.create(MessageTag.LATTICE_QUERY, queryId, pathVector);
+				Message queryMessage = Message.create(MessageType.LATTICE_QUERY, queryPayload);
+
+				CompletableFuture<Result> resultFuture = peer.message(queryMessage);
+				Result result = resultFuture.get(10, TimeUnit.SECONDS);
+
+				if (result.isError()) {
+					throw new RuntimeException("Path pull query failed: " + result);
+				}
+
+				ACell receivedValue = result.getValue();
+				if (receivedValue == null) return null;
+
+				ACell acquired;
+				try {
+					acquired = Cells.announce(receivedValue, r -> {}, store);
+				} catch (MissingDataException mde) {
+					Hash rootHash = Hash.get(receivedValue);
+					acquired = peer.acquire(rootHash, store).get(30, TimeUnit.SECONDS);
+				}
+
+				log.debug("Pulled path value from peer: {}", peer.getHostAddress());
+				return acquired;
+
+			} catch (Exception e) {
+				log.warn("Path pull failed from peer: {}", peer.getHostAddress(), e);
+				throw new RuntimeException("Path pull failed from peer", e);
 			}
 		});
 	}

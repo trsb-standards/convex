@@ -29,10 +29,12 @@ import convex.api.ConvexRemote;
 import convex.core.data.ASet;
 import convex.core.data.AString;
 import convex.core.data.Cells;
+import convex.core.data.Format;
 import convex.core.data.Hash;
 import convex.core.data.Index;
 import convex.core.data.Keyword;
 import convex.core.data.Maps;
+import convex.core.data.Ref;
 import convex.core.data.Sets;
 import convex.core.data.SignedData;
 import convex.core.data.Strings;
@@ -50,6 +52,8 @@ import convex.lattice.LatticeContext;
 import convex.lattice.P2PLattice;
 import convex.lattice.cursor.ACursor;
 import convex.lattice.cursor.PathCursor;
+import convex.lattice.generic.KeyedLattice;
+import convex.lattice.generic.LWWLattice;
 import convex.lattice.generic.MaxLattice;
 import convex.lattice.generic.SetLattice;
 
@@ -290,6 +294,226 @@ public class NodeServerTest {
 			assertEquals(CVMLong.ZERO, result); // Should return initial zero value
 		} finally {
 			peer.close();
+		}
+	}
+
+	/**
+	 * Test that pullPath(Convex, ACell...) pulls only the requested sub-path
+	 * of a peer's lattice value, and does not leak sibling regions the
+	 * caller never asked for — the mechanism behind selective/partial
+	 * replication (e.g. dbase's DbaseServer pulling just "meta", or just one
+	 * database, from a peer that may host several).
+	 */
+	@Test
+	public void testPullPathDoesNotLeakSiblingRegions() throws Exception {
+		Keyword regionA = Keyword.create("regiona");
+		Keyword regionB = Keyword.create("regionb");
+		KeyedLattice testLattice = KeyedLattice.create(
+			regionA, MaxLattice.create(),
+			regionB, MaxLattice.create());
+
+		NodeServer<Index<Keyword, ACell>> serverA = new NodeServer<>(testLattice, new MemoryStore());
+		NodeServer<Index<Keyword, ACell>> serverB = new NodeServer<>(testLattice, new MemoryStore());
+		try {
+			serverA.launch();
+			serverB.launch();
+
+			// A has data in BOTH regions
+			serverA.getCursor().path(regionA).merge(CVMLong.create(111));
+			serverA.getCursor().path(regionB).merge(CVMLong.create(222));
+			serverA.getCursor().sync();
+
+			ConvexRemote peerA = ConvexRemote.connect(serverA.getHostAddress());
+			try {
+				// B pulls ONLY regionA from A
+				CompletableFuture<ACell> future = serverB.pullPath(peerA, regionA);
+				ACell result = future.get(5, TimeUnit.SECONDS);
+
+				assertEquals(CVMLong.create(111), result);
+				assertEquals(CVMLong.create(111), serverB.getCursor().get(regionA));
+
+				// regionB must NOT have leaked in, even though it lives in
+				// the same lattice value on the peer
+				assertNull(serverB.getCursor().get(regionB));
+			} finally {
+				peerA.close();
+			}
+		} finally {
+			serverA.close();
+			serverB.close();
+		}
+	}
+
+	/**
+	 * Correctness test (NOT a timing reproduction — see below) for a GC race
+	 * found live 2026-08-05 (see dbase's CLAUDE.md "RefSoft/GC race"
+	 * writeup): {@code processLatticeValue} used to merge an incoming
+	 * LATTICE_VALUE into the cursor immediately, leaving it reachable only
+	 * via {@code RefSoft} (soft references) until the propagator's
+	 * background thread got around to announcing it — if GC won that race,
+	 * the update was silently lost. Fix: announce to the node's own store
+	 * synchronously, before merging.
+	 *
+	 * <p><b>This test cannot actually reproduce the race</b>: verified by
+	 * temporarily reverting the fix and re-running with a busy-spin
+	 * (zero-sleep) poll on the receiving side — it still passed, because the
+	 * bug requires the JVM's garbage collector to reclaim a soft reference
+	 * inside a narrow window, and nothing short of forcing real memory
+	 * pressure at exactly the right moment triggers that; a fast,
+	 * low-allocation test never gives GC a reason to run there. So this test
+	 * only proves the announce-then-merge path is correct end-to-end (data
+	 * ends up in the store, nothing throws) — the actual ordering guarantee
+	 * (announce happens-before merge, so seeing the merged cursor value also
+	 * guarantees seeing the announce) rests on reading the fix itself, not
+	 * on this test catching a reverted fix.
+	 *
+	 * <p>Sends a hand-crafted, fully-encoded LATTICE_VALUE message directly
+	 * (same shape {@code maybePerformRootSync} uses) rather than going
+	 * through the normal ambient {@code triggerBroadcast}/delta-encoding
+	 * path deliberately: that path has a separate, pre-existing bug where
+	 * its novelty-tracking doesn't reliably include every non-embedded child
+	 * cell (found while writing this test, tracked separately — not what
+	 * this test is about). Sending a full (non-delta) encoding sidesteps
+	 * that bug entirely, isolating just the announce-before-merge fix in
+	 * {@code processLatticeValue} on the *receiving* side.
+	 */
+	@Test
+	public void testIncomingLatticeValueIsAnnouncedToOwnStoreBeforeMerging() throws Exception {
+		// A simple last-write-wins register lattice (own==null just takes the
+		// incoming value directly) so this test isolates the fix itself,
+		// rather than exercising any particular lattice's comparison logic.
+		// AString (not a bare CVMLong) so the value is genuinely
+		// non-embedded — an embedded value has no separate hash at all and
+		// could never exercise the race in the first place.
+		Keyword region = Keyword.create("region");
+		KeyedLattice testLattice = KeyedLattice.create(region, LWWLattice.create(v -> 0L));
+
+		AStore storeB = new MemoryStore();
+		NodeServer<?> serverB = new NodeServer<>(testLattice, storeB, NodeConfig.port(0));
+		try {
+			serverB.launch();
+
+			AString bigValue = Strings.create("x".repeat(500));
+			Hash valueHash = Hash.get(bigValue);
+			Index<Keyword, ACell> rootValue = Index.of(region, bigValue);
+
+			AVector<ACell> emptyPath = Vectors.empty();
+			AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, emptyPath, rootValue);
+			// Message bodies are decoded via AStore.decodeMultiCell (see
+			// Message.getPayload(AStore)), which expects a *self-contained*
+			// multi-cell encoding (top cell + every non-embedded child's own
+			// bytes) — plain payload.getEncoding() only encodes the top
+			// cell with hash-only references to children, which a fresh
+			// receiver can't resolve on its own.
+			Message message = Message.create(MessageType.LATTICE_VALUE, payload, Format.encodeMultiCell(payload, true));
+
+			ConvexRemote peerB = ConvexRemote.connect(serverB.getHostAddress());
+			try {
+				peerB.message(message); // fire-and-forget: LATTICE_VALUE never sends a Result back
+
+				// Busy-spin (no sleep) rather than poll-with-delay: the fix's
+				// actual guarantee is a happens-before one — announce() runs
+				// on the SAME thread, strictly before the cursor update that
+				// makes get(region) visible to us, so the instant we observe
+				// a non-null value we're also guaranteed to observe the
+				// announce (per Java's cross-thread happens-before via the
+				// cursor's AtomicReference). A sleep-based poll's slack would
+				// give the (buggy) async-announce background thread ample
+				// time to "win" anyway, making the test pass either way and
+				// defeating the point of it.
+				long deadlineNanos = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+				ACell receivedOnB = null;
+				while (System.nanoTime() < deadlineNanos) {
+					receivedOnB = serverB.getCursor().get(region);
+					if (receivedOnB != null) break;
+					Thread.onSpinWait();
+				}
+				assertEquals(bigValue, receivedOnB, "B should have received and merged the message");
+
+				// The actual regression check: by the time B's cursor
+				// reflects the merge, the value must ALSO already be
+				// durably announced to B's own store — not just softly
+				// reachable via the live cursor object graph.
+				Ref<ACell> refInStoreB = storeB.refForHash(valueHash);
+				assertNotNull(refInStoreB, "expected the incoming value to already be persisted to B's store");
+				assertTrue(refInStoreB.isPersisted(),
+					"expected the incoming value's ref to be PERSISTED (status >= PERSISTED), not just soft-reachable");
+			} finally {
+				peerB.close();
+			}
+		} finally {
+			serverB.close();
+			storeB.close();
+		}
+	}
+
+	/**
+	 * Regression test for a real (100%-reproducible, not racy) bug found
+	 * live 2026-08-05 while writing the test above: {@code processValue}'s
+	 * novelty-tracking added the announced top-level cell to the delta's
+	 * "child cells" list regardless of whether that cell was itself
+	 * embeddable — a store's {@code persistRef} calls the novelty callback
+	 * at "topLevel || !embedded", so a *small* lattice value (one node's own
+	 * handful of self-registration rows, common early in a node's life) is
+	 * often embeddable itself, even though non-embedded data lives inside
+	 * it. {@code Format.encodeDelta}'s decode side (readChildCells) rejects
+	 * an embedded cell as a child outright ("Embedded Cell as child"),
+	 * so the receiver's message decode failed before {@code
+	 * processLatticeValue} ever ran — silently discarding the entire
+	 * ambient-broadcast update. Fix: {@code processValue}'s noveltyHandler
+	 * now skips embedded cells (they're already inlined in their parent's
+	 * own encoding, never needing a separate child-cell entry).
+	 *
+	 * <p>Unlike the test above, this one exercises the REAL ambient
+	 * broadcast path end-to-end (triggerBroadcast → delta encoding →
+	 * wire → processLatticeValue) rather than a hand-crafted message —
+	 * this is exactly the scenario that used to fail 100% of the time.
+	 */
+	@Test
+	public void testAmbientBroadcastOfASmallEmbeddableStructureWithANonEmbeddedChild() throws Exception {
+		Keyword region = Keyword.create("region");
+		KeyedLattice testLattice = KeyedLattice.create(region, LWWLattice.create(v -> 0L));
+
+		AStore storeA = new MemoryStore();
+		AStore storeB = new MemoryStore();
+		NodeServer<?> serverA = new NodeServer<>(testLattice, storeA, NodeConfig.port(0));
+		NodeServer<?> serverB = new NodeServer<>(testLattice, storeB, NodeConfig.port(0));
+		try {
+			serverA.launch();
+			serverB.launch();
+
+			AKeyPair keyA = AKeyPair.generate();
+			serverA.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyA));
+
+			ConvexRemote peerB = ConvexRemote.connect(serverB.getHostAddress());
+			try {
+				serverA.getPropagator().addPeer(keyA.getAccountKey(), peerB);
+
+				// The whole root value here is just one entry (region ->
+				// bigValue) — small enough that the top-level Index wrapping
+				// it is itself embeddable, even though bigValue is not.
+				AString bigValue = Strings.create("x".repeat(500));
+				assertFalse(bigValue.isEmbedded(), "test assumes bigValue itself is non-embedded");
+
+				serverA.getCursor().path(region).merge(bigValue);
+				serverA.getCursor().sync(); // triggers the REAL ambient broadcast path
+
+				long deadlineNanos = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+				ACell receivedOnB = null;
+				while (System.nanoTime() < deadlineNanos) {
+					receivedOnB = serverB.getCursor().get(region);
+					if (receivedOnB != null) break;
+				}
+				assertEquals(bigValue, receivedOnB,
+					"B should have received A's ambient broadcast (previously silently dropped)");
+			} finally {
+				peerB.close();
+			}
+		} finally {
+			serverA.close();
+			serverB.close();
+			storeA.close();
+			storeB.close();
 		}
 	}
 
