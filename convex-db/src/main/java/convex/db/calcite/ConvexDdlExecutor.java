@@ -66,9 +66,12 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 	 * Invokes {@link #onDdlExecuted} if set, swallowing (and logging) any
 	 * exception it throws — the DDL statement itself already succeeded by
 	 * the time this runs, so a failing callback must not roll it back or
-	 * break the client's connection.
+	 * break the client's connection. Public so other DDL entry points outside
+	 * this class (e.g. {@code ConvexMeta}'s regex-intercepted CREATE
+	 * INDEX/DROP INDEX, which never goes through this executor at all) can
+	 * fire the same hook.
 	 */
-	private static void fireDdlExecuted(ConvexDB cdb) {
+	public static void fireDdlExecuted(ConvexDB cdb) {
 		Consumer<ConvexDB> callback = onDdlExecuted;
 		if (callback == null || cdb == null) return;
 		try {
@@ -76,6 +79,36 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 		} catch (Exception e) {
 			LOG.warn("onDdlExecuted callback failed", e);
 		}
+	}
+
+	/**
+	 * Handler for the {@code REPLICATE DB "name"} statement (regex-intercepted
+	 * in {@code ConvexMeta}, same as CREATE/DROP INDEX, since Calcite's parser
+	 * has no grammar for it) — given just the db name, since a real handler
+	 * (registered by e.g. dbase's DbaseServer) already has everything else
+	 * (which node it is, its NodeServer, its own meta schema) closed over from
+	 * its own startup. Unlike {@link #onDdlExecuted}, a REPLICATE DB statement
+	 * IS the operation (there's no prior "already succeeded" step) — so, on
+	 * purpose, {@link #fireReplicateDb} does NOT swallow exceptions the way
+	 * {@link #fireDdlExecuted} does; they propagate back to the client as a
+	 * real query error instead.
+	 */
+	public static volatile Consumer<String> onReplicateDb;
+
+	/**
+	 * Invokes {@link #onReplicateDb}, letting any exception it throws
+	 * propagate to the caller (unlike {@link #fireDdlExecuted}) — a failed
+	 * replication attempt must be visible to the client as a query error, not
+	 * silently swallowed.
+	 *
+	 * @throws IllegalStateException if no handler is registered
+	 */
+	public static void fireReplicateDb(String dbName) {
+		Consumer<String> callback = onReplicateDb;
+		if (callback == null) {
+			throw new IllegalStateException("REPLICATE DB is not supported in this environment (no handler registered)");
+		}
+		callback.accept(dbName);
 	}
 
 	public static final SqlParserImplFactory PARSER_FACTORY =

@@ -1,6 +1,7 @@
 package convex.db.psql;
 
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
@@ -107,7 +108,19 @@ public class PgServer {
 				.option(ChannelOption.SO_BACKLOG, 128)
 				.option(ChannelOption.SO_REUSEADDR, true)
 				.childOption(ChannelOption.SO_KEEPALIVE, true)
-				.childOption(ChannelOption.TCP_NODELAY, true);
+				.childOption(ChannelOption.TCP_NODELAY, true)
+				// Netty's default allocator on this version is the newer
+				// "adaptive" one, whose chunk-release path throws
+				// NoClassDefFoundError: io/netty/buffer/FreeChunkEvent under
+				// this shaded jar (a first-load classloading failure that the
+				// JVM then permanently caches, silently abandoning whatever
+				// buffer that worker thread was mid-write on — the actual
+				// cause of a client hanging forever on an otherwise-ordinary
+				// query, found live 2026-08-04). PooledByteBufAllocator is
+				// the older, extremely well-tested allocator used across
+				// most production Netty deployments for years — pin to it
+				// explicitly rather than relying on Netty's own default.
+				.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
 
 			ChannelFuture f = b.bind(port).sync();
 			serverChannel = f.channel();
@@ -132,6 +145,17 @@ public class PgServer {
 	 */
 	public void startAndWait() throws InterruptedException {
 		start();
+		awaitClose();
+	}
+
+	/**
+	 * Blocks until the server closes. Split out from {@link #startAndWait}
+	 * so a caller can do something between "actually accepting connections"
+	 * and "block forever" — e.g. dbase.DbaseServer marking its own node
+	 * RUNNING only once the bind has genuinely succeeded, not just once
+	 * {@code start()} was called.
+	 */
+	public void awaitClose() throws InterruptedException {
 		serverChannel.closeFuture().sync();
 	}
 

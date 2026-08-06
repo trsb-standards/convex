@@ -141,6 +141,16 @@ public class ConvexSchema extends AbstractSchema {
 	/**
 	 * Creates a secondary index via DDL.
 	 *
+	 * <p>Table/column existence is checked explicitly rather than relying on
+	 * {@link convex.db.lattice.SQLSchema#createIndex}'s return value — that
+	 * method returns {@code false} both when the table doesn't exist in
+	 * *this* schema (e.g. the client's connection default schema isn't the
+	 * one actually holding the table — an easy mistake, since CREATE INDEX
+	 * here has no qualified-name support, see {@code ConvexMeta}) and,
+	 * ambiguously, would otherwise be indistinguishable from a genuine no-op.
+	 * Silently reporting success for the former case previously left a
+	 * client believing an index existed when nothing had actually happened.
+	 *
 	 * @param indexName  SQL index name (for later DROP INDEX lookup)
 	 * @param tableName  Table to index
 	 * @param columnName Column to index
@@ -149,6 +159,23 @@ public class ConvexSchema extends AbstractSchema {
 	 */
 	public boolean createIndex(String indexName, String tableName, String columnName,
 			boolean ifNotExists) {
+		if (!tables.tableExists(tableName)) {
+			throw new IllegalStateException(
+					"Table \"" + tableName + "\" does not exist in schema \"" + name + "\"");
+		}
+		String[] columnNames = tables.getColumnNames(tableName);
+		boolean columnFound = false;
+		for (String c : columnNames) {
+			if (c.equalsIgnoreCase(columnName)) {
+				columnFound = true;
+				break;
+			}
+		}
+		if (!columnFound) {
+			throw new IllegalStateException(
+					"Column \"" + columnName + "\" does not exist on table \"" + tableName + "\"");
+		}
+
 		if (tables.hasIndex(tableName, columnName)) {
 			if (ifNotExists) return false;
 			throw new IllegalStateException(

@@ -12,6 +12,8 @@ import org.apache.calcite.avatica.Meta.StatementHandle;
 import org.apache.calcite.avatica.NoSuchStatementException;
 import org.apache.calcite.schema.SchemaPlus;
 
+import convex.db.ConvexDB;
+import convex.db.calcite.ConvexDdlExecutor;
 import convex.db.calcite.ConvexSchema;
 import convex.db.lattice.SQLDatabase;
 
@@ -66,11 +68,25 @@ public class ConvexMeta extends CalciteMetaImpl {
 
 	// ── Secondary index DDL interception ─────────────────────────────────────
 
+	// Table name accepts an optional "schema." qualifier (e.g. "meta.otcol")
+	// — without it, a qualified reference just failed to match at all and
+	// fell through to Calcite's real parser, which has no CREATE/DROP INDEX
+	// grammar, producing a confusing parse error instead of doing the right
+	// thing. Unqualified still falls back to the connection's own default
+	// schema, same as before.
 	private static final Pattern CREATE_INDEX = Pattern.compile(
-		"(?i)CREATE\\s+INDEX\\s+(IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s+ON\\s+(\\w+)\\s*\\(\\s*(\\w+)[^)]*\\)\\s*");
+		"(?i)CREATE\\s+INDEX\\s+(IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s+ON\\s+(?:(\\w+)\\.)?(\\w+)\\s*\\(\\s*(\\w+)[^)]*\\)\\s*");
 
 	private static final Pattern DROP_INDEX = Pattern.compile(
-		"(?i)DROP\\s+INDEX\\s+(IF\\s+EXISTS\\s+)?(\\w+)(?:\\s+ON\\s+(\\w+))?\\s*");
+		"(?i)DROP\\s+INDEX\\s+(IF\\s+EXISTS\\s+)?(\\w+)(?:\\s+ON\\s+(?:(\\w+)\\.)?(\\w+))?\\s*");
+
+	// REPLICATE DB "name" (or unquoted) — same regex-interception trick as
+	// CREATE/DROP INDEX, since Calcite has no native grammar for this either.
+	// Must be issued on the connection of the node you want to become a
+	// replica; see ConvexDdlExecutor.onReplicateDb for why this can't reach
+	// out and command some OTHER named node instead.
+	private static final Pattern REPLICATE_DB = Pattern.compile(
+		"(?i)REPLICATE\\s+DB\\s+['\"]?(\\w+)['\"]?\\s*");
 
 	@Override
 	public ExecuteResult prepareAndExecute(StatementHandle h, String sql,
@@ -80,12 +96,15 @@ public class ConvexMeta extends CalciteMetaImpl {
 		if (m.matches()) {
 			boolean ifNotExists = m.group(1) != null;
 			String indexName  = m.group(2);
-			String tableName  = m.group(3);
-			String columnName = m.group(4);
-			ConvexSchema schema = findConvexSchema(getSchemaName());
-			if (schema != null) {
-				schema.createIndex(indexName, tableName, columnName, ifNotExists);
+			String schemaName = (m.group(3) != null) ? m.group(3) : getSchemaName();
+			String tableName  = m.group(4);
+			String columnName = m.group(5);
+			ConvexSchema schema = findConvexSchema(schemaName);
+			if (schema == null) {
+				throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
 			}
+			schema.createIndex(indexName, tableName, columnName, ifNotExists);
+			fireDdlExecuted(schema);
 			return new ExecuteResult(Collections.singletonList(
 					MetaResultSet.count(h.connectionId, h.id, 0L)));
 		}
@@ -94,10 +113,21 @@ public class ConvexMeta extends CalciteMetaImpl {
 		if (m.matches()) {
 			boolean ifExists = m.group(1) != null;
 			String indexName = m.group(2);
-			ConvexSchema schema = findConvexSchema(getSchemaName());
-			if (schema != null) {
-				schema.dropIndex(indexName, ifExists);
+			String schemaName = (m.group(3) != null) ? m.group(3) : getSchemaName();
+			ConvexSchema schema = findConvexSchema(schemaName);
+			if (schema == null) {
+				throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
 			}
+			schema.dropIndex(indexName, ifExists);
+			fireDdlExecuted(schema);
+			return new ExecuteResult(Collections.singletonList(
+					MetaResultSet.count(h.connectionId, h.id, 0L)));
+		}
+
+		m = REPLICATE_DB.matcher(sql.trim());
+		if (m.matches()) {
+			String dbName = m.group(1);
+			ConvexDdlExecutor.fireReplicateDb(dbName);
 			return new ExecuteResult(Collections.singletonList(
 					MetaResultSet.count(h.connectionId, h.id, 0L)));
 		}
@@ -193,6 +223,18 @@ public class ConvexMeta extends CalciteMetaImpl {
 		}
 		txDatabase = null;
 		originalSchema = null;
+	}
+
+	/**
+	 * Fires {@link ConvexDdlExecutor#onDdlExecuted} for a CREATE INDEX/DROP
+	 * INDEX statement — these never go through {@code ConvexDdlExecutor} at
+	 * all (intercepted earlier, via regex, since Calcite's DDL parser has no
+	 * native CREATE INDEX support here), so without this a caller relying on
+	 * that hook (e.g. to refresh ot/otindex and re-announce to peers) would
+	 * never see an index change take effect until a restart.
+	 */
+	private static void fireDdlExecuted(ConvexSchema schema) {
+		ConvexDdlExecutor.fireDdlExecuted(ConvexDB.lookup(schema.getName()));
 	}
 
 	private String getSchemaName() {

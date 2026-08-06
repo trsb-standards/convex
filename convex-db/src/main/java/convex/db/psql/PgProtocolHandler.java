@@ -228,13 +228,17 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			return;
 		}
 
+		long startNanos = System.nanoTime();
 		try (Statement stmt = connection.createStatement()) {
 			boolean hasResultSet = stmt.execute(sql);
 
 			if (hasResultSet) {
+				long rowCount;
 				try (ResultSet rs = stmt.getResultSet()) {
-					sendResultSet(ctx, rs, includeRowDescription);
+					rowCount = sendResultSet(ctx, rs, includeRowDescription);
 				}
+				write(ctx, NoticeResponse.timing(
+					rowCount + " " + rowsWord(rowCount) + " in set (" + formatElapsed(startNanos) + ")"));
 			} else {
 				int updateCount = stmt.getUpdateCount();
 				String upperSql = sql.toUpperCase().trim();
@@ -252,6 +256,8 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				} else {
 					write(ctx, new CommandComplete("OK"));
 				}
+				write(ctx, NoticeResponse.timing("Query OK, " + updateCount + " " + rowsWord(updateCount)
+					+ " affected (" + formatElapsed(startNanos) + ")"));
 			}
 		}
 	}
@@ -350,7 +356,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		return sql;
 	}
 
-	private void sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean includeRowDescription) throws SQLException {
+	private long sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean includeRowDescription) throws SQLException {
 		ResultSetMetaData meta = rs.getMetaData();
 		int columnCount = meta.getColumnCount();
 
@@ -368,6 +374,22 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 		// Send command complete
 		write(ctx, CommandComplete.select(rowCount));
+		return rowCount;
+	}
+
+	/**
+	 * Formats elapsed time since {@code startNanos} the same way MySQL's CLI
+	 * reports it ("0.008 sec") — a first step towards surfacing
+	 * replication-staleness timing (sync time vs. query time) once that
+	 * mechanism exists; for now this is just the query's own execution time.
+	 */
+	private static String formatElapsed(long startNanos) {
+		double seconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
+		return String.format("%.3f sec", seconds);
+	}
+
+	private static String rowsWord(long count) {
+		return count == 1 ? "row" : "rows";
 	}
 
 	// ========== Extended Query Protocol ==========
@@ -620,11 +642,15 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				}
 			}
 
+			long startNanos = System.nanoTime();
 			boolean hasResultSet = pstmt.execute();
 			if (hasResultSet) {
+				long rowCount;
 				try (ResultSet rs = pstmt.getResultSet()) {
-					sendResultSet(ctx, rs, includeRowDescription);
+					rowCount = sendResultSet(ctx, rs, includeRowDescription);
 				}
+				write(ctx, NoticeResponse.timing(
+					rowCount + " " + rowsWord(rowCount) + " in set (" + formatElapsed(startNanos) + ")"));
 			} else {
 				int updateCount = pstmt.getUpdateCount();
 				String upperSql = sql.toUpperCase().trim();
@@ -637,6 +663,8 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				} else {
 					write(ctx, new CommandComplete("OK"));
 				}
+				write(ctx, NoticeResponse.timing("Query OK, " + updateCount + " " + rowsWord(updateCount)
+					+ " affected (" + formatElapsed(startNanos) + ")"));
 			}
 		}
 	}

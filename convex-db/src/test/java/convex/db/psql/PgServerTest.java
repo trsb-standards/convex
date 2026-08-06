@@ -169,6 +169,50 @@ public class PgServerTest {
 			String completeMsg = new String(completeData, StandardCharsets.UTF_8);
 			assertTrue(completeMsg.startsWith("SELECT"));
 
+			// NoticeResponse: server-measured query timing ("1 row in set (X.XXX sec)")
+			type = in.readByte();
+			assertEquals('N', type);
+			length = in.readInt();
+			byte[] noticeData = new byte[length - 4];
+			in.readFully(noticeData);
+			String noticeMsg = new String(noticeData, StandardCharsets.UTF_8);
+			assertTrue(noticeMsg.contains("1 row in set ("), "expected timing notice, got: " + noticeMsg);
+			assertTrue(noticeMsg.contains("sec)"), "expected timing notice, got: " + noticeMsg);
+
+			// ReadyForQuery
+			type = in.readByte();
+			assertEquals('Z', type);
+		}
+	}
+
+	@Test
+	public void testInsertTimingNotice() throws IOException {
+		try (Socket socket = new Socket("localhost", server.getPort())) {
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+
+			sendStartupMessage(out, dbName, "testuser");
+			skipToReadyForQuery(in);
+
+			sendQuery(out, "INSERT INTO users (id, name, email) VALUES (3, 'Carol', 'carol@example.com')");
+
+			// CommandComplete
+			byte type = in.readByte();
+			assertEquals('C', type);
+			int length = in.readInt();
+			byte[] completeData = new byte[length - 4];
+			in.readFully(completeData);
+			assertTrue(new String(completeData, StandardCharsets.UTF_8).startsWith("INSERT"));
+
+			// NoticeResponse: "Query OK, 1 row affected (X.XXX sec)"
+			type = in.readByte();
+			assertEquals('N', type);
+			length = in.readInt();
+			byte[] noticeData = new byte[length - 4];
+			in.readFully(noticeData);
+			String noticeMsg = new String(noticeData, StandardCharsets.UTF_8);
+			assertTrue(noticeMsg.contains("Query OK, 1 row affected ("), "expected timing notice, got: " + noticeMsg);
+
 			// ReadyForQuery
 			type = in.readByte();
 			assertEquals('Z', type);
