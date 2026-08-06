@@ -1,11 +1,14 @@
 package convex.node;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,6 +26,7 @@ import convex.core.data.prim.CVMLong;
 import convex.core.lang.RT;
 import convex.core.store.AStore;
 import convex.core.store.MemoryStore;
+import convex.etch.EtchStore;
 import convex.lattice.ALattice;
 import convex.lattice.Lattice;
 
@@ -46,8 +50,12 @@ public class LatticePropagatorTest {
 		store1 = new MemoryStore();
 		store2 = new MemoryStore();
 
-		server1 = new NodeServer<>(lattice, store1, NodeConfig.port(19600));
-		server2 = new NodeServer<>(lattice, store2, NodeConfig.port(19601));
+		// Port 0 = OS-assigned free ports, avoiding bind collisions on busy CI runners.
+		// Peer connections below use getHostAddress(), which reflects the actual ports.
+		server1 = new NodeServer<>(lattice, store1, NodeConfig.port(0));
+		server2 = new NodeServer<>(lattice, store2, NodeConfig.port(0));
+		server1.setInboundPropagatorSelector(connection -> server1.getPropagator());
+		server2.setInboundPropagatorSelector(connection -> server2.getPropagator());
 
 		// Launch both servers
 		server1.launch();
@@ -128,8 +136,8 @@ public class LatticePropagatorTest {
 		}
 		Index<Hash, ACell> updatedDataIndex = dataIndex.assoc(valueHash, testValue);
 		server2.getCursor().assoc(dataKeyword, updatedDataIndex);
+		// Synchronous commit: sync() returns after primary announce + setRootData
 		server2.getCursor().sync();
-		Thread.sleep(100); // Let propagator process the sync
 
 		// Pull from server2 into server1
 		assertTrue(server1.pull(), "Pull should complete successfully");
@@ -137,6 +145,85 @@ public class LatticePropagatorTest {
 		// Verify server1 received the value from server2
 		assertEquals(testValue, RT.getIn(server1.getLocalValue(), dataKeyword, valueHash),
 			"Server1 should have received the value broadcast from server2");
+	}
+
+	/** Delta broadcast retains the protocol envelope and drives a real push merge. */
+	@Test
+	public void testDeltaPushUsesLatticeValueEnvelope() throws Exception {
+		Keyword dataKeyword = Keyword.intern("data");
+		ACell expected = CVMLong.create(4242);
+		Hash expectedHash = expected.getHash();
+		@SuppressWarnings("unchecked")
+		Index<Hash, ACell> values = (Index<Hash, ACell>) Index.EMPTY;
+		values = values.assoc(expectedHash, expected);
+		server1.getCursor().assoc(dataKeyword, values);
+		server1.getCursor().sync();
+
+		Convex connection = server1.getPropagator().getPeers().iterator().next();
+		connection.ping().get(5, TimeUnit.SECONDS);
+		assertEquals(1L, server1.getPropagator().getBroadcastCount(),
+			"source should send one delta broadcast");
+		NodeServer.InboundStats inbound = server2.getInboundStats();
+		assertEquals(1L, inbound.mergesAccepted,
+			"receiver should accept the pushed lattice merge: " + inbound);
+		ACell merged = server2.getLocalValue();
+		assertEquals(expected, RT.getIn(merged, dataKeyword, expectedHash),
+			"receiver should decode the LATTICE_VALUE tag/path before merging the delta");
+	}
+
+	/**
+	 * Regression test for the shutdown durability race: triggerAndClose sets
+	 * running=false before offering the final value, so the propagation loop
+	 * can observe running==false with an empty queue and exit without ever
+	 * consuming the value — silently losing the last writes on a clean
+	 * shutdown (seen as an intermittent NodeServerPersistenceTest failure on
+	 * CI).
+	 *
+	 * <p>The window is a few instructions wide and cannot be hit reliably by
+	 * brute force, so this test constructs the post-race state directly (loop
+	 * already exited, final value offered afterwards) and asserts the contract:
+	 * the value must still be processed before triggerAndClose returns, via
+	 * the closing thread's post-join drain.
+	 */
+	@Test
+	public void testTriggerAndCloseDrainsAfterLoopExit() throws Exception {
+		LatticePropagator propagator = new LatticePropagator(new MemoryStore());
+		propagator.start();
+
+		// Force the propagation loop to terminate while triggerAndClose still
+		// sees a propagator to shut down (running false, thread field non-null)
+		Field runningField = LatticePropagator.class.getDeclaredField("running");
+		runningField.setAccessible(true);
+		runningField.setBoolean(propagator, false);
+		Field threadField = LatticePropagator.class.getDeclaredField("propagationThread");
+		threadField.setAccessible(true);
+		Thread worker = (Thread) threadField.get(propagator);
+		worker.interrupt(); // wake from poll; loop drains (empty queue) and exits
+		worker.join(10_000);
+		assertFalse(worker.isAlive(), "Propagation loop should have exited");
+
+		// The final value is offered to a queue no thread will ever read;
+		// only the closing thread's drain can process it
+		ACell finalValue = CVMLong.create(424242);
+		propagator.triggerAndClose(finalValue);
+		assertEquals(finalValue, propagator.getLastAnnouncedValue(),
+			"Final value must be announced even when the loop exited before the offer");
+	}
+
+	/**
+	 * As above, but with a persistent store: the final value must be durable
+	 * (readable as root data) once triggerAndClose returns.
+	 */
+	@Test
+	public void testTriggerAndClosePersistsFinalValue() throws IOException {
+		try (EtchStore store = EtchStore.createTemp("propagator-close")) {
+			LatticePropagator propagator = new LatticePropagator(store);
+			propagator.start();
+			ACell finalValue = CVMLong.create(12345);
+			propagator.triggerAndClose(finalValue);
+			assertEquals(finalValue, store.getRootData(),
+				"Final value must be persisted as root data before triggerAndClose returns");
+		}
 	}
 
 	/**
@@ -160,8 +247,8 @@ public class LatticePropagatorTest {
 			}
 			Index<Hash, ACell> updatedDataIndex = dataIndex.assoc(valueHash, testValue);
 			server1.getCursor().assoc(dataKeyword, updatedDataIndex);
+			// Synchronous commit: sync() returns after primary announce + setRootData
 			server1.getCursor().sync();
-			Thread.sleep(100); // Let propagator process the sync
 
 			// Pull from server1 into server2
 			assertTrue(server2.pull(), "Pull should complete successfully for update " + (i + 1));

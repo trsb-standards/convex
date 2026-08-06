@@ -20,14 +20,14 @@ HTTP REST API server for accessing the [Convex](https://convex.world) network vi
 <dependency>
     <groupId>world.convex</groupId>
     <artifactId>convex-restapi</artifactId>
-    <version>0.8.2</version>
+    <version>0.8.10</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'world.convex:convex-restapi:0.8.2'
+implementation 'world.convex:convex-restapi:0.8.10'
 ```
 
 ## Usage
@@ -36,10 +36,13 @@ implementation 'world.convex:convex-restapi:0.8.2'
 
 ```java
 import convex.api.Convex;
+import convex.core.crypto.AKeyPair;
+import convex.peer.API;
 import convex.peer.Server;
 import convex.restapi.RESTServer;
 
-// Connect to a peer
+// Launch a local peer and connect to it
+AKeyPair keyPair = AKeyPair.generate();
 Server peerServer = API.launchPeer();
 Convex convex = Convex.connect(peerServer, peerServer.getPeerController(), keyPair);
 
@@ -53,9 +56,11 @@ rest.start(8080);
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/v1/query` | POST | Execute read-only query |
-| `/api/v1/transact` | POST | Submit signed transaction |
+| `/api/v1/transact` | POST | Submit a signed transaction, or a seed for server-side signing |
 | `/api/v1/faucet` | POST | Request test funds (test networks) |
 | `/api/v1/accounts/{address}` | GET | Get account information |
+| `/api/v1/watch` | GET (SSE) | Watch a query result against finalised state (disabled by default) |
+| `/api/v1/watch/logs` | GET (SSE) | Watch filtered finalised log events |
 
 ### Example Requests
 
@@ -70,11 +75,18 @@ curl -X POST http://localhost:8080/api/v1/query \
 ```bash
 curl -X POST http://localhost:8080/api/v1/transact \
   -H "Content-Type: application/json" \
-  -d '{"address": "#11", "source": "(transfer #42 1000)", "sig": "..."}'
+  -d '{"address": "#11", "source": "(transfer #42 1000)", "seed": "<64 hex characters>"}'
 ```
+
+The JSON form of `transact` sends a private seed to the server. Cleartext HTTP
+is accepted only from loopback by default; remote clients must use HTTPS. Use
+locally signed transactions with `transaction/prepare` and `transaction/submit`
+where possible so the private key never leaves the client.
 
 ## Documentation
 
+- [Filtered log watching](LOG_WATCHING.md)
+- [Query-result watching](QUERY_WATCHING.md)
 - [Javadoc API Reference](https://javadoc.io/doc/world.convex/convex-restapi)
 - [Convex Documentation](https://docs.convex.world)
 - [API Specification](https://docs.convex.world/docs/convex-api)

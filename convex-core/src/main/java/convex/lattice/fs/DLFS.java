@@ -48,10 +48,29 @@ public class DLFS {
 	 */
 	public static DLFSLocal connect(ALatticeCursor<?> parent, AString driveName) {
 		ALatticeCursor<AVector<ACell>> cursor = parent.path(driveName);
-		if (cursor.get() == null) {
-			cursor.set(DLFSLattice.INSTANCE.zero());
-		}
+		// Atomic init: read-then-set is racy under concurrent connect()s — a late
+		// reader could observe null and set(zero), clobbering an earlier writer's
+		// committed contents. updateAndGet is a single CAS and is idempotent.
+		cursor.updateAndGet(current -> current != null ? current : DLFSLattice.INSTANCE.zero());
 		return new DLFSLocal(PROVIDER, driveName.toString(), cursor);
+	}
+
+	/**
+	 * Opens an existing DLFS drive at a named path without creating it.
+	 *
+	 * <p>This is intended for registries which keep the parent map as their source of
+	 * truth. Unlike {@link #connect(ALatticeCursor, AString)}, a concurrent deletion
+	 * cannot be reversed merely by opening a cached filesystem view.</p>
+	 *
+	 * @param parent Parent lattice cursor containing named drives
+	 * @param driveName Existing drive name
+	 * @return Connected filesystem view, or {@code null} if the drive is absent
+	 */
+	public static DLFSLocal open(ALatticeCursor<?> parent, AString driveName) {
+		ALatticeCursor<AVector<ACell>> cursor=parent.path(driveName);
+		AVector<ACell> root=cursor.get();
+		if (root==null) return null;
+		return new DLFSLocal(PROVIDER, driveName.toString(), cursor, DLFSNode.getUTime(root));
 	}
 
 	public static DLFileSystem createLocal() {

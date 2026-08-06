@@ -68,10 +68,6 @@ public class NodeNetworkTest {
 	 */
 	private static final int NETWORK_SIZE = 3;
 	
-	/**
-	 * Base port for the first NodeServer (others will use sequential ports)
-	 */
-	private static final int BASE_PORT = 19000;
 
 	/**
 	 * Sets up the network of NodeServers before all tests run.
@@ -96,9 +92,11 @@ public class NodeNetworkTest {
 			AStore store = new MemoryStore();
 			stores.add(store);
 			
-			// Create NodeServer with the common lattice
-			Integer port = BASE_PORT + i;
-			NodeServer<?> server = new NodeServer<>(commonLattice, store, NodeConfig.port(port));
+			// Create NodeServer with the common lattice. Port 0 = OS-assigned free
+			// port, avoiding bind collisions on busy CI runners; peer wiring below
+			// uses getHostAddress() which reflects the actual port.
+			NodeServer<?> server = new NodeServer<>(commonLattice, store, NodeConfig.port(0));
+			server.setInboundPropagatorSelector(connection -> server.getPropagator());
 			nodeServers.add(server);
 			
 			// Launch the server
@@ -198,9 +196,9 @@ public class NodeNetworkTest {
 		// Update the :data path with the updated Index
 		server0.getCursor().assoc(dataKeyword, updatedDataIndex);
 
-		// Sync so the propagator has the value for LATTICE_QUERY responses
+		// Sync so the propagator has the value for LATTICE_QUERY responses.
+		// Synchronous commit: announce completes on this thread before return.
 		server0.getCursor().sync();
-		Thread.sleep(100);
 
 		// Create the query path [:data valueHash] for reuse
 		AVector<ACell> queryPath = Vectors.create(dataKeyword, valueHash);

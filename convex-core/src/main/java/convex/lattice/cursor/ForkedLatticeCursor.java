@@ -14,7 +14,9 @@ import convex.lattice.LatticeContext;
  * sync operations on top.</p>
  *
  * <p>Modifications to a forked cursor don't affect the parent until {@link #sync()}
- * is called. The sync operation uses lattice merge semantics and always succeeds.</p>
+ * is called. A fork snapshots its resolved context for local writes. If the parent
+ * changed since the fork, sync merges the local fork value with the parent using the
+ * parent's current effective context.</p>
  *
  * <h3>Concurrent writes during sync</h3>
  * <p>{@link #sync()} is safe to call while other threads are writing to the fork.
@@ -30,6 +32,7 @@ public class ForkedLatticeCursor<V extends ACell> extends ALatticeCursor<V> {
 	private final ALatticeCursor<V> parent;
 	private final Root<V> localCursor;
 	private volatile V forkPoint;
+	private final LatticeContext forkContext;
 
 	/**
 	 * Creates a forked cursor from a parent.
@@ -37,27 +40,40 @@ public class ForkedLatticeCursor<V extends ACell> extends ALatticeCursor<V> {
 	 * @param parent The parent cursor to fork from
 	 * @param lattice The lattice defining merge semantics
 	 * @param currentValue The value at the time of fork
-	 * @param context The merge context
+	 * @param context Resolved merge-context snapshot captured at fork time
 	 */
 	ForkedLatticeCursor(ALatticeCursor<V> parent, ALattice<V> lattice, V currentValue, LatticeContext context) {
-		super(lattice, context, currentValue);
+		super(lattice, null, currentValue);
 		this.parent = parent;
 		this.localCursor = Root.create(currentValue);
 		this.forkPoint = currentValue;
+		this.forkContext = (context != null) ? context : LatticeContext.EMPTY;
+	}
+
+	@Override
+	protected LatticeContext getInheritedContext() {
+		return forkContext;
 	}
 
 	@Override
 	public V sync() {
 		V localVal = localCursor.get();
 
-		// Atomically update parent and get the merged result
+		// Atomically update parent and get the merged result.
+		//
+		// Argument order is critical: merge positions are not equivalent.
+		// The fork's local edits are the value being applied, so they are
+		// "own" — for LWW-style lattices that prefer own on timestamp ties,
+		// a locally made edit (e.g. a deletion re-stamped in the same
+		// millisecond as its predecessor) must win against a concurrent
+		// parent advance such as a propagator merge-back of an older
+		// snapshot. Strictly newer parent values still win via timestamp.
 		V synced = parent.updateAndGet(parentValue -> {
 			if (parentValue == forkPoint) {
 				// Fast path: parent unchanged since fork
 				return localVal;
 			} else if (lattice != null) {
-				// Parent changed: perform lattice merge
-				return lattice.merge(context, parentValue, localVal);
+				return lattice.merge(parent.getContext(), localVal, parentValue);
 			} else {
 				// Null lattice: write-back (overwrite parent)
 				return localVal;
@@ -81,7 +97,7 @@ public class ForkedLatticeCursor<V extends ACell> extends ALatticeCursor<V> {
 		if (!localCursor.compareAndSet(localVal, synced)) {
 			if (lattice != null) {
 				localCursor.updateAndGet(current ->
-					lattice.merge(context, current, synced));
+					lattice.merge(getContext(), current, synced));
 			}
 			// Null lattice with concurrent writers: no well-defined merge.
 			// Leave concurrent writes in place — they will propagate to parent

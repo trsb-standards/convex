@@ -3,6 +3,7 @@ package convex.restapi.mcp;
 import java.util.List;
 
 import convex.api.Convex;
+import convex.auth.did.DID;
 import convex.auth.ucan.UCAN;
 import convex.core.Coin;
 import convex.core.Result;
@@ -74,7 +75,7 @@ class SigningMcpTools {
 	/**
 	 * Registers all signing service tools with the MCP API.
 	 */
-	void registerAll() {
+	void registerAll(boolean elevated) {
 		api.registerTool(new SigningServiceInfoTool());
 		api.registerTool(new SigningCreateKeyTool());
 		api.registerTool(new SigningListKeysTool());
@@ -87,11 +88,12 @@ class SigningMcpTools {
 		api.registerTool(new SigningListAccountsTool());
 		api.registerTool(new SigningDelegateTool());
 
-		// Elevated tools
-		api.registerTool(new SigningImportKeyTool());
-		api.registerTool(new SigningExportKeyTool());
-		api.registerTool(new SigningDeleteKeyTool());
-		api.registerTool(new SigningChangePassphraseTool());
+		if (elevated) {
+			api.registerTool(new SigningImportKeyTool());
+			api.registerTool(new SigningExportKeyTool());
+			api.registerTool(new SigningDeleteKeyTool());
+			api.registerTool(new SigningChangePassphraseTool());
+		}
 	}
 
 	// ==================== Helpers ====================
@@ -353,7 +355,6 @@ class SigningMcpTools {
 				// Build transaction
 				long sequence = as.getSequence() + 1;
 				ATransaction transaction = Invoke.create(address, sequence, code);
-				transaction = Cells.persist(transaction, srv.getStore());
 				Ref<ATransaction> ref = transaction.getRef();
 				Blob message = SignedData.getMessageForRef(ref);
 
@@ -444,8 +445,6 @@ class SigningMcpTools {
 		}
 	}
 
-	// TODO: signingListAccounts should resolve on-chain addresses per key
-	// when the peer has a proper key→account index. For now, returns keys only.
 	private class SigningListAccountsTool extends McpTool {
 		SigningListAccountsTool() {
 			super(McpTool.loadMetadata("convex/restapi/mcp/tools/signingListAccounts.json"));
@@ -459,18 +458,49 @@ class SigningMcpTools {
 			SigningService svc = getSigningService();
 			if (svc == null) return api.toolError("Signing service not available");
 
+			// #551: opt-in on-chain address resolution — a full scan of the
+			// account table, so off by default (fine for gateway peers, not
+			// free on large states)
+			boolean resolve = RT.bool(arguments.get(McpAPI.ARG_RESOLVE));
+
 			try {
 				List<AccountKey> keys = svc.listKeys(identity);
+				java.util.Map<AccountKey, AVector<ACell>> resolved =
+					resolve ? resolveAddresses(keys) : null;
 				AVector<ACell> entries = Vectors.empty();
 				for (AccountKey key : keys) {
-					entries = entries.conj(Maps.of(
-						"publicKey", key.toString()
-					));
+					AMap<AString, ACell> entry = Maps.of("publicKey", key.toString());
+					if (resolved != null) {
+						AVector<ACell> addrs = resolved.get(key);
+						entry = entry.assoc(Strings.intern("addresses"),
+							(addrs != null) ? addrs : Vectors.empty());
+					}
+					entries = entries.conj(entry);
 				}
 				return api.toolSuccess(Maps.of("accounts", entries));
 			} catch (Exception e) {
 				return api.toolError("List accounts failed: " + e.getMessage());
 			}
+		}
+
+		/**
+		 * Single pass over the consensus state's account table, collecting the
+		 * addresses whose on-chain key matches one of the given signing keys (#551).
+		 */
+		private java.util.Map<AccountKey, AVector<ACell>> resolveAddresses(List<AccountKey> keys) {
+			java.util.Set<AccountKey> wanted = new java.util.HashSet<>(keys);
+			java.util.Map<AccountKey, AVector<ACell>> result = new java.util.HashMap<>();
+			AVector<AccountStatus> accounts = api.getRESTServer().getServer().getState().getAccounts();
+			long n = accounts.count();
+			for (long i = 0; i < n; i++) {
+				AccountKey k = accounts.get(i).getAccountKey();
+				if ((k != null) && wanted.contains(k)) {
+					AVector<ACell> addrs = result.getOrDefault(k, Vectors.empty());
+					// Address values as longs, matching signingCreateAccount's "address" field
+					result.put(k, addrs.conj(CVMLong.create(i)));
+				}
+			}
+			return result;
 		}
 	}
 
@@ -499,21 +529,32 @@ class SigningMcpTools {
 			if (publicKey == null) return api.toolError("Invalid public key format");
 
 			// Extract nested ucan object
-			AMap<AString, ACell> ucanArgs = RT.ensureMap(arguments.get(ARG_UCAN));
+			AMap<AString, ACell> ucanArgs = RT.castMap(arguments.get(ARG_UCAN));
 			if (ucanArgs == null) return api.toolError("signingDelegate requires 'ucan' object");
 
 			// Parse aud (required) — accept did:key or hex public key
 			AString audCell = RT.ensureString(ucanArgs.get(UCAN.AUD));
 			if (audCell == null) return api.toolError("ucan.aud is required");
 
-			AccountKey audienceKey;
+			AString audienceDID;
 			String audStr = audCell.toString();
-			if (audStr.startsWith("did:key:")) {
-				audienceKey = UCAN.fromDIDKey(audCell);
+			if (audStr.startsWith("did:")) {
+				try {
+					DID did = DID.fromString(audStr);
+					if (did.getMethod().isEmpty() || did.getID().isEmpty()) {
+						return api.toolError("Invalid aud: must be a valid DID or hex public key");
+					}
+					audienceDID = audCell;
+				} catch (RuntimeException ex) {
+					return api.toolError("Invalid aud: must be a valid DID or hex public key");
+				}
 			} else {
-				audienceKey = AccountKey.parse(audStr);
+				AccountKey audienceKey = AccountKey.parse(audStr);
+				if (audienceKey == null) {
+					return api.toolError("Invalid aud: must be a valid DID or hex public key");
+				}
+				audienceDID = UCAN.toDIDKey(audienceKey);
 			}
-			if (audienceKey == null) return api.toolError("Invalid aud: must be a did:key string or hex public key");
 
 			// Parse exp (required)
 			CVMLong expCell = RT.ensureLong(ucanArgs.get(UCAN.EXP));
@@ -532,7 +573,7 @@ class SigningMcpTools {
 			try {
 				// Build payload and sign via signing service
 				AMap<AString, ACell> payload = UCAN.buildPayload(
-					publicKey, audienceKey, expiry, notBefore, att, prf, fct);
+					publicKey, audienceDID, expiry, notBefore, att, prf, fct);
 				Blob message = Ref.get(payload).getEncoding();
 				ASignature signature = svc.sign(identity, publicKey, passphrase, message);
 				if (signature == null) return api.toolError("Key not found or wrong passphrase");
@@ -571,6 +612,8 @@ class SigningMcpTools {
 
 			AString seedCell = RT.ensureString(arguments.get(McpAPI.ARG_SEED));
 			if (seedCell == null) return api.toolError("signingImportKey requires 'seed' string");
+			AMap<AString, ACell> transportError = api.checkSeedTransport();
+			if (transportError != null) return transportError;
 
 			AString passphrase = RT.ensureString(arguments.get(McpAPI.ARG_PASSPHRASE));
 			if (passphrase == null) return api.toolError("signingImportKey requires 'passphrase' string");
@@ -611,6 +654,8 @@ class SigningMcpTools {
 
 			AString passphrase = RT.ensureString(arguments.get(McpAPI.ARG_PASSPHRASE));
 			if (passphrase == null) return api.toolError("signingExportKey requires 'passphrase' string");
+			AMap<AString, ACell> transportError = api.checkSeedTransport();
+			if (transportError != null) return transportError;
 
 			AccountKey publicKey = AccountKey.parse(publicKeyCell.toString());
 			if (publicKey == null) return api.toolError("Invalid public key format");

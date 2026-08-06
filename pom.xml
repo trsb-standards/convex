@@ -1,10 +1,10 @@
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+<project xmlns="https://maven.apache.org/POM/4.0.0"
+	xmlns:xsi="https://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>world.convex</groupId>
 	<artifactId>convex</artifactId>
-	<version>0.8.4-SNAPSHOT</version>
+	<version>0.8.11-SNAPSHOT</version>
 	<packaging>pom</packaging>
 
 	<name>Convex Parent</name>
@@ -20,30 +20,47 @@
 		<module>convex-benchmarks</module>
 		<module>convex-observer</module>
 		<module>convex-java</module>
+		<module>convex-x402</module>
 		<module>convex-restapi</module>
 		<module>convex-dlfs</module>
 		<module>convex-social</module>
+		<module>convex-p2p</module>
 		<module>convex-integration</module>
 	</modules>
 
 	<properties>
+		<!-- Bytecode target = the consumer floor: 21-targeted classes run on any JRE 21+,
+		     keeping convex-java and the other library modules usable by downstream apps on
+		     the current LTS. We develop and release on JDK 25, while CI verifies both JDK 21
+		     and JDK 25. This target is independent from the build and test JDK. -->
 		<maven.compiler.release>21</maven.compiler.release>
-		<maven.compiler.source>21</maven.compiler.source>
-		<maven.compiler.target>21</maven.compiler.target>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-		<logback.version>1.5.32</logback.version>
+		<logback.version>1.6.0</logback.version>
 		<jmh.version>1.37</jmh.version>
-		<junit.version>6.0.1</junit.version>
-		<slf4j.version>2.0.16</slf4j.version>
+		<junit.version>6.1.2</junit.version>
+		<slf4j.version>2.0.18</slf4j.version>
 		<hc.version>5.5</hc.version>
-		<netty.version>4.2.7.Final</netty.version>
+		<netty.version>4.2.16.Final</netty.version>
 		<convex.version>${project.version}</convex.version>
 		<!--Freeze this for reproducible builds. -->
-		<project.build.outputTimestamp>2026-03-02T12:02:33Z</project.build.outputTimestamp>
+		<project.build.outputTimestamp>2026-07-25T11:42:38Z</project.build.outputTimestamp>
+		<!-- slf4j.internal.verbosity=ERROR silences SLF4J's informational init-replay
+		     notice in test output (at the cost of hiding e.g. multiple-provider warnings). -->
 		<argLine>
 			--add-opens=java.base/java.util=ALL-UNNAMED
+			-Dslf4j.internal.verbosity=ERROR
 		</argLine>
 	</properties>
+
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.apache.commons</groupId>
+				<artifactId>commons-lang3</artifactId>
+				<version>3.20.0</version>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
 
 	<licenses>
 		<license>
@@ -70,7 +87,7 @@
 	<distributionManagement>
 		<snapshotRepository>
 			<id>central</id>
-			<url>https://central.sonatype.org/repository/maven-snapshots/</url>
+			<url>https://central.sonatype.com/repository/maven-snapshots/</url>
 		</snapshotRepository>
 	</distributionManagement>
 
@@ -113,7 +130,7 @@
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-enforcer-plugin</artifactId>
-				<version>3.6.2</version>
+				<version>3.6.3</version>
 				<executions>
 					<execution>
 						<id>enforce-maven</id>
@@ -144,7 +161,7 @@
 		    <plugin>
   		        <groupId>org.sonatype.central</groupId>
 				<artifactId>central-publishing-maven-plugin</artifactId>
-				<version>0.9.0</version>
+				<version>0.11.0</version>
  				<extensions>true</extensions>
 				<configuration>
 					<publishingServerId>central</publishingServerId>
@@ -157,7 +174,7 @@
 			<plugin>
 				<groupId>org.cyclonedx</groupId>
 				<artifactId>cyclonedx-maven-plugin</artifactId>
-				<version>2.9.1</version>
+				<version>2.9.2</version>
 				<executions>
 					<execution>
 						<phase>deploy</phase>
@@ -189,17 +206,17 @@
 				<plugin>
 					<groupId>org.apache.maven.plugins</groupId>
 					<artifactId>maven-jar-plugin</artifactId>
-					<version>3.4.2</version>
+					<version>3.5.1</version>
 				</plugin>
 				<plugin>
 					<groupId>org.apache.maven.plugins</groupId>
 					<artifactId>maven-compiler-plugin</artifactId>
-					<version>3.14.1</version>
+					<version>3.15.0</version>
 				</plugin>
 				<plugin>
 					<groupId>org.apache.maven.plugins</groupId>
 					<artifactId>maven-surefire-plugin</artifactId>
-					<version>3.5.4</version>
+					<version>3.5.6</version>
 					<configuration>
 						<forkedProcessExitTimeoutInSeconds>120</forkedProcessExitTimeoutInSeconds>
 					</configuration>
@@ -207,7 +224,7 @@
 				<plugin>
                 	<groupId>org.apache.maven.plugins</groupId>
                 	<artifactId>maven-resources-plugin</artifactId>
-                	<version>3.3.1</version>
+                	<version>3.5.0</version>
                 	<configuration>
 				        <!-- Silence warnings with explicit encoding -->
 				        <encoding>UTF-8</encoding>
@@ -219,7 +236,7 @@
 				<plugin>
 					<groupId>org.apache.maven.plugins</groupId>
 					<artifactId>maven-source-plugin</artifactId>
-					<version>3.3.1</version>
+					<version>3.4.0</version>
 					<executions>
 						<execution>
 							<id>attach-sources</id>
@@ -236,10 +253,15 @@
 				<plugin>
 					<groupId>org.apache.maven.plugins</groupId>
 					<artifactId>maven-javadoc-plugin</artifactId>
-					<version>3.10.0</version>
+					<version>3.12.0</version>
 					<configuration>
 						<doclint>syntax</doclint>
 						<quiet />
+						<doctitle>${project.name} ${project.version} API</doctitle>
+						<windowtitle>${project.name} ${project.version} API</windowtitle>
+						<header><![CDATA[<b>Convex</b> ${project.version}]]></header>
+						<bottom><![CDATA[Copyright &copy; Convex Foundation. Licensed under the <a href="https://github.com/Convex-Dev/convex/blob/master/LICENSE.md">Convex Public License</a>. See <a href="https://docs.convex.world/">docs.convex.world</a> for user documentation.]]></bottom>
+						<notimestamp>true</notimestamp>
 					</configuration>
 					<executions>
 						<execution>

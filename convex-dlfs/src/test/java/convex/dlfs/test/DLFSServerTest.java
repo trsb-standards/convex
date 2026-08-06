@@ -41,6 +41,29 @@ public class DLFSServerTest {
 	}
 
 	@Test
+	void testMalformedMethodRejected() throws Exception {
+		// Method tokens Javalin cannot route (hyphenated/lowercase) → 501, not 500
+		HttpRequest hyphenated = HttpRequest.newBuilder()
+				.uri(URI.create(driveURL))
+				.method("M-SEARCH", HttpRequest.BodyPublishers.noBody())
+				.build();
+		assertEquals(501, client.send(hyphenated, HttpResponse.BodyHandlers.ofString()).statusCode());
+
+		HttpRequest lowercase = HttpRequest.newBuilder()
+				.uri(URI.create(driveURL))
+				.method("propfind", HttpRequest.BodyPublishers.noBody())
+				.build();
+		assertEquals(501, client.send(lowercase, HttpResponse.BodyHandlers.ofString()).statusCode());
+
+		// Well-formed but unknown method falls through to normal routing → 404
+		HttpRequest unknown = HttpRequest.newBuilder()
+				.uri(URI.create(baseURL + "no-such-place"))
+				.method("FOOBAR", HttpRequest.BodyPublishers.noBody())
+				.build();
+		assertEquals(404, client.send(unknown, HttpResponse.BodyHandlers.ofString()).statusCode());
+	}
+
+	@Test
 	void testPutAndGetRoundTrip() throws Exception {
 		String content = "Hello DLFS!";
 		String path = driveURL + "test.txt";
@@ -189,7 +212,95 @@ public class DLFSServerTest {
 		assertTrue(allow.contains("DELETE"), "Allow should contain DELETE");
 
 		String dav = resp.headers().firstValue("DAV").orElse("");
-		assertTrue(dav.contains("1"), "DAV header should include class 1");
+		assertEquals("1", dav, "Only implemented DAV class 1 semantics should be advertised");
+		assertFalse(allow.contains("LOCK"), "Unsupported locking must not be advertised");
+	}
+
+	@Test
+	void testUnsupportedWebDavMethodsFailHonestly() throws Exception {
+		for (String method : new String[] { "LOCK", "UNLOCK", "PROPPATCH" }) {
+			HttpRequest req = HttpRequest.newBuilder()
+				.uri(URI.create(driveURL))
+				.method(method, HttpRequest.BodyPublishers.noBody())
+				.build();
+			assertEquals(501, client.send(req, HttpResponse.BodyHandlers.ofString()).statusCode(), method);
+		}
+	}
+
+	@Test
+	void testInvalidDriveNameRejected() throws Exception {
+		HttpRequest req = HttpRequest.newBuilder()
+			.uri(URI.create(baseURL + "bad%3Aname/"))
+			.method("MKCOL", HttpRequest.BodyPublishers.noBody())
+			.build();
+		assertEquals(400, client.send(req, HttpResponse.BodyHandlers.ofString()).statusCode());
+	}
+
+	@Test
+	void testDirectoryMoveFailsWithoutPartialMutation() throws Exception {
+		String source = driveURL + "move-directory-source/";
+		HttpRequest create = HttpRequest.newBuilder(URI.create(source))
+			.method("MKCOL", HttpRequest.BodyPublishers.noBody()).build();
+		assertEquals(201, client.send(create, HttpResponse.BodyHandlers.ofString()).statusCode());
+
+		HttpRequest move = HttpRequest.newBuilder(URI.create(source))
+			.method("MOVE", HttpRequest.BodyPublishers.noBody())
+			.header("Destination", driveURL + "move-directory-target/").build();
+		assertEquals(501, client.send(move, HttpResponse.BodyHandlers.ofString()).statusCode());
+		assertEquals(200, client.send(HttpRequest.newBuilder(URI.create(source)).GET().build(),
+			HttpResponse.BodyHandlers.ofString()).statusCode());
+	}
+
+	@Test
+	void testETagWritePreconditions() throws Exception {
+		String path = driveURL + "conditional.txt";
+		HttpResponse<String> created = client.send(HttpRequest.newBuilder(URI.create(path))
+			.PUT(HttpRequest.BodyPublishers.ofString("v1")).build(), HttpResponse.BodyHandlers.ofString());
+		assertEquals(201, created.statusCode());
+
+		HttpResponse<String> get = client.send(HttpRequest.newBuilder(URI.create(path)).GET().build(),
+			HttpResponse.BodyHandlers.ofString());
+		String etag = get.headers().firstValue("ETag").orElseThrow();
+
+		HttpResponse<String> stale = client.send(HttpRequest.newBuilder(URI.create(path))
+			.header("If-Match", "\"stale\"")
+			.PUT(HttpRequest.BodyPublishers.ofString("bad")).build(), HttpResponse.BodyHandlers.ofString());
+		assertEquals(412, stale.statusCode());
+
+		HttpResponse<String> replace = client.send(HttpRequest.newBuilder(URI.create(path))
+			.header("If-Match", etag)
+			.PUT(HttpRequest.BodyPublishers.ofString("v2")).build(), HttpResponse.BodyHandlers.ofString());
+		assertEquals(204, replace.statusCode());
+		assertEquals("v2", client.send(HttpRequest.newBuilder(URI.create(path)).GET().build(),
+			HttpResponse.BodyHandlers.ofString()).body());
+
+		HttpResponse<String> createOnly = client.send(HttpRequest.newBuilder(URI.create(path))
+			.header("If-None-Match", "*")
+			.PUT(HttpRequest.BodyPublishers.ofString("v3")).build(), HttpResponse.BodyHandlers.ofString());
+		assertEquals(412, createOnly.statusCode());
+	}
+
+	@Test
+	void testMutationAdvancesTimestamp() throws Exception {
+		String path = driveURL + "timestamped.txt";
+		client.send(HttpRequest.newBuilder(URI.create(path))
+			.PUT(HttpRequest.BodyPublishers.ofString("time")).build(), HttpResponse.BodyHandlers.ofString());
+		var fs = server.getDriveManager().getDrive(null, "test");
+		long timestamp = java.nio.file.Files.getLastModifiedTime(fs.getPath("/timestamped.txt")).toMillis();
+		assertTrue(timestamp > 0, "External mutations must not remain at the zero timestamp");
+	}
+
+	@Test
+	void testRequestSizeLimit() throws Exception {
+		try (DLFSServer limited = DLFSServer.create(null).setMaxRequestSize(8)) {
+			limited.getDriveManager().createDrive(null, "limited");
+			limited.start(0);
+			String url = "http://localhost:" + limited.getPort() + "/dlfs/limited/large.txt";
+			HttpResponse<String> response = client.send(HttpRequest.newBuilder(URI.create(url))
+				.PUT(HttpRequest.BodyPublishers.ofByteArray(new byte[9])).build(),
+				HttpResponse.BodyHandlers.ofString());
+			assertEquals(413, response.statusCode());
+		}
 	}
 
 	@Test

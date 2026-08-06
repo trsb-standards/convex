@@ -18,7 +18,7 @@ import convex.restapi.RESTServer;
 import convex.restapi.auth.OAuthService;
 import convex.restapi.auth.OAuthService.PendingAuth;
 import convex.restapi.auth.OAuthService.Provider;
-import io.javalin.Javalin;
+import io.javalin.config.RoutesConfig;
 import io.javalin.http.Context;
 import j2html.tags.DomContent;
 
@@ -39,9 +39,9 @@ public class AuthPage extends AWebSite {
 	}
 
 	@Override
-	public void addRoutes(Javalin app) {
-		app.get("/auth", this::showLoginPage);
-		app.get("/auth/callback", this::handleCallback);
+	public void addRoutes(RoutesConfig routes) {
+		routes.get("/auth", this::showLoginPage);
+		routes.get("/auth/callback", this::handleCallback);
 	}
 
 	/**
@@ -137,7 +137,7 @@ public class AuthPage extends AWebSite {
 
 		// Issue peer-signed JWT
 		PeerAuth peerAuth = restServer.getAuthMiddleware().getPeerAuth();
-		long expiry = 86400; // 24 hours
+		long expiry = restServer.getRESTConfig().getTokenExpiry();
 		AString peerToken = peerAuth.issuePeerToken(identity, expiry);
 
 		returnPage(ctx, "Authenticated",
@@ -145,7 +145,7 @@ public class AuthPage extends AWebSite {
 				h3("Authentication Successful"),
 				p("Identity:"),
 				preCode(identity.toString()),
-				p("Your bearer token (valid 24 hours):"),
+				p("Your bearer token (valid "+expiry+" seconds):"),
 				pre(code(peerToken.toString()))
 					.withStyle("word-break: break-all; white-space: pre-wrap;"),
 				p(small("Copy this token and use it as a Bearer token in API requests."))

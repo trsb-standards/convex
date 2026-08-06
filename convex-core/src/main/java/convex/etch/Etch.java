@@ -5,12 +5,8 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.channels.FileChannel.MapMode;
 import java.nio.channels.FileLock;
-import java.util.ArrayList;
 import java.util.Arrays;
 
 import convex.core.Constants;
@@ -40,10 +36,15 @@ import convex.core.util.Utils;
  * To avoid creating too many index blocks when collisions occur, a chained entry list inside is created
  * in unused space in index blocks. Once there is no more space, chains are collapsed to a new index block.
  *
- * Header of file is 42 bytes as follows:
+ * Common header fields are as follows:
  * - Magic number 0xe7c6 (2 bytes)
+ * - Etch format version (2 bytes)
  * - Database length in bytes (8 bytes)
  * - Root hash (32 bytes)
+ *
+ * Etch v1 starts its root index immediately afterwards at byte 44. Etch v2
+ * reserves the remainder of a 64-byte header and starts its aligned root index
+ * at byte 64.
  * 
  * Pointers in index blocks are of 4 possible types, determined by the two high bits (MSBs):
  * - 00 high bits: pointer to data
@@ -77,10 +78,9 @@ public class Etch {
 	 */
 	static final byte[] MAGIC_NUMBER=Utils.hexToBytes("e7c6");
 	
-	/**
-	 * Version number
-	 */
-	static final short ETCH_VERSION=1;
+	static final short ETCH_VERSION_1=1;
+	static final short ETCH_VERSION_2=2;
+	static final short CURRENT_VERSION=ETCH_VERSION_2;
 
 	static final int SIZE_HEADER_MAGIC=2;
 	static final int SIZE_HEADER_VERSION=2;
@@ -90,23 +90,16 @@ public class Etch {
 	static final int ZLEN=16384;
 	static final byte[] ZERO_ARRAY=new byte[ZLEN];
 
-	/**
-	 * Length of Etch header. Used to be 42 until we added the version number
-	 *
-	 * "The Ultimate Answer to Life, The Universe and Everything is... 42!"
-     * - Douglas Adams, The Hitchhiker's Guide to the Galaxy
-	 */
-	static final int SIZE_HEADER=SIZE_HEADER_MAGIC+SIZE_HEADER_VERSION+SIZE_HEADER_FILESIZE+SIZE_HEADER_ROOT;
+	static final int SIZE_HEADER_COMMON=SIZE_HEADER_MAGIC+SIZE_HEADER_VERSION+SIZE_HEADER_FILESIZE+SIZE_HEADER_ROOT;
+	static final int SIZE_HEADER_V1=SIZE_HEADER_COMMON;
+	static final int SIZE_HEADER_V2=64;
 
 	protected static final long OFFSET_VERSION = SIZE_HEADER_MAGIC; // Skip past magic number
 	protected static final long OFFSET_FILE_SIZE = OFFSET_VERSION+SIZE_HEADER_VERSION; // Skip past version
 	protected static final long OFFSET_ROOT_HASH = OFFSET_FILE_SIZE+SIZE_HEADER_FILESIZE; // Skip past file size
 
-	/**
-	 * Start position of first index block
-	 * This is immediately after a long data length pointer at the start of the file
-	 */
-	static final long INDEX_START=SIZE_HEADER;
+	static final long INDEX_START_V1=SIZE_HEADER_V1;
+	static final long INDEX_START_V2=SIZE_HEADER_V2;
 
 	static final long TYPE_MASK = 0xC000000000000000L;
 	static final long PTR_PLAIN = 0x0000000000000000L; // direct pointer to data
@@ -134,12 +127,11 @@ public class Etch {
 	private final String fileName;
 	private final RandomAccessFile data;
 
-	/**
-	 * List of MappedByteBuffers for each region of the database file.
-	 */
-	private final ArrayList<MappedByteBuffer> regionMap=new ArrayList<>();
+	private final short version;
+	private final long indexStart;
+	private final EtchFileMapper fileMapper;
 
-	private long dataLength=0;
+	private volatile long dataLength=0;
 
 	private boolean BUILD_CHAINS=true;
 	private EtchStore store;
@@ -156,47 +148,59 @@ public class Etch {
 		FileChannel fileChannel=this.data.getChannel();
 		FileLock lock=fileChannel.tryLock();
 		if (lock==null) {
-			throw new IOException("File lock failed");
+			throw new IOException("File lock failed on "+dataFile);
+		}
+		// at this point, we have an exclusive lock on the database file.
+		boolean newFile=(dataFile.length()==0);
+		long storedLength=0L;
+		short fileVersion;
+		if (newFile) {
+			fileVersion=CURRENT_VERSION;
+		} else {
+			this.data.seek(0L);
+			byte[] check=new byte[SIZE_HEADER_MAGIC];
+			this.data.readFully(check);
+			if (!Arrays.equals(MAGIC_NUMBER,check)) {
+				throw new IOException("Bad magic number! Probably not an Etch file: "+dataFile);
+			}
+			fileVersion=this.data.readShort();
+			storedLength=this.data.readLong();
 		}
 
-		// at this point, we have an exclusive lock on the database file.
+		this.version=fileVersion;
+		this.indexStart=indexStartForVersion(fileVersion);
+		this.fileMapper=EtchFileMapperFactory.create(fileChannel,fileVersion);
 
-		if (dataFile.length()==0) {
+		if (newFile) {
 			// Need to populate  new file, with data length long and initial index block
-			MappedByteBuffer mbb=seekMap(0);
-
 			// write Header, initally zeros expect magic number and version
-			byte[] temp=new byte[SIZE_HEADER];
+			byte[] temp=new byte[Math.toIntExact(indexStart)];
 			System.arraycopy(MAGIC_NUMBER, 0, temp, 0, SIZE_HEADER_MAGIC);
-			Utils.writeShort(temp, (int)OFFSET_VERSION, ETCH_VERSION);
-			mbb.put(temp);
+			Utils.writeShort(temp, (int)OFFSET_VERSION,version);
+			writeBytes(0,temp,0,temp.length);
 			
-			dataLength=SIZE_HEADER; // advance past initial long
+			setDataLength(indexStart);
 
 			// add an index block
-			mbb=seekMap(SIZE_HEADER);
-			long indexStart=appendNewIndexBlock(0);
-			assert(indexStart==INDEX_START);
+			long rootIndex=appendNewIndexBlock(0);
+			assert(rootIndex==indexStart);
 
 			// ensure data length is initially correct
 			writeDataLength();
 		} else {
-			// existing file, so need to read the length pointer
-			MappedByteBuffer mbb=seekMap(0);
-			byte[] check=new byte[2];
-			mbb.get(check);
-			if(!Arrays.equals(MAGIC_NUMBER, check)) {
-				throw new IOException("Bad magic number! Probably not an Etch file: "+dataFile);
-			}
-			short version=mbb.getShort();
-			if (version!=ETCH_VERSION) throw new IOException("Bad Etch version: expected "+ETCH_VERSION+" but was "+version+ " in "+dataFile);
-
-			long length = mbb.getLong();
-			dataLength=length;
+			dataLength=storedLength;
 		}
 
 		// shutdown hook to close file / release lock
 		convex.core.util.Shutdown.addHook(Shutdown.ETCH,this::close);
+	}
+
+	private static long indexStartForVersion(short version) throws IOException {
+		return switch (version) {
+			case ETCH_VERSION_1 -> INDEX_START_V1;
+			case ETCH_VERSION_2 -> INDEX_START_V2;
+			default -> throw new IOException("Unsupported Etch version: "+version);
+		};
 	}
 
 	/**
@@ -234,73 +238,54 @@ public class Etch {
 	}
 
 	/**
-	 * Gets a MappedByteBuffer for a given position, seeking to the specified location.
+	 * Validates and normalises a mapped-storage position.
 	 * Type flags are ignored if included in the position pointer.
 	 *
-	 * @param position Target position for the MappedByteBuffer
-	 * @return MappedByteBuffer instance with correct position.
-	 * @throws IOException
+	 * @param position Target position
+	 * @return requested absolute file position without pointer type flags
 	 */
-	private MappedByteBuffer seekMap(long position) throws IOException {
+	private long checkedPosition(long position) {
 		position=rawPointer(position); // ensure we don't have any pesky type bits
 
 		if ((position<0)||(position>dataLength)) {
 			throw new EtchCorruptionError("Seek out of range in Etch file: position="+Utils.toHexString(position)+ " dataLength="+Utils.toHexString(dataLength)+" file="+file.getName());
 		}
 
-		MappedByteBuffer mbb=(MappedByteBuffer)((ByteBuffer)getInternalBuffer(position)).duplicate();
-
-		mbb.position(Utils.checkedInt(position%MAX_REGION_SIZE));
-		return mbb;
+		return position;
 	}
 
-	/**
-	 * Gets the internal mapped byte buffer for the specified region of the Etch database
-	 * 
-	 * @param position Position for which to get buffer
-	 * @return Mapped Byte Buffer for specified region
-	 * @throws IOException
-	 */
-	private MappedByteBuffer getInternalBuffer(long position) throws IOException {
-		int regionIndex=Utils.checkedInt(position/MAX_REGION_SIZE); // 1GB chunks
-
-		// Get current mapped region, or null if out of range
-		int regionMapSize=regionMap.size();
-		MappedByteBuffer mbb=(regionIndex<regionMapSize)?regionMap.get(regionIndex):null;
-
-		// Call createBuffer if mapped region does not exist, or is too small
-		if ((mbb==null)||((mbb.capacity()+regionIndex*MAX_REGION_SIZE)<position+REGION_MARGIN)) {
-			mbb=createBuffer(regionIndex);
-		}
-
-		return mbb;
+	private byte readByte(long position) throws IOException {
+		return fileMapper.getByte(checkedPosition(position));
 	}
 
-	/**
-	 * Create a MappedByteBuffer at the specified region index position.
-	 *
-	 * CONCURRENCY: should be the only place where regionMap is modified.
-	 *
-	 * @param regionIndex Index of database file region
-	 * @return
-	 * @throws IOException
-	 */
-	private synchronized MappedByteBuffer createBuffer(int regionIndex) throws IOException {
-		while(regionMap.size()<=regionIndex) regionMap.add(null);
+	private short readShort(long position) throws IOException {
+		return fileMapper.getShort(checkedPosition(position));
+	}
 
-		// position of region start
-		long pos=((long)regionIndex)*MAX_REGION_SIZE;
+	private long readLongAcquire(long position) throws IOException {
+		return fileMapper.getLongAcquire(checkedPosition(position));
+	}
 
-		// Expand region size until big enough for current database plus appropriate margin
-		int length=1<<16;
-		while((length<MAX_REGION_SIZE)&&((pos+length)<(dataLength+REGION_MARGIN))) {
-			length*=2;
-		}
+	private void readBytes(long position, byte[] destination, int offset, int length)
+			throws IOException {
+		fileMapper.get(checkedPosition(position),destination,offset,length);
+	}
 
-		length+=REGION_MARGIN; // include margin in buffer length
-		MappedByteBuffer mbb= data.getChannel().map(MapMode.READ_WRITE, pos, length);
-		regionMap.set(regionIndex, mbb);
-		return mbb;
+	private void writeByte(long position, byte value) throws IOException {
+		fileMapper.putByte(checkedPosition(position),value);
+	}
+
+	private void writeLong(long position, long value) throws IOException {
+		fileMapper.putLong(checkedPosition(position),value);
+	}
+
+	private void writeLongRelease(long position, long value) throws IOException {
+		fileMapper.putLongRelease(checkedPosition(position),value);
+	}
+
+	private void writeBytes(long position, byte[] source, int offset, int length)
+			throws IOException {
+		fileMapper.put(checkedPosition(position),source,offset,length);
 	}
 
 	/**
@@ -314,7 +299,7 @@ public class Etch {
 	 * @throws IOException If an IO error occurs
 	 */
 	public synchronized <T extends ACell > Ref<T> write(AArrayBlob key, Ref<T> value) throws IOException {
-		return write(key,0,value,INDEX_START);
+		return write(key,0,value,indexStart);
 	}
 
 	private <T extends ACell > Ref<T> write(AArrayBlob key, int level, Ref<T> ref, long indexPosition) throws IOException {
@@ -417,11 +402,14 @@ public class Etch {
 				long movingSlotValue=readSlot(indexPosition,movingDigit);
 				long dp=rawPointer(movingSlotValue); // just the raw pointer
 				rewriteExistingData(newIndexPos,nextLevel,dp);
-				if (j!=0) writeSlot(indexPosition,movingDigit,0L); // clear the old chain
 			}
 
-			// finally update this index with the new index pointer
+			// publish the complete new index block BEFORE clearing the old chain:
+			// lock-free readers then see either the intact chain or the new block
 			writeSlot(indexPosition,digit,newIndexPos|PTR_INDEX);
+			for (int j=1; j<i; j++) {
+				writeSlot(indexPosition,(digit+j)&mask,0L); // clear the old chain
+			}
 			return ref;
 		} else if (type==PTR_CHAIN) {
 			// need to collapse existing chain
@@ -437,10 +425,14 @@ public class Etch {
 				long movingSlotValue=readSlot(indexPosition,movingDigit);
 				long dp=rawPointer(movingSlotValue); // just the raw pointer
 				rewriteExistingData(newIndexPos,nextLevel,dp);
-				if (j!=0) writeSlot(indexPosition,movingDigit,0L); // clear the old chain
 			}
 
+			// publish the complete new index block BEFORE clearing the old chain:
+			// lock-free readers then see either the intact chain or the new block
 			writeSlot(indexPosition,chainStartDigit,newIndexPos|PTR_INDEX);
+			for (int j=1; j<n; j++) {
+				writeSlot(indexPosition,(chainStartDigit+j)&mask,0L); // clear the old chain
+			}
 
 			// write to the current slot
 			return writeNewData(indexPosition,digit,key,ref,PTR_PLAIN);
@@ -537,16 +529,14 @@ public class Etch {
 	 * @throws IOException
 	 */
 	Blob readBlob(long pointer, int length) throws IOException {
-		MappedByteBuffer mbb=seekMap(pointer);
 		byte[] bs=new byte[length];
-		mbb.get(bs);
+		readBytes(pointer,bs,0,length);
 		return Blob.wrap(bs);
 	}
 	
 	public Hash readValueKey(long ptr) throws IOException {
-		MappedByteBuffer mbb=seekMap(ptr);
 		byte[] bs=new byte[KEY_SIZE];
-		mbb.get(bs);
+		readBytes(ptr,bs,0,KEY_SIZE);
 		return Hash.wrap(bs);
 	}
 
@@ -586,7 +576,7 @@ public class Etch {
 				// Send writes to disk
 				flush();
 				
-				regionMap.clear();
+				fileMapper.close();
 	
 				data.close();
 	
@@ -610,9 +600,7 @@ public class Etch {
 	 */
 	protected void writeDataLength() throws IOException {
 		// write final data length
-		MappedByteBuffer mbb=seekMap(OFFSET_FILE_SIZE);
-		mbb.putLong(dataLength);
-		mbb=null;
+		writeLong(OFFSET_FILE_SIZE,dataLength);
 	}
 	
 	/**
@@ -620,8 +608,15 @@ public class Etch {
 	 * @return Return Etch version number
 	 */
 	public short getVersion() {
-		// Override when we have more versions
-		return ETCH_VERSION;
+		return version;
+	}
+
+	long getIndexStart() {
+		return indexStart;
+	}
+
+	String getMappingImplementation() {
+		return fileMapper.implementationName();
 	}
 
 	/**
@@ -642,9 +637,8 @@ public class Etch {
 	 */
 	private boolean checkMatchingKey(AArrayBlob key, long dataPointer) throws IOException {
 		long dataPosition=rawPointer(dataPointer);
-		MappedByteBuffer mbb=seekMap(dataPosition);
 		byte[] temp=tempArray.get();
-		mbb.get(temp, 0, KEY_SIZE);
+		readBytes(dataPosition,temp,0,KEY_SIZE);
 		if (key.equalsBytes(temp,0)) {
 			// key already in store matching at this data position
 			return true;
@@ -667,17 +661,15 @@ public class Etch {
 		int indexBlockLength=POINTER_SIZE*isize;
 		digit=digit&mask;
 		
-		long position=dataLength;
+		long position=nextIndexPosition();
 		byte[] temp=tempArray.get();
 		Arrays.fill(temp, 0,indexBlockLength,(byte)0x00);
 		
 		int ix=POINTER_SIZE*digit; // compute position in block. note: should be already masked above
 		Utils.writeLong(temp, ix,dataPointer); // single node
-		MappedByteBuffer mbb=seekMap(position);
-		mbb.put(temp,0,indexBlockLength); // write index block
-		
 		// set the datalength to the last available byte in the file after adding index block
 		setDataLength(position+indexBlockLength);
+		writeBytes(position,temp,0,indexBlockLength); // write index block
 		return position;
 	}
 
@@ -713,27 +705,27 @@ public class Etch {
 	}
 		
 	public <T extends ACell> RefSoft<T> read(AArrayBlob key,long pointer) throws IOException {
-		MappedByteBuffer mbb;
+		long recordPosition=checkedPosition(pointer);
+		byte[] recordHeader=tempArray.get();
+		int headerOffset=0;
 		if (key==null) {
-			mbb=seekMap(pointer);
-			byte[] bs=new byte[KEY_SIZE];
-			mbb.get(bs);
-			key=Hash.wrap(bs);
+			readBytes(recordPosition,recordHeader,0,KEY_SIZE+LABEL_SIZE+LENGTH_SIZE);
+			key=Hash.wrap(Arrays.copyOf(recordHeader,KEY_SIZE));
+			headerOffset=KEY_SIZE;
 		} else {
-			// seek to correct position, skipping over key
-			mbb=seekMap(pointer+KEY_SIZE);
+			readBytes(recordPosition+KEY_SIZE,recordHeader,0,LABEL_SIZE+LENGTH_SIZE);
 		}
 		
 		// get flags byte
-		byte flagByte=mbb.get();
+		byte flagByte=recordHeader[headerOffset];
 
 		// Get memory size
-		long memorySize=mbb.getLong();
+		long memorySize=Utils.readLong(recordHeader,headerOffset+Byte.BYTES,Long.BYTES);
 
 		// get Data length
-		short length=mbb.getShort();
+		short length=Utils.readShort(recordHeader,headerOffset+LABEL_SIZE);
 		byte[] bs=new byte[length];
-		mbb.get(bs);
+		readBytes(recordPosition+KEY_SIZE+LABEL_SIZE+LENGTH_SIZE,bs,0,length);
 		Blob encoding= Blob.wrap(bs);
 		try {
 			Hash hash=Hash.wrap(key);
@@ -759,9 +751,7 @@ public class Etch {
 	 * @throws IOException If an IO error occurs
 	 */
 	public synchronized void flush() throws IOException {
-		for (MappedByteBuffer mbb: regionMap) {
-			if (mbb!=null) mbb.force();
-		}
+		fileMapper.force();
 		data.getChannel().force(false);
 	}
 
@@ -772,7 +762,7 @@ public class Etch {
 	 * @throws IOException
 	 */
 	private long seekPosition(AArrayBlob key) throws IOException {
-		return seekPosition(key,0,INDEX_START);
+		return seekPosition(key,0,indexStart);
 	}
 
 	/**
@@ -784,9 +774,7 @@ public class Etch {
 	 */
 	public long readSlot(long indexPosition, int digit) throws IOException {
 		long pointerIndex=indexPosition+POINTER_SIZE*digit;
-		MappedByteBuffer mbb=seekMap(pointerIndex);
-		long pointer=mbb.getLong();
-		return pointer;
+		return readLongAcquire(pointerIndex);
 	}
 
 	/**
@@ -816,24 +804,24 @@ public class Etch {
 		// ensure we have a raw position
 		position=rawPointer(position);
 		
-		// Seek to status location
-		MappedByteBuffer mbb=seekMap(position+KEY_SIZE);
+		long labelPosition=position+KEY_SIZE;
 
 		// Get current stored values
-		int currentFlags=mbb.get();
+		byte[] label=tempArray.get();
+		readBytes(labelPosition,label,0,LABEL_SIZE);
+		int currentFlags=label[0];
 		int newFlags=Ref.mergeFlags(currentFlags,ref.getFlags()); // idempotent flag merge
 
-		long currentSize=mbb.getLong();
+		long currentSize=Utils.readLong(label,Byte.BYTES,Long.BYTES);
 
 		if (currentFlags==newFlags) return ref;
 
 		// We have a status change, need to increase status of store
-		mbb=seekMap(position+KEY_SIZE);
-		mbb.put((byte)newFlags);
+		writeByte(labelPosition,(byte)newFlags);
 
 		// maybe update size, if not already persisted
 		if ((currentSize==0L)&&((newFlags&Ref.STATUS_MASK)>=Ref.PERSISTED)) {
-			mbb.putLong(ref.getValue().getMemorySize());
+			writeLong(labelPosition+Byte.BYTES,ref.getValue().getMemorySize());
 		}
 
 		return ref.withFlags(newFlags);	// reflect merged flags
@@ -849,13 +837,23 @@ public class Etch {
 	 */
 	private void writeSlot(long indexPosition, int digit, long slotValue) throws IOException {
 		long position=indexPosition+digit*POINTER_SIZE;
-		MappedByteBuffer mbb=seekMap(position);
-		mbb.putLong(slotValue);
+		writeLongRelease(position,slotValue);
 	}
 	
+	/**
+	 * Visits all index blocks in this Etch file.
+	 *
+	 * WARNING: inherently racy under concurrent writes. Writes restructure the
+	 * index in place (chain collapses, slot repointing, new index blocks), so a
+	 * concurrent visit may miss entries or visit them twice. Only use on a store
+	 * that is not undergoing any writes.
+	 *
+	 * @param v Visitor to apply to each index block
+	 * @throws IOException in case of IO error
+	 */
 	public void visitIndex(IEtchIndexVisitor v) throws IOException {
 		int[] bs=new int[32];
-		visitIndex(v,bs,0,INDEX_START);
+		visitIndex(v,bs,0,indexStart);
 	}
 
 	private void visitIndex(IEtchIndexVisitor v, int[] digits, int level, long indexPointer) throws IOException {
@@ -902,18 +900,24 @@ public class Etch {
 			// continuation of chain from some previous index, therefore key can't be present
 			return -1;
 		} else if (type==PTR_START) {
-			synchronized (this) {
-				// start of chain, so scan chain of entries
-				int i=0;
-				while (i<isize) {
-					long ptr=slotValue&(~TYPE_MASK);
-					if (checkMatchingKey(key,ptr)) return ptr;
+			// Optimistic lock-free chain scan. A concurrent collapse publishes its
+			// new index block into the start slot BEFORE clearing chain entries, so
+			// on a miss we revalidate the start slot and retry if it changed. Slot
+			// transitions are one-way (PLAIN -> START -> INDEX), bounding retries.
+			long startValue=slotValue;
+			int i=0;
+			while (i<isize) {
+				long ptr=slotValue&(~TYPE_MASK);
+				if (checkMatchingKey(key,ptr)) return ptr;
 
-					i++; // advance to next position
-					slotValue=readSlot(indexPosition,(digit+i)&mask);
-					type=(slotValue&TYPE_MASK);
-					if (!(type==PTR_CHAIN)) return -1; // reached end of chain
-				}
+				i++; // advance to next position
+				slotValue=readSlot(indexPosition,(digit+i)&mask);
+				type=(slotValue&TYPE_MASK);
+				if (!(type==PTR_CHAIN)) break; // reached end of chain
+			}
+			if (readSlot(indexPosition,digit)!=startValue) {
+				// chain restructured during our scan: retry at this position
+				return seekPosition(key,level,indexPosition);
 			}
 			return -1;
 		} else {
@@ -945,17 +949,14 @@ public class Etch {
 	 */
 	private int getDigit(long dp, int level) throws IOException {
 		if (level==0) {
-			MappedByteBuffer mbb=seekMap(dp);
-			return mbb.getShort()&0xffff;
+			return readShort(dp)&0xffff;
 		} 
 		if (level==1) {
-			MappedByteBuffer mbb=seekMap(dp+(level+1));
-			return mbb.get()&0xFF;
+			return readByte(dp+(level+1))&0xFF;
 		}
 		int bi=(level+4)/2;      // level 2,3 maps to 3 etc.
 		boolean hi=(level&1)==0; // we want high byte if even
-		MappedByteBuffer mbb=seekMap(dp+bi);
-		byte v= mbb.get();
+		byte v=readByte(dp+bi);
 		return (hi?(v>>4):v)&0xf;		
 	}
 
@@ -986,18 +987,21 @@ public class Etch {
 		int isize=indexSize(level);
 		int sizeBytes=isize*POINTER_SIZE;
 		
-		long position=dataLength;
-		MappedByteBuffer mbb=null;
-		
+		// Root placement is selected by the file version. All child indexes are
+		// naturally aligned and reached through explicit pointers.
+		long position=(level==0)?indexStart:nextIndexPosition();
 		// set the datalength to the last available byte in the file
 		setDataLength(position+sizeBytes);
 		
 		// Use temporary zero array to fill new index block
 		for (int ix=0; ix<sizeBytes; ix+=ZLEN) {
-			mbb=seekMap(position+ix);
-			mbb.put(ZERO_ARRAY,0,Math.min(sizeBytes-ix,ZLEN));
+			writeBytes(position+ix,ZERO_ARRAY,0,Math.min(sizeBytes-ix,ZLEN));
 		}
 		return position;
+	}
+
+	private long nextIndexPosition() {
+		return (dataLength+(POINTER_SIZE-1))&-POINTER_SIZE;
 	}
 
 	/**
@@ -1023,33 +1027,33 @@ public class Etch {
 			memorySize=cell.getMemorySize();
 		}
 
-		// position ready for append
-		final long position=dataLength;
-		MappedByteBuffer mbb=seekMap(position);
-
-		// append key
-		mbb.put(key.getInternalArray(),key.getInternalOffset(),KEY_SIZE);
-
-		// append flags (1 byte)
-		int flags=ref.flagsWithStatus(Math.max(ref.getStatus(),Ref.STORED));
-		mbb.put((byte)(flags)); // currently all flags fit in one byte
-
-		// append Memory Size (8 bytes). Initialised to 0L if STORED only.
-		mbb.putLong(memorySize);
-
-		// append blob length
 		short length=Utils.checkedShort(encoding.count());
 		if (length==0) {
 			// Blob b=cell.createEncoding();
 			throw new Error("Etch trying to write zero length encoding for: "+Utils.getClassName(cell));
 		}
-		mbb.putShort(length);
+
+		// position ready for append
+		final long position=dataLength;
+		final long newDataLength=position+KEY_SIZE+LABEL_SIZE+LENGTH_SIZE+length;
+		long writePosition=position;
+		// append key
+		fileMapper.put(writePosition,key.getInternalArray(),key.getInternalOffset(),KEY_SIZE);
+		writePosition+=KEY_SIZE;
+
+		// append flags, Memory Size and blob length as one fixed-size header
+		byte[] recordHeader=tempArray.get();
+		int flags=ref.flagsWithStatus(Math.max(ref.getStatus(),Ref.STORED));
+		recordHeader[0]=(byte)flags; // currently all flags fit in one byte
+		Utils.writeLong(recordHeader,Byte.BYTES,memorySize);
+		Utils.writeShort(recordHeader,LABEL_SIZE,length);
+		fileMapper.put(writePosition,recordHeader,0,LABEL_SIZE+LENGTH_SIZE);
+		writePosition+=LABEL_SIZE+LENGTH_SIZE;
 
 		// append blob value
-		mbb.put(encoding.getInternalArray(),encoding.getInternalOffset(),length);
+		fileMapper.put(writePosition,encoding.getInternalArray(),encoding.getInternalOffset(),length);
 
-		// set the datalength to the last available byte in the file
-		setDataLength(position+KEY_SIZE+LABEL_SIZE+LENGTH_SIZE+length);
+		setDataLength(newDataLength);
 
 		// return file position for added data
 		return position;
@@ -1079,9 +1083,11 @@ public class Etch {
 	}
 
 	public synchronized Hash getRootHash() throws IOException {
-		MappedByteBuffer mbb=seekMap(OFFSET_ROOT_HASH);
 		byte[] bs=new byte[Hash.LENGTH];
-		mbb.get(bs);
+		readBytes(OFFSET_ROOT_HASH,bs,0,Hash.LENGTH);
+		// Preserve the distinction between a never-assigned, zero-initialised root
+		// and an explicitly written null root (Hash.NULL_HASH).
+		if (Arrays.equals(bs, Utils.ZERO_BYTES_32)) return Hash.UNSET_HASH;
 		return Hash.wrap(bs);
 	}
 
@@ -1091,10 +1097,9 @@ public class Etch {
 	 * @throws IOException If IO Error occurs
 	 */
 	public synchronized void setRootHash(Hash h) throws IOException {
-		MappedByteBuffer mbb=seekMap(OFFSET_ROOT_HASH);
 		byte[] bs=h.getBytes();
 		assert(bs.length==Hash.LENGTH);
-		mbb.put(bs);
+		writeBytes(OFFSET_ROOT_HASH,bs,0,bs.length);
 	}
 
 	public void setStore(EtchStore etchStore) {

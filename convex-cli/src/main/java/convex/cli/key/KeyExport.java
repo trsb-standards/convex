@@ -1,8 +1,7 @@
 package convex.cli.key;
 
-import java.io.IOException;
-import java.nio.file.Paths;
 import java.security.GeneralSecurityException;
+import java.util.Arrays;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,7 +10,6 @@ import convex.cli.CLIError;
 import convex.cli.mixins.KeyMixin;
 import convex.core.crypto.AKeyPair;
 import convex.core.crypto.PEMTools;
-import convex.core.util.FileUtils;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Mixin;
 import picocli.CommandLine.Option;
@@ -37,13 +35,13 @@ public class KeyExport extends AKeyCommand {
 
 	
 	@Option(names={"-o", "--output-file"},
-			description="Output file for the private key. Use '-' for STDOUT (default).")
+			description="Write the private key to a new owner-only file. Use '-' to explicitly write to stdout. Required non-interactively; defaults to the attached console.")
 	private String outputFilename;
 
 
 	@Option(names={"--export-password"},
 		description="Password for the exported key, if applicable")
-    private String exportPassword;
+    private char[] exportPassword;
 	
 	@Option(names={"--type"},
 			description="Type of file exported. Supports: pem, seed (default).")
@@ -53,17 +51,17 @@ public class KeyExport extends AKeyCommand {
 	
 	private void ensureExportPassword() {
 		if ((exportPassword==null)&&(cli().isInteractive())) {
-			exportPassword=new String(cli().readPassword("Enter passphrase for exported key: "));
+			exportPassword=cli().readPassword("Enter passphrase for exported key: ");
 		}
-		
-		if (exportPassword == null || exportPassword.length() == 0) {
-			
+
+		if (exportPassword == null || exportPassword.length == 0) {
+
 			if (cli().isParanoid()) {
 				throw new CLIError("Strict security: attempting to export PEM with no passphrase.");
 			} else {
 				log.warn("No export passphrase '--export-password' provided: Defaulting to blank.");
 			}
-			exportPassword="";
+			exportPassword=new char[0];
 		}
 	}
 	
@@ -71,12 +69,12 @@ public class KeyExport extends AKeyCommand {
 	public void execute() {
 		String keystorePublicKey=keyMixin.getPublicKey();
 		if ((keystorePublicKey == null)||(keystorePublicKey.isEmpty())) {
-			if (outputFilename==null) {
+			if (!isInteractive()) {
 				cli().inform("You must provide a --key parameter");
 				showUsage();
 				return;
 			}
-			
+
 			keystorePublicKey=cli().prompt("Enter public key to export: ");
 		}
 
@@ -87,37 +85,28 @@ public class KeyExport extends AKeyCommand {
 				". Use 'convex key list' to see available keys.");
 		}
 		
-		// Default to "seed" type unless security is strict
-		if (type==null) {
-			if (cli().isParanoid()) throw new CLIError("Strict security: must specifiy key export type, e.g. --type=seed");
-			type="seed";
-		}
+		// Raw seed is the canonical lossless export and remains the default.
+		if (type==null) type="seed";
 		
 		String output;
 		if ("pem".equals(type)) {
 			ensureExportPassword();
 			try {
-				String pemText = PEMTools.encryptPrivateKeyToPEM(keyPair, exportPassword.toCharArray());
-				output=pemText;
+				output = PEMTools.encryptPrivateKeyToPEM(keyPair, exportPassword);
 			} catch (GeneralSecurityException e) {
 				throw new CLIError("Cannot encrypt PEM",e);
+			} finally {
+				Arrays.fill(exportPassword, 'x');
 			}
 		} else if ("seed".equals(type)){
-			paranoia("Raw seed export forbidden in strict mode.");
 			String rawSeed = keyPair.getSeed().toHexString();
 			output=rawSeed;
 		} else {
 			throw new CLIError("Export type not recognised: "+type);
 		}
 
-		if ((outputFilename==null)||("-".equals(outputFilename.trim()))) {
-			println(output);
-		} else {
-			try {
-				FileUtils.writeFileAsString(Paths.get(outputFilename),output);
-			} catch (IOException e) {
-				throw new CLIError("Failed to write output file: "+e.getMessage());
-			}
+		try (SecretOutput secretOutput=SecretOutput.open(this,outputFilename,"--output-file","Private key")) {
+			secretOutput.write(output,"Private key export ("+type+"):");
 		}
 	}
 

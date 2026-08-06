@@ -52,6 +52,16 @@ public class DLFSLocal extends DLFileSystem {
 		this.rootCursor =  cursor;
 	}
 
+	/**
+	 * Creates a cursor-backed view using a root timestamp captured by the caller.
+	 * This avoids re-reading a registry entry while opening an existing drive.
+	 */
+	public DLFSLocal(DLFSProvider dlfsProvider, String uriPath,
+			ALatticeCursor<AVector<ACell>> cursor, CVMLong timestamp) {
+		super(dlfsProvider, uriPath, timestamp);
+		this.rootCursor=cursor;
+	}
+
 	public static DLFSLocal create(DLFSProvider provider) {
 		return new DLFSLocal(provider,null,DLFSNode.createDirectory(CVMLong.ZERO));
 	}
@@ -64,10 +74,16 @@ public class DLFSLocal extends DLFileSystem {
 	}
 
 	@Override
+	public CVMLong getTimestamp() {
+		CVMLong ctxTs = rootCursor.getContext().getTimestamp();
+		return (ctxTs != null) ? ctxTs : super.getTimestamp();
+	}
+
+	@Override
 	protected DLDirectoryStream newDirectoryStream(DLPath dir, Filter<? super Path> filter) {
 		AVector<ACell> rootNode=rootCursor.get();
 		AVector<ACell> result=DLFSNode.navigate(rootNode,dir);
-		return DLDirectoryStream.create(dir,result);
+		return DLDirectoryStream.create(dir,result,filter);
 	}
 
 	@Override
@@ -87,7 +103,9 @@ public class DLFSLocal extends DLFileSystem {
 		if (parentNode==null) {
 			throw new NoSuchFileException(parent.toString());
 		}
-		if (DLFSNode.getDirectoryEntries(parentNode).containsKey(name)) {
+		// A live entry blocks creation; a tombstoned name is absent from live entries, so it is free.
+		AVector<ACell> existing = DLFSNode.getDirectoryEntries(parentNode).get(name);
+		if (existing != null) {
 			throw new FileAlreadyExistsException(dir.toString());
 		}
 		updateNode(dir,DLFSNode.createDirectory(getTimestamp()));
@@ -107,9 +125,7 @@ public class DLFSLocal extends DLFileSystem {
 		}
 		AVector<ACell> oldNode=DLFSNode.getDirectoryEntries(parentNode).get(name);
 		if (oldNode!=null) {
-			if (!DLFSNode.isTombstone(oldNode)) {
-				throw new FileAlreadyExistsException(name.toString());
-			}
+			throw new FileAlreadyExistsException(name.toString());
 		}
 		AVector<ACell> newNode=DLFSNode.createEmptyFile(getTimestamp());
 		updateNode(path,newNode);
@@ -119,20 +135,22 @@ public class DLFSLocal extends DLFileSystem {
 
 	@Override
 	public synchronized void delete(DLPath path) throws IOException {
-		path=path.toAbsolutePath();
-		if (path.getNameCount()==0) {
+		final DLPath p=path.toAbsolutePath();
+		if (p.getNameCount()==0) {
 			throw new IOException("Can't delete DLFS Root node");
 		}
-		
+
 		// Check file actually exists
-		AVector<ACell> node=getNode(path);
-		if (node==null) throw new NoSuchFileException(path.toString());
-		
-		// Check it it empty, if a directory
-		Index<AString, AVector<ACell>> entries = DLFSNode.getDirectoryEntries(node);
-		if ((entries!=null)&&(!entries.isEmpty())) throw new DirectoryNotEmptyException(path.toString());
-		
-		updateNode(path,DLFSNode.createTombstone(getTimestamp()));
+		AVector<ACell> node=getNode(p);
+		if (node==null) throw new NoSuchFileException(p.toString());
+
+		// A directory can only be deleted if it has no live children
+		if (DLFSNode.isDirectory(node) && !DLFSNode.isEmpty(node)) {
+			throw new DirectoryNotEmptyException(p.toString());
+		}
+
+		// Drop the live entry and record a tombstone in the parent directory
+		rootCursor.updateAndGet(rootNode->DLFSNode.deleteNode(rootNode,p,getTimestamp()));
 	}
 
 	@Override
@@ -145,7 +163,7 @@ public class DLFSLocal extends DLFileSystem {
 	protected void checkAccess(DLPath path) throws IOException {
 		AVector<ACell> rootNode=rootCursor.get();
 		AVector<ACell> node=DLFSNode.navigate(rootNode,path);
-		if ((node==null)||(DLFSNode.isTombstone(node))) {
+		if (node==null) {
 			throw new NoSuchFileException(path.toString());
 		}
 	}

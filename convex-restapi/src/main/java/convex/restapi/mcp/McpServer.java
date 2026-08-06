@@ -4,6 +4,7 @@ import static convex.restapi.mcp.McpProtocol.*;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -23,8 +24,10 @@ import convex.core.json.JSONReader;
 import convex.core.lang.RT;
 import convex.core.util.JSON;
 import convex.core.util.Utils;
-import io.javalin.Javalin;
+import convex.restapi.handler.RequestBody;
+import io.javalin.config.RoutesConfig;
 import io.javalin.http.Context;
+import io.javalin.http.HttpResponseException;
 
 /**
  * Standalone MCP (Model Context Protocol) server with pluggable tool and prompt
@@ -36,10 +39,10 @@ import io.javalin.http.Context;
  *
  * <p>Does not depend on any Convex peer infrastructure. SSE session handling
  * and transport-specific extensions (e.g. state watches) are left to the caller
- * — typically by registering additional routes on the same Javalin app.</p>
+ * — typically by registering additional routes on the same routes configuration.</p>
  *
  * @see <a href="https://www.jsonrpc.org/specification">JSON-RPC 2.0</a>
- * @see <a href="https://modelcontextprotocol.io/specification/2025-06-18">MCP Specification</a>
+ * @see <a href="https://modelcontextprotocol.io/specification/2025-11-25">MCP Specification</a>
  */
 public class McpServer {
 
@@ -47,6 +50,20 @@ public class McpServer {
 
 	/** Maximum entries in a batch JSON-RPC request. */
 	public static final int MAX_BATCH_SIZE = 20;
+
+	/** Latest MCP protocol version this server implements. */
+	public static final String LATEST_PROTOCOL_VERSION = "2025-11-25";
+
+	/**
+	 * Protocol versions we can serve, newest first. If a client requests one of
+	 * these in {@code initialize}, the server echoes it back; otherwise it
+	 * responds with {@link #LATEST_PROTOCOL_VERSION} and lets the client decide.
+	 */
+	public static final List<String> SUPPORTED_PROTOCOL_VERSIONS = List.of(
+		"2025-11-25",
+		"2025-06-18",
+		"2025-03-26"
+	);
 
 	/** ThreadLocal to make the current Javalin Context available to tool handlers */
 	static final ThreadLocal<Context> currentContext = new ThreadLocal<>();
@@ -136,14 +153,14 @@ public class McpServer {
 	// ==================== Route Registration ====================
 
 	/**
-	 * Registers MCP routes on the given Javalin app.
+	 * Registers MCP routes on the given routes configuration.
 	 * Registers POST and .well-known only. SSE (GET/DELETE) should be added
 	 * by the caller if needed.
 	 */
-	public void addRoutes(Javalin app) {
-		app.before(routePath, this::validateOrigin);
-		app.post(routePath, this::handlePost);
-		app.get("/.well-known/mcp", this::handleWellKnown);
+	public void addRoutes(RoutesConfig routes) {
+		routes.before(routePath, this::validateOrigin);
+		routes.post(routePath, this::handlePost);
+		routes.get("/.well-known/mcp", this::handleWellKnown);
 	}
 
 	// ==================== POST /mcp — JSON-RPC dispatch ====================
@@ -152,7 +169,7 @@ public class McpServer {
 		currentContext.set(ctx);
 		try {
 			boolean useSSE = acceptsEventStream(ctx);
-			ACell body = JSONReader.read(ctx.bodyInputStream());
+			ACell body = JSONReader.read(RequestBody.boundedInputStream(ctx));
 
 			if (body instanceof AMap<?, ?> map) {
 				if (isNotification(map)) {
@@ -200,6 +217,9 @@ public class McpServer {
 		} catch (ParseException | IOException e) {
 			ctx.contentType(ContentTypes.JSON);
 			ctx.result(JSON.print(protocolError(-32700, "Parse error")).toString());
+		} catch (HttpResponseException e) {
+			// Preserve transport-level responses such as the request-size 413.
+			throw e;
 		} catch (Exception e) {
 			log.warn("Unexpected error handling MCP request", e);
 			ctx.contentType(ContentTypes.JSON);
@@ -248,6 +268,12 @@ public class McpServer {
 	/**
 	 * Builds the initialize result. Override to customise capabilities or
 	 * protocol version negotiation.
+	 *
+	 * <p>Version negotiation: if the client's {@code protocolVersion} is one we
+	 * support, echo it back; otherwise respond with our latest supported version
+	 * and let the client decide whether to continue.</p>
+	 *
+	 * @see <a href="https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation">MCP version negotiation</a>
 	 */
 	protected AMap<AString, ACell> buildInitializeResult(ACell params) {
 		AMap<AString, ACell> capabilities = Maps.of(
@@ -257,10 +283,25 @@ public class McpServer {
 			capabilities = capabilities.assoc(Strings.create("prompts"), EMPTY_MAP);
 		}
 		return Maps.of(
-			"protocolVersion", "2025-06-18",
+			"protocolVersion", negotiateProtocolVersion(params),
 			"serverInfo", serverInfo,
 			"capabilities", capabilities
 		);
+	}
+
+	/**
+	 * Negotiates a protocol version from the client's {@code initialize} params.
+	 * Returns the client's requested version if supported, otherwise the latest
+	 * version supported by this server.
+	 */
+	protected String negotiateProtocolVersion(ACell params) {
+		if (params instanceof AMap<?, ?> map) {
+			AString requested = RT.ensureString(map.get(Strings.create("protocolVersion")));
+			if (requested != null && SUPPORTED_PROTOCOL_VERSIONS.contains(requested.toString())) {
+				return requested.toString();
+			}
+		}
+		return LATEST_PROTOCOL_VERSION;
 	}
 
 	/**
@@ -295,7 +336,7 @@ public class McpServer {
 			return protocolError(-32601, "Unknown tool: " + toolName);
 		}
 
-		AMap<AString, ACell> arguments = RT.ensureMap(params.get(FIELD_ARGUMENTS));
+		AMap<AString, ACell> arguments = RT.castMap(params.get(FIELD_ARGUMENTS));
 		if (arguments == null) {
 			return protocolError(-32602, toolName + " requires arguments");
 		}
@@ -322,7 +363,7 @@ public class McpServer {
 		McpPrompt prompt = prompts.get(nameCell.toString());
 		if (prompt == null) return protocolError(-32601, "Unknown prompt: " + nameCell);
 
-		AMap<AString, ACell> arguments = RT.ensureMap(params.get(FIELD_ARGUMENTS));
+		AMap<AString, ACell> arguments = RT.castMap(params.get(FIELD_ARGUMENTS));
 		if (arguments == null) arguments = Maps.empty();
 
 		AVector<AMap<AString, ACell>> messages = prompt.render(arguments);
@@ -345,6 +386,36 @@ public class McpServer {
 
 	// ==================== Origin validation ====================
 
+	/**
+	 * Allowed Origins for MCP requests (#552), or null to allow all.
+	 *
+	 * <p>Public Convex peers allow all origins by design. Localhost-only and
+	 * private deployments should restrict this set: the MCP spec requires
+	 * Origin validation to prevent DNS-rebinding attacks, where a hostile web
+	 * page resolves its own hostname to 127.0.0.1 and drives a local MCP
+	 * server from the victim's browser.
+	 */
+	private volatile java.util.Set<String> allowedOrigins = null;
+
+	/**
+	 * Restricts MCP requests to the given Origins (#552). Requests carrying an
+	 * Origin header not in this set are rejected with 403. Pass null to allow
+	 * all origins (public peer default). Requests without an Origin header
+	 * (non-browser clients) are always allowed.
+	 *
+	 * @param origins Exact Origin values to allow (e.g. "https://app.example.com"), or null for all
+	 */
+	public void setAllowedOrigins(java.util.Collection<String> origins) {
+		this.allowedOrigins = (origins == null) ? null : java.util.Set.copyOf(origins);
+	}
+
+	/**
+	 * @return The configured allowed Origins, or null if all origins are allowed
+	 */
+	public java.util.Set<String> getAllowedOrigins() {
+		return allowedOrigins;
+	}
+
 	private void validateOrigin(Context ctx) {
 		String origin = ctx.header("Origin");
 		if (origin != null && !isOriginAllowed(origin)) {
@@ -353,11 +424,13 @@ public class McpServer {
 	}
 
 	/**
-	 * Check if an Origin is allowed for MCP requests. Override to restrict.
-	 * Default: all origins allowed.
+	 * Check if an Origin is allowed for MCP requests. Consults the configured
+	 * allowed-origins set (#552); default (null set) allows all origins.
+	 * Override for custom policies.
 	 */
 	protected boolean isOriginAllowed(String origin) {
-		return true;
+		java.util.Set<String> allowed = allowedOrigins;
+		return (allowed == null) || allowed.contains(origin);
 	}
 
 	// ==================== .well-known/mcp ====================

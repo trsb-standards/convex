@@ -1,6 +1,7 @@
 package convex.lattice.fs;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -26,6 +27,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Iterator;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
 
 import org.junit.jupiter.api.Test;
 
@@ -43,6 +45,75 @@ import convex.lattice.LatticeContext;
 import convex.lattice.LatticeTest;
 
 public class DLFSTest {
+
+	@Test
+	public void testUnsupportedProviderOperationsFailHonestly() throws Exception {
+		DLFileSystem fs=(DLFileSystem)DLFS.createLocal();
+		Path a=fs.getPath("/a");
+		Path b=fs.getPath("/b");
+		Files.write(a,new byte[] {1});
+		assertThrows(UnsupportedOperationException.class,()->Files.copy(a,b));
+		assertThrows(UnsupportedOperationException.class,()->Files.move(a,b));
+		assertThrows(UnsupportedOperationException.class,()->fs.getPathMatcher("glob:*.txt"));
+		fs.close();
+		assertFalse(fs.isOpen());
+		assertThrows(java.nio.file.ClosedFileSystemException.class,()->fs.getPath("/closed"));
+	}
+
+	@Test
+	public void testDirectoryStreamFilter() throws Exception {
+		DLFileSystem fs=(DLFileSystem)DLFS.createLocal();
+		Files.write(fs.getPath("/keep.txt"),new byte[] {1});
+		Files.write(fs.getPath("/drop.bin"),new byte[] {2});
+		try (DirectoryStream<Path> stream=Files.newDirectoryStream(fs.getPath("/"),
+			p->p.toString().endsWith(".txt"))) {
+			Iterator<Path> it=stream.iterator();
+			assertTrue(it.hasNext());
+			assertEquals("/keep.txt",it.next().toString());
+			assertFalse(it.hasNext());
+			assertThrows(IllegalStateException.class,stream::iterator);
+		}
+	}
+
+	@Test
+	public void testAtomicWholeFileReplacement() throws Exception {
+		DLFileSystem fs=(DLFileSystem)DLFS.createLocal();
+		DLPath path=fs.getPath("/atomic.bin");
+		byte[] longValue=new byte[4096];
+		byte[] shortValue=new byte[17];
+		java.util.Arrays.fill(longValue,(byte)1);
+		java.util.Arrays.fill(shortValue,(byte)2);
+		CountDownLatch start=new CountDownLatch(1);
+		Thread a=Thread.ofVirtual().start(()->writeAfter(start,fs,path,longValue));
+		Thread b=Thread.ofVirtual().start(()->writeAfter(start,fs,path,shortValue));
+		start.countDown();
+		a.join();
+		b.join();
+		byte[] actual=Files.readAllBytes(path);
+		if (actual.length==longValue.length) {
+			assertArrayEquals(longValue,actual);
+		} else {
+			assertArrayEquals(shortValue,actual);
+		}
+	}
+
+	@Test
+	public void testLocalTimestampAdvanceIsStrictlyMonotonic() {
+		DLFileSystem fs=(DLFileSystem)DLFS.createLocal();
+		long future=System.currentTimeMillis()+10_000;
+		fs.setTimestamp(CVMLong.create(future));
+		assertEquals(future+1,fs.updateTimestamp().longValue());
+		assertEquals(future+2,fs.updateTimestamp().longValue());
+	}
+
+	private static void writeAfter(CountDownLatch start, DLFileSystem fs, DLPath path, byte[] value) {
+		try {
+			start.await();
+			fs.writeAllBytes(path,value);
+		} catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+	}
 	
 	@Test public void testProvider() throws URISyntaxException, IOException {
 		DLFSProvider provider=DLFS.provider();
@@ -198,6 +269,66 @@ public class DLFSTest {
 
 		assertThrows(IOException.class,()->Files.delete(fs.getRoot()));
 		assertThrows(NoSuchFileException.class,()->Files.delete(fs.getRoot().resolve("not-found")));
+	}
+
+	@Test
+	public void testDeleteAfterChildrenTombstoned() throws IOException {
+		// A directory whose children have all been deleted is logically empty:
+		// deletions move children out of the live entries into the parent's
+		// POS_TOMBS index, so the directory itself can then be deleted.
+		DLFileSystem fs = DLFS.createLocal();
+		Path root = fs.getRoot();
+		Path tree = Files.createDirectory(root.resolve("tree"));
+		Path a = root.resolve("tree/a.txt");
+		Path b = root.resolve("tree/b.txt");
+		Files.write(a, new byte[]{1,2,3});
+		Files.write(b, new byte[]{4,5,6});
+
+		Files.delete(a);
+		Files.delete(b);
+
+		// All children gone — the directory's live entries are empty (their
+		// tombstones live in the parent's POS_TOMBS index). Delete must succeed.
+		Files.delete(tree);
+		assertFalse(Files.exists(tree));
+
+		// Listing shows only live entries — root no longer shows tree.
+		try (DirectoryStream<Path> ds = Files.newDirectoryStream(root)) {
+			assertFalse(ds.iterator().hasNext());
+		}
+	}
+
+	@Test
+	public void testRecreateOverTombstone() throws IOException {
+		// After deleting a directory, mkdir at the same path should succeed
+		// (tombstones don't reserve the name).
+		DLFileSystem fs = DLFS.createLocal();
+		Path root = fs.getRoot();
+		Path foo = Files.createDirectory(root.resolve("foo"));
+		Files.delete(foo);
+
+		Path foo2 = Files.createDirectory(root.resolve("foo"));
+		assertTrue(Files.exists(foo2));
+		assertTrue(Files.isDirectory(foo2));
+	}
+
+	@Test
+	public void testDirectoryStreamSkipsTombstones() throws IOException {
+		DLFileSystem fs = DLFS.createLocal();
+		Path root = fs.getRoot();
+		Path keep = root.resolve("keep.txt");
+		Path drop = root.resolve("drop.txt");
+		Files.write(keep, new byte[]{1});
+		Files.write(drop, new byte[]{2});
+		Files.delete(drop);
+
+		// Only the surviving entry should appear.
+		try (DirectoryStream<Path> ds = Files.newDirectoryStream(root)) {
+			Iterator<Path> it = ds.iterator();
+			assertTrue(it.hasNext());
+			assertEquals(keep, it.next());
+			assertFalse(it.hasNext());
+		}
 	}
 	
 	@Test 
@@ -717,6 +848,50 @@ public class DLFSTest {
 		//   rootCursor.updateAndGet(rootNode -> DLFSNode.merge(rootNode, other, getTimestamp()))
 		// It should be:
 		//   rootCursor.updateAndGet(rootNode -> DLFSLattice.INSTANCE.merge(LatticeContext.EMPTY, rootNode, other))
+	}
+
+	/**
+	 * Two updates in a row at the SAME timestamp must have last-write-wins
+	 * semantics: the second write survives even when an older snapshot of the
+	 * first write is merged back (e.g. the propagator re-applying an announced
+	 * pre-edit snapshot). LWW on a tie is delivered by the merge favouring the
+	 * "own" (first) argument, so the realistic write path — which passes the
+	 * local/latest value as own — keeps the later write. Reversing the argument
+	 * order reverts to the earlier write; asserting both directions guards
+	 * against an accidental swap that would silently lose the last write.
+	 */
+	@Test
+	public void testEqualTimestampUpdatesInARowAreLWW() throws IOException {
+		CVMLong t = CVMLong.create(1000);
+		DLFileSystem drive = DLFS.createLocal();
+		drive.setTimestamp(t);
+		DLPath path = drive.getPath("f.txt");
+
+		// Update 1: f.txt = {1}
+		try (OutputStream os = Files.newOutputStream(path)) { os.write(new byte[] { 1 }); }
+		AVector<ACell> older = drive.getNode(drive.getRoot());   // snapshot after the first write
+
+		// Update 2, in a row at the SAME timestamp: f.txt = {2}
+		try (OutputStream os = Files.newOutputStream(path)) { os.write(new byte[] { 2 }); }
+		AVector<ACell> latest = drive.getNode(drive.getRoot());
+
+		assertEquals(DLFSNode.getUTime(older), DLFSNode.getUTime(latest),
+			"precondition: both updates share a timestamp (a genuine tie, not newer-wins)");
+
+		Blob first = Blob.wrap(new byte[] { 1 });
+		Blob second = Blob.wrap(new byte[] { 2 });
+
+		// Realistic path: the latest write is "own", an older snapshot is merged
+		// back as "other" — the last write must survive (LWW).
+		AVector<ACell> merged = DLFSLattice.INSTANCE.merge(LatticeContext.EMPTY, latest, older);
+		assertEquals(second, DLFSNode.getData(DLFSNode.navigate(merged, path)),
+			"last of two equal-timestamp updates must survive a merge-back of the older snapshot (LWW)");
+
+		// Order is load-bearing: passing the older value as own would revert the
+		// last write, which is why the write/sync path keeps the latest as own.
+		AVector<ACell> reverted = DLFSLattice.INSTANCE.merge(LatticeContext.EMPTY, older, latest);
+		assertEquals(first, DLFSNode.getData(DLFSNode.navigate(reverted, path)),
+			"reversing the merge order reverts the tie — confirms the argument order is correct and load-bearing");
 	}
 
 	/**

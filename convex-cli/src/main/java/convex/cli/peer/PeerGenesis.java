@@ -5,6 +5,7 @@ import java.util.List;
 
 import convex.cli.CLIError;
 import convex.cli.ExitCodes;
+import convex.cli.Helpers;
 import convex.core.cvm.State;
 import convex.core.crypto.AKeyPair;
 import convex.core.data.AccountKey;
@@ -17,7 +18,6 @@ import convex.peer.PeerException;
 import convex.peer.Server;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
-import picocli.CommandLine.ParentCommand;
 import picocli.CommandLine.ScopeType;
 
 /**
@@ -31,14 +31,15 @@ import picocli.CommandLine.ScopeType;
 	description = "Instantiate a Convex network.")
 public class PeerGenesis extends APeerCommand {
 
-	@ParentCommand
-	private Peer peerParent;
-	
-	@Option(names = { "--governance-key" }, 
-			defaultValue = "${env:CONVEX_GOVERNANCE_KEY}", 
-			scope = ScopeType.INHERIT, 
+	@Option(names = { "--governance-key" },
+			defaultValue = "${env:CONVEX_GOVERNANCE_KEY}",
+			scope = ScopeType.INHERIT,
 			description = "Network Governance Key. Must be a valid Ed25519 public key. Genesis key will be used if not specified (unless security is strict).")
 	protected String governanceKey;
+
+	@Option(names = { "--protocol-version" },
+			description = "Protocol version for the new network genesis. Default: latest version supported by this release.")
+	private Long protocolVersion;
 
 	@Override
 	public void execute() throws InterruptedException {
@@ -75,15 +76,16 @@ public class PeerGenesis extends APeerCommand {
 				}
 			}
 	
-			EtchStore store=getEtchStore();
-			
-			State genesisState=Init.createState(govKey,genesisKey.getAccountKey(),List.of(peerKey.getAccountKey()));
-			inform("Created genesis state with hash: "+genesisState.getHash());
-			
+			State genesisState=Helpers.applyGenesisProtocol(
+					Init.createState(govKey,genesisKey.getAccountKey(),List.of(peerKey.getAccountKey())),
+					protocolVersion);
+			inform("Created genesis state with hash: "+genesisState.getHash()
+					+" at protocol version "+genesisState.getProtocolVersion());
+
 			inform("Testing genesis state peer initialisation");
-			
+
 			HashMap<Keyword,Object> config=new HashMap<>();
-			config.put(Keywords.STORE, store);
+			config.put(Keywords.STORE, etch);
 			config.put(Keywords.STATE, genesisState);
 			config.put(Keywords.KEYPAIR, peerKey);
 			Server s=API.launchPeer(config); 

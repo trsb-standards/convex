@@ -52,7 +52,6 @@ public class AuthTest {
 		expectedAudience = DID.forKey(serverKeyPair.getAccountKey()).toString();
 
 		server = DLFSServer.create(serverKeyPair);
-		server.getWebDAV().setRequireAuthForWrites(true);
 		// Pre-seed a drive for anonymous read tests
 		server.getDriveManager().createDrive(null, "auth");
 		server.start(0);
@@ -313,7 +312,7 @@ public class AuthTest {
 		}
 		HttpResponse<String> resp = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
 		assertEquals(200, resp.statusCode(), "MCP request should return 200");
-		return RT.ensureMap(JSON.parse(resp.body()));
+		return RT.castMap(JSON.parse(resp.body()));
 	}
 
 	@Test
@@ -720,5 +719,140 @@ public class AuthTest {
 		String deniedJson = JSON.print(deniedResult).toString();
 		assertTrue(deniedJson.contains("Drive not found") || deniedJson.contains("isError"),
 			"Bob should not read files outside the scoped path");
+
+		// Canonicalisation must happen before capability matching: otherwise the raw
+		// prefix public/../ would be covered and the NIO channel would read /secret.txt.
+		AMap<AString, ACell> traversalResult = mcpToolCallWithUcans("dlfs_read",
+			Maps.of("drive", "ucan-scoped", "path", "public/../secret.txt"),
+			bobJWT(), Vectors.of(ucan));
+		String traversalJson = JSON.print(traversalResult).toString();
+		assertTrue(traversalJson.contains("Invalid path") || traversalJson.contains("isError"),
+			"Dot segments must not escape a UCAN path grant");
+	}
+
+	@Test
+	void testMcpAnonymousMutationsRejectedByDefault() throws Exception {
+		AMap<AString, ACell> result = mcpToolCall("dlfs_write",
+			Maps.of("drive", "auth", "path", "anonymous.txt", "content", "denied"), null);
+		String json = JSON.print(result).toString();
+		assertTrue(json.contains("Authentication required") || json.contains("isError"));
+		assertFalse(java.nio.file.Files.exists(
+			server.getDriveManager().getDrive(null, "auth").getPath("/anonymous.txt")));
+	}
+
+	// --- Delegation chains (root authority + per-hop attenuation) ---
+
+	private static final AKeyPair carolKeyPair = AKeyPair.generate();
+
+	private String carolJWT() {
+		return createSelfIssuedJWT(carolKeyPair, 3600);
+	}
+
+	/** Bob re-delegates access to Alice's drive to Carol, carrying the root grant as proof. */
+	private static AString redelegateToCarol(AString rootUcan, String aliceDID,
+			String driveName, String path, String ability) {
+		String resource = aliceDID + "/dlfs/" + driveName;
+		if (path != null && !path.isEmpty()) resource += "/" + path;
+		AVector<ACell> caps = Vectors.of(
+			Capability.create(Strings.create(resource), Strings.create(ability)));
+		long expiry = System.currentTimeMillis() / 1000 + 1800; // narrower than the root grant
+		return UCAN.createJWT(bobKeyPair, carolKeyPair.getAccountKey(), expiry, caps,
+			Vectors.of(rootUcan));
+	}
+
+	@Test
+	void testUcanDelegationChain() throws Exception {
+		String aliceDID = getDID(clientKeyPair);
+		server.getDriveManager().createDrive(aliceDID, "ucan-chain");
+		var fs = server.getDriveManager().getDrive(aliceDID, "ucan-chain");
+		java.nio.file.Files.write(fs.getPath("/shared.txt"), "chained".getBytes(),
+			java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
+
+		// Alice -> Bob (crud), Bob -> Carol (read only, properly attenuated)
+		AString rootUcan = createDlfsUcanJWT(clientKeyPair, bobKeyPair,
+			"ucan-chain", null, "crud", 3600);
+		AString chained = redelegateToCarol(rootUcan, aliceDID, "ucan-chain", null, "crud/read");
+
+		AMap<AString, ACell> result = mcpToolCallWithUcans("dlfs_read",
+			Maps.of("drive", "ucan-chain", "path", "shared.txt"),
+			carolJWT(), Vectors.of(chained));
+		assertTrue(JSON.print(result).toString().contains("chained"),
+			"Carol should read via the Alice->Bob->Carol delegation chain");
+	}
+
+	@Test
+	void testUcanChainEscalationRefused() throws Exception {
+		String aliceDID = getDID(clientKeyPair);
+		server.getDriveManager().createDrive(aliceDID, "ucan-chain-esc");
+		var fs = server.getDriveManager().getDrive(aliceDID, "ucan-chain-esc");
+		java.nio.file.Files.createDirectory(fs.getPath("/public"));
+		java.nio.file.Files.write(fs.getPath("/public/ok.txt"), "visible".getBytes(),
+			java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
+		java.nio.file.Files.write(fs.getPath("/secret.txt"), "hidden".getBytes(),
+			java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
+
+		// Alice grants Bob read on "public" only; Bob re-delegates the WHOLE drive to
+		// Carol — genuine signatures and linkage, but escalated beyond Bob's grant
+		AString rootUcan = createDlfsUcanJWT(clientKeyPair, bobKeyPair,
+			"ucan-chain-esc", "public", "crud/read", 3600);
+		AString escalated = redelegateToCarol(rootUcan, aliceDID, "ucan-chain-esc", null, "crud");
+
+		// Outside the root grant: denied (per-hop attenuation)
+		AMap<AString, ACell> denied = mcpToolCallWithUcans("dlfs_read",
+			Maps.of("drive", "ucan-chain-esc", "path", "secret.txt"),
+			carolJWT(), Vectors.of(escalated));
+		String deniedJson = JSON.print(denied).toString();
+		assertTrue(deniedJson.contains("Drive not found") || deniedJson.contains("isError"),
+			"Escalated re-delegation must not exceed the root grant");
+
+		// Within the root grant: the same token still authorises
+		AMap<AString, ACell> ok = mcpToolCallWithUcans("dlfs_read",
+			Maps.of("drive", "ucan-chain-esc", "path", "public/ok.txt"),
+			carolJWT(), Vectors.of(escalated));
+		assertTrue(JSON.print(ok).toString().contains("visible"),
+			"The chain still authorises requests within the root grant");
+	}
+
+	// --- DID-URL drive references (explicit owner, resolves shadowing) ---
+
+	@Test
+	void testUcanDIDURLDriveReference() throws Exception {
+		String aliceDID = getDID(clientKeyPair);
+		String bobDID = getDID(bobKeyPair);
+
+		// Alice and Bob both own a drive named "shadow" with different content
+		server.getDriveManager().createDrive(aliceDID, "shadow");
+		server.getDriveManager().createDrive(bobDID, "shadow");
+		var aliceFs = server.getDriveManager().getDrive(aliceDID, "shadow");
+		java.nio.file.Files.write(aliceFs.getPath("/note.txt"), "alice content".getBytes(),
+			java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
+		var bobFs = server.getDriveManager().getDrive(bobDID, "shadow");
+		java.nio.file.Files.write(bobFs.getPath("/note.txt"), "bob content".getBytes(),
+			java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
+
+		AString ucan = createDlfsUcanJWT(clientKeyPair, bobKeyPair,
+			"shadow", null, "crud/read", 3600);
+
+		// A bare name resolves to Bob's own drive, shadowing the delegated one
+		AMap<AString, ACell> own = mcpToolCallWithUcans("dlfs_read",
+			Maps.of("drive", "shadow", "path", "note.txt"),
+			bobJWT(), Vectors.of(ucan));
+		assertTrue(JSON.print(own).toString().contains("bob content"),
+			"Bare drive name should resolve to the caller's own drive");
+
+		// A DID-URL reference names Alice's drive explicitly
+		AMap<AString, ACell> delegated = mcpToolCallWithUcans("dlfs_read",
+			Maps.of("drive", aliceDID + "/shadow", "path", "note.txt"),
+			bobJWT(), Vectors.of(ucan));
+		assertTrue(JSON.print(delegated).toString().contains("alice content"),
+			"DID-URL drive reference should reach the delegated drive");
+
+		// Without a proof the DID-URL reference is denied
+		AMap<AString, ACell> noProof = mcpToolCall("dlfs_read",
+			Maps.of("drive", aliceDID + "/shadow", "path", "note.txt"),
+			bobJWT());
+		String noProofJson = JSON.print(noProof).toString();
+		assertTrue(noProofJson.contains("Drive not found") || noProofJson.contains("isError"),
+			"DID-URL drive reference without a covering proof must be denied");
 	}
 }

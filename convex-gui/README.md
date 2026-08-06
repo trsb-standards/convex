@@ -2,7 +2,7 @@
 
 [![Maven Central](https://img.shields.io/maven-central/v/world.convex/convex-gui.svg?label=Maven%20Central)](https://search.maven.org/search?q=world.convex)
 
-A full-featured desktop application for developers and power users working with the [Convex](https://convex.world) decentralized network.
+A full-featured desktop application for developers and power users working with the [Convex](https://convex.world) decentralised network.
 
 ![Screenshot](docs/images/convex-desktop.png)
 
@@ -11,7 +11,7 @@ A full-featured desktop application for developers and power users working with 
 - **Transaction Execution** - Submit transactions and queries to Convex networks
 - **Wallet Management** - Secure key generation and account management
 - **Local Network** - Run a local Convex peer cluster for development
-- **Network Visualization** - Real-time view of CPoS consensus and messaging
+- **Network Visualisation** - Real-time view of CPoS consensus and messaging
 - **Testing Tools** - Simulations and stress testing capabilities
 
 ## Quick Start
@@ -26,7 +26,25 @@ Download `convex.jar` from the [releases page](https://github.com/Convex-Dev/con
 java -jar convex.jar desktop
 ```
 
+Convex GUI applications install one process-level system tray icon where
+supported. Double-clicking the icon or selecting **Open GUI** restores the main
+window; **Close** exits through the normal GUI shutdown path. Child windows do
+not create additional icons. Headless and unsupported systems simply run without
+tray integration. Set `CONVEX_NO_TRAY=1` to disable it explicitly.
+
 On Windows, you can also double-click `convex.jar` if Java is properly configured.
+
+### First run on macOS / Windows
+
+`convex.jar` is not code-signed, so the first time you **double-click** it macOS Gatekeeper
+("unidentified developer") or Windows SmartScreen may block it. Launching from a terminal with
+`java -jar convex.jar desktop` is not affected. To keep double-clicking:
+
+- **macOS** — right-click `convex.jar` and choose **Open** once, or clear the quarantine flag:
+  `xattr -dr com.apple.quarantine convex.jar`
+- **Windows** — on the SmartScreen dialog, choose **More info → Run anyway**
+
+This is expected for an unsigned build; signed/notarised installers are tracked as a future improvement.
 
 ## Building from Source
 

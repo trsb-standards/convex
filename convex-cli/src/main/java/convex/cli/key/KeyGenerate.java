@@ -16,7 +16,6 @@ import convex.core.data.Blobs;
 import convex.core.data.Hash;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
-import picocli.CommandLine.ScopeType;
 
 
 /**
@@ -52,26 +51,28 @@ public class KeyGenerate extends AKeyCommand {
 			defaultValue=convex.core.Constants.DEFAULT_BIP39_PATH,
 			description="Derivation path for SLIP-0010 when using BIP39. Default: ${DEFAULT-VALUE}")
 	private String path;
+
+	@Option(names="--mnemonic-file",
+			description="Write BIP39 mnemonic(s) to a new owner-only file. Use '-' to explicitly write to stdout. Required non-interactively; defaults to the attached console.")
+	private String mnemonicFilename;
 	
 	@Option(names="--passphrase",
 			description="BIP39 passphrase. If not provided, will be requested from user (or assumed blank in non-interactive mode).")
 	private String passphrase;
 	
-	@Option(names = { "-p","--keypass" }, 
-			defaultValue = "${env:CONVEX_KEY_PASSWORD}", 
-			scope = ScopeType.INHERIT, 
+	@Option(names = { "-p","--keypass" },
+			defaultValue = "${env:CONVEX_KEY_PASSWORD}",
 			description = "Key pair password for generated key. Can specify with CONVEX_KEY_PASSWORD.")
 	protected char[] keyPassword;
 
-	private AKeyPair generateKeyPair() {	
+	private AKeyPair generateKeyPair(SecretOutput mnemonicOutput) {
 		if ("bip39".equals(type)) {
 			if (words<12) {
 				paranoia("Can't use less than 12 BIP39 words in strict security mode");
 			}
 			
 			String mnemonic=BIP39.createSecureMnemonic(words);
-			inform("BIP39 mnemonic generated with "+words+" words:");
-			inform(mnemonic);
+			mnemonicOutput.write(mnemonic,"BIP39 mnemonic generated with "+words+" words:");
 			if (passphrase==null) {
 				if (isInteractive()) {
 					passphrase=new String(readPassword("Enter BIP39 passphrase: "));
@@ -105,8 +106,19 @@ public class KeyGenerate extends AKeyCommand {
 			}
 			return AKeyPair.create(h.toFlatBlob());
 		} else {
-			throw new CLIError(ExitCodes.USAGE,"Unsupprted key generation type: "+type);
+			throw new CLIError(ExitCodes.USAGE,"Unsupported key generation type: "+type);
 		}
+	}
+
+	private SecretOutput prepareMnemonicOutput() {
+		if (!"bip39".equals(type)) {
+			if (mnemonicFilename!=null) {
+				throw new CLIError(ExitCodes.USAGE,"--mnemonic-file is only valid with --type=bip39");
+			}
+			return null;
+		}
+
+		return SecretOutput.open(this,mnemonicFilename,"--mnemonic-file","BIP39 mnemonic");
 	}
 	
 	@Override
@@ -117,28 +129,35 @@ public class KeyGenerate extends AKeyCommand {
 			return;
 		}
 		
-		for ( int index = 0; index < count; index ++) {
-			AKeyPair kp=generateKeyPair();
-			
-            String publicKeyHexString =  kp.getAccountKey().toHexString();
-			storeMixin.ensureKeyStore();
-			
-			inform("Generated key pair with public key: 0x"+kp.getAccountKey().toChecksumHex());
+		storeMixin.ensureKeyStore();
 
-			if (keyPassword==null) {
-				if (isInteractive()) {
-					keyPassword=readPassword("Enter password for generated key: ");
-				} else if (isParanoid()) {
-					throw new CLIError(ExitCodes.USAGE,
-						"Password required in strict security mode. Use --keypass or CONVEX_KEY_PASSWORD environment variable.");
-				} else {
-					informWarning("No password provided - using empty password for key encryption.");
-					keyPassword = new char[0];
+		if (keyPassword==null) {
+			if (isInteractive()) {
+				keyPassword=readPassword("Enter password for generated key(s): ");
+			} else if (isParanoid()) {
+				throw new CLIError(ExitCodes.USAGE,
+					"Password required in strict security mode. Use --keypass or CONVEX_KEY_PASSWORD environment variable.");
+			} else {
+				informWarning("No password provided - using empty password for key encryption.");
+				keyPassword = new char[0];
+			}
+		}
+
+		try {
+			try (SecretOutput mnemonicOutput=prepareMnemonicOutput()) {
+				for ( int index = 0; index < count; index ++) {
+					AKeyPair kp=generateKeyPair(mnemonicOutput);
+
+					String publicKeyHexString =  kp.getAccountKey().toHexString();
+					inform("Generated key pair with public key: 0x"+kp.getAccountKey().toChecksumHex());
+
+					storeMixin.addKeyPairToStore(kp, keyPassword);
+					println(publicKeyHexString); // Output generated public key
 				}
 			}
-
-			storeMixin.addKeyPairToStore(kp, keyPassword); 
-			println(publicKeyHexString); // Output generated public key		
+		} finally {
+			// Wipe the password only after ALL keys are stored, otherwise keys 2..n
+			// would be encrypted with the wiped buffer contents.
 			Arrays.fill(keyPassword, 'p');
 		}
 		storeMixin.saveKeyStore();

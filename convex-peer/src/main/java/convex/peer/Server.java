@@ -24,6 +24,7 @@ import convex.core.cpos.Belief;
 import convex.core.cpos.Order;
 import convex.core.crypto.AKeyPair;
 import convex.core.cvm.AccountStatus;
+import convex.core.cvm.Migrations;
 import convex.core.cvm.Address;
 import convex.core.cvm.Keywords;
 import convex.core.cvm.Peer;
@@ -44,6 +45,7 @@ import convex.core.data.Vectors;
 import convex.core.data.prim.CVMLong;
 import convex.core.exceptions.InvalidDataException;
 import convex.core.exceptions.MissingDataException;
+import convex.core.exceptions.UpgradeError;
 import convex.core.init.Init;
 import convex.core.lang.RT;
 import convex.core.message.AConnection;
@@ -87,6 +89,14 @@ public class Server implements Closeable {
 	public static final int DEFAULT_PORT = Constants.DEFAULT_PEER_PORT;
 	
 	static final Logger log = LoggerFactory.getLogger(Server.class.getName());
+
+	/**
+	 * Logger for protocol upgrade lifecycle events (scheduled upgrade warnings,
+	 * stake withdrawal, consensus halt). Kept separate from per-class loggers so
+	 * operators and test configurations can route or filter upgrade alerts
+	 * independently.
+	 */
+	static final Logger upgradeLog = LoggerFactory.getLogger("convex.peer.upgrade");
 
 	private Consumer<Message> messageReceiveObserver=null;
 
@@ -221,8 +231,11 @@ public class Server implements Closeable {
 				log.info("Defaulting to standard Peer startup with genesis state: "+genesisState.getHash());
 			} else {
 				AccountKey peerKey=keyPair.getAccountKey();
-				genesisState=Init.createState(List.of(peerKey));
-				log.info("Created new genesis state: "+genesisState.getHash()+ " with initial peer: "+peerKey);
+				// Fresh network: default to the latest protocol version unless pinned
+				// lower with :protocol-version (a new network has no history to preserve)
+				genesisState=Config.applyGenesisProtocol(Init.createState(List.of(peerKey)),getConfig());
+				log.info("Created new genesis state: "+genesisState.getHash()+ " with initial peer: "+peerKey
+						+" at protocol version "+genesisState.getProtocolVersion());
 			}
 			return Peer.createGenesisPeer(keyPair,genesisState);
 
@@ -248,7 +261,14 @@ public class Server implements Closeable {
 			AccountKey remotePeerKey=RT.ensureAccountKey(status.get(Keywords.PEER));
 			Hash genesisHash=RT.ensureHash(status.get(Keywords.GENESIS));
 			Hash stateHash=RT.ensureHash(status.get(Keywords.STATE));
+			CVMLong remoteStatePosition=RT.ensureLong(status.get(Keywords.STATE_POSITION));
 			
+			if (beliefHash==null) {
+				throw new LaunchException("Remote peer did not provide a Belief hash");
+			}
+			if (remotePeerKey==null) {
+				throw new LaunchException("Remote peer did not provide a Peer key");
+			}
 			if (genesisHash==null) {
 				throw new LaunchException("Remote peer did not provide genesis hash");
 			}
@@ -288,6 +308,31 @@ public class Server implements Closeable {
 			}
 
 			Peer peer=Peer.create(keyPair, genF, belF);
+			if (remoteStatePosition!=null) {
+				long targetPosition=remoteStatePosition.longValue();
+				if (stateHash==null) {
+					throw new LaunchException("Remote peer advertised a state position without a state hash");
+				}
+				try {
+					peer=peer.recalcState(0,targetPosition);
+				} catch (IllegalArgumentException e) {
+					throw new LaunchException("Remote peer advertised invalid state position " + targetPosition,e);
+				}
+
+				Hash localStateHash=peer.getConsensusState().getHash();
+				if (!localStateHash.equals(stateHash)) {
+					log.warn("STATE REPLAY DIVERGENCE at position {}: local state {} differs from remote peer {} state {}. Retaining locally replayed state.",
+							targetPosition,localStateHash,remotePeerKey,stateHash);
+				} else {
+					log.info("Locally replayed and verified state {} at position {}",localStateHash,targetPosition);
+				}
+			} else {
+				// Older status responses cannot qualify their state hash with a position.
+				// Still complete local replay before networking, but do not compare unlike snapshots.
+				peer=peer.recalcState(0);
+				log.info("Remote peer did not advertise a state position; locally replayed finalised Order to position {} without a remote state comparison",
+						peer.getStatePosition());
+			}
 			return peer;
 		} catch (ExecutionException | InvalidDataException e) {
 			throw new LaunchException("Erring while trying to sync peer",e);
@@ -344,6 +389,19 @@ public class Server implements Closeable {
 	}
 
 	/**
+	 * Gets a future completing with this Server's Peer once its state has been computed to
+	 * at least the given block position. A real signal to wait on rather than polling
+	 * {@link #getPeer()} — state position advances asynchronously on the executor thread,
+	 * so a caller reading it straight after launch may observe an earlier position.
+	 *
+	 * @param position Block position the state must reach
+	 * @return Future completing with the Peer at or beyond that state position
+	 */
+	public CompletableFuture<Peer> awaitStatePosition(long position) {
+		return executor.awaitStatePosition(position);
+	}
+
+	/**
 	 * Gets the desired host name for this Peer
 	 * @return Hostname String
 	 */
@@ -362,9 +420,8 @@ public class Server implements Closeable {
 			// Establish Peer state
 			Peer peer = establishPeer();
 
-			// Ensure Peer is stored in executor and initially persisted prior to launch
+			// Ensure Peer is stored in executor before any optional recalculation
 			executor.setPeer(peer);
-			executor.persistPeerData();
 
 			HashMap<Keyword, Object> config = getConfig();
 
@@ -378,6 +435,9 @@ public class Server implements Closeable {
 			} catch (Exception e) {
 				throw new LaunchException("Launch failed to recalculate state: "+e,e);
 			}
+
+			// Persist the exact state that will be exposed before networking begins
+			executor.persistPeerData();
 
 			Object p = config.get(Keywords.PORT);
 			Integer port = (p == null) ? null : Utils.toInt(p);
@@ -420,7 +480,7 @@ public class Server implements Closeable {
 	 *
 	 * <p>Non-blocking on the fast path: a single {@code queue.offer()} and return. If the
 	 * target queue is full, returns a pre-allocated retry predicate instead of an error —
-	 * the caller (typically {@link convex.net.impl.netty.NettyInboundHandler}) parks the
+	 * the caller (typically {@code NettyInboundHandler}) parks the
 	 * channel and lets the predicate block on a virtual thread until space is available.
 	 *
 	 * <p>SECURITY: Must anticipate malicious or malformed messages.
@@ -609,6 +669,8 @@ public class Server implements Closeable {
 	 * 6 = proposal point
 	 * 7 = ordering length
 	 * 8 = consensus point vector
+	 * 9 = locally computed state position
+	 * 10 = maximum protocol version supported by this release
 	 * @return Status vector
 	 */
 	public AVector<ACell> getStatusData() {
@@ -629,7 +691,10 @@ public class Server implements Closeable {
 		CVMLong op = CVMLong.create(order.getBlockCount()) ;
 		AVector<CVMLong> cps = Vectors.of(Utils.toObjectArray(order.getConsensusPoints())) ;
 
-		AVector<ACell> reply=Vectors.of(beliefHash,stateHash,genesisHash,peerKey,consensusHash, cp,pp,op,cps);
+		CVMLong statePosition=CVMLong.create(peer.getStatePosition());
+		CVMLong supportedProtocolVersion=CVMLong.create(Migrations.MAX_VERSION);
+		AVector<ACell> reply=Vectors.of(beliefHash,stateHash,genesisHash,peerKey,consensusHash,
+				cp,pp,op,cps,statePosition,supportedProtocolVersion);
 		assert(reply.count()==Config.STATUS_COUNT);
 		return reply;
 	}
@@ -877,6 +942,104 @@ public class Server implements Closeable {
 		return isRunning;
 	}
 
+	/**
+	 * The peer's time source, in milliseconds since epoch. All consensus-relevant
+	 * time reads (block timestamps, belief merge, block-rate throttling) go through
+	 * this single seam. Defaults to wall clock; overridable so that the passage of
+	 * time can be driven deterministically in tests.
+	 */
+	private volatile java.util.function.LongSupplier timeSource = Utils::getCurrentTimestamp;
+
+	/**
+	 * Gets the current peer timestamp in milliseconds since epoch.
+	 * @return Current peer timestamp
+	 */
+	public long getTimestamp() {
+		return timeSource.getAsLong();
+	}
+
+	/**
+	 * Overrides the peer's time source. Consensus-relevant time reads then observe
+	 * the supplied clock instead of the wall clock, so tests can drive the passage
+	 * of time deterministically. Package-visible: for test use only.
+	 * @param timeSource New time source (milliseconds since epoch)
+	 */
+	void setTimeSource(java.util.function.LongSupplier timeSource) {
+		this.timeSource = timeSource;
+	}
+
+	/**
+	 * Non-null if the peer has frozen consensus participation because a required
+	 * network upgrade cannot be applied by this release. See UPGRADE.md.
+	 */
+	private volatile UpgradeError consensusHalt = null;
+
+	/**
+	 * Completed with the halting UpgradeError the first time consensus freezes.
+	 * A real signal for operators/monitoring (and tests) to react to a freeze
+	 * rather than polling {@link #isConsensusHalted()}.
+	 */
+	private final java.util.concurrent.CompletableFuture<UpgradeError> consensusHaltFuture = new java.util.concurrent.CompletableFuture<>();
+
+	/**
+	 * Freezes this peer's consensus participation due to a required upgrade this
+	 * release cannot apply. Both the CVM executor and the belief propagator check
+	 * {@link #isConsensusHalted()} and cease all consensus activity (state
+	 * application, belief merge, block proposal, Order publication) — a full
+	 * consensus freeze, so the peer never votes on or publishes anything past the
+	 * boundary it cannot validate. The server stays alive to serve queries and
+	 * report its condition. Idempotent: only the first halt is recorded.
+	 *
+	 * @param error The UpgradeError that triggered the freeze
+	 */
+	public void haltConsensus(UpgradeError error) {
+		if (consensusHalt == null) {
+			consensusHalt = error;
+			consensusHaltFuture.complete(error);
+			upgradeLog.error("Peer consensus HALTED: upgrade to protocol version {} required but not supported by this release ({} supported). Update the peer software to rejoin. See UPGRADE.md",
+					error.getVersion(), Migrations.MAX_VERSION);
+		}
+	}
+
+	/**
+	 * Gets a future that completes with the halting UpgradeError when this peer
+	 * freezes consensus pending a software upgrade. Never completes if the peer
+	 * does not halt.
+	 * @return Future of the halting UpgradeError
+	 */
+	public java.util.concurrent.CompletableFuture<UpgradeError> awaitConsensusHalt() {
+		return consensusHaltFuture;
+	}
+
+	/**
+	 * Gets the earliest scheduled network upgrade this release cannot apply, or null
+	 * if every scheduled upgrade is supported. If non-null, the peer will withdraw
+	 * from consensus at the returned activation timestamp unless the software is
+	 * upgraded first. A pure function of current consensus state, suitable for
+	 * health checks and operator tooling. See UPGRADE.md.
+	 * @return Pending unsupported upgrade warning, or null
+	 */
+	public Migrations.UpgradeWarning getUpgradeWarning() {
+		return Migrations.pendingBeyondSupport(getPeer().getConsensusState());
+	}
+
+	/**
+	 * Checks whether this peer has frozen consensus participation pending a
+	 * software upgrade.
+	 * @return True if consensus is halted
+	 */
+	public boolean isConsensusHalted() {
+		return consensusHalt != null;
+	}
+
+	/**
+	 * Gets the UpgradeError that froze consensus, or null if not halted.
+	 * @return The halting UpgradeError, or null
+	 */
+	public UpgradeError getConsensusHalt() {
+		return consensusHalt;
+	}
+
 	public TransactionHandler getTransactionHandler() {
 		return transactionHandler;
 	}
@@ -895,6 +1058,31 @@ public class Server implements Closeable {
 
 	public CVMExecutor getCVMExecutor() {
 		return executor;
+	}
+
+	/**
+	 * Adds an observer for finalised peer state updates. A newly registered observer
+	 * is first called with the current Peer while registration holds the executor
+	 * lock, eliminating a missed-update window. Later calls occur on the CVM executor
+	 * thread. Observers should return promptly; asynchronous observers should enqueue
+	 * or distribute the supplied Peer value.
+	 *
+	 * @param observer Observer to register
+	 * @return {@code true} if the observer was added
+	 */
+	public boolean addStateUpdateObserver(Consumer<Peer> observer) {
+		return executor.addUpdateObserver(observer);
+	}
+
+	/**
+	 * Removes a finalised peer state observer. An in-progress invocation may still
+	 * complete after this method returns.
+	 *
+	 * @param observer Observer instance to remove
+	 * @return {@code true} if the observer was removed
+	 */
+	public boolean removeStateUpdateObserver(Consumer<Peer> observer) {
+		return executor.removeUpdateObserver(observer);
 	}
 
 	public QueryHandler getQueryProcessor() {
@@ -921,8 +1109,17 @@ public class Server implements Closeable {
 		}
 	}
 
+	/**
+	 * Waits for the Server to shut down (i.e. {@link #isRunning()} becoming false).
+	 *
+	 * @throws InterruptedException if the calling thread is interrupted, including if the
+	 *         interrupt flag is already set on entry. This guarantees callers see an
+	 *         interrupt as an exception rather than a silent return, so an interrupt
+	 *         cannot be mistaken for a completed shutdown.
+	 */
 	public void waitForShutdown() throws InterruptedException {
-		while (isRunning()&&!Thread.currentThread().isInterrupted()) {
+		while (isRunning()) {
+			// Note: throws immediately if the interrupt flag is already set
 			Thread.sleep(1000);
 		}
 	}

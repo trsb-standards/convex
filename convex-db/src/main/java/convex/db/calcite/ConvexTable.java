@@ -47,12 +47,6 @@ public class ConvexTable extends AbstractQueryableTable
 	private final ConvexSchema schema;
 	private final String tableName;
 
-	// Lazily cached column metadata — column names and types are stable for a
-	// given table definition and expensive to re-derive from the lattice on every
-	// getRowType() / getStatistic() call during query planning.
-	private volatile String[] cachedColumnNames;
-	private volatile ConvexColumnType[] cachedColumnTypes;
-
 	public ConvexTable(ConvexSchema schema, String tableName) {
 		super(Object[].class);
 		this.schema = schema;
@@ -63,8 +57,9 @@ public class ConvexTable extends AbstractQueryableTable
 	public RelDataType getRowType(RelDataTypeFactory typeFactory) {
 		RelDataTypeFactory.Builder builder = typeFactory.builder();
 
-		String[] columnNames = getColumnNames();
-		ConvexColumnType[] columnTypes = getColumnTypes();
+		SQLSchema tables = schema.getTables();
+		String[] columnNames = tables.getColumnNames(tableName);
+		ConvexColumnType[] columnTypes = tables.getColumnTypes(tableName);
 
 		if (columnNames != null && columnTypes != null) {
 			for (int i = 0; i < columnNames.length; i++) {
@@ -74,13 +69,6 @@ public class ConvexTable extends AbstractQueryableTable
 		}
 
 		return builder.build();
-	}
-
-	private String[] getColumnNames() {
-		if (cachedColumnNames == null) {
-			cachedColumnNames = schema.getTables().getColumnNames(tableName);
-		}
-		return cachedColumnNames;
 	}
 
 	/**
@@ -99,10 +87,7 @@ public class ConvexTable extends AbstractQueryableTable
 	}
 
 	public ConvexColumnType[] getColumnTypes() {
-		if (cachedColumnTypes == null) {
-			cachedColumnTypes = schema.getTables().getColumnTypes(tableName);
-		}
-		return cachedColumnTypes;
+		return schema.getTables().getColumnTypes(tableName);
 	}
 
 	/**
@@ -174,28 +159,12 @@ public class ConvexTable extends AbstractQueryableTable
 
 	// ========== DML Operations (called from generated code) ==========
 
-	/**
-	 * Normalizes a row yielded by an input Enumerable to an {@code Object[]}.
-	 *
-	 * <p>Calcite's child relational node (e.g. a {@code VALUES}/{@code SELECT}
-	 * feeding an INSERT/UPDATE/DELETE) decides its own row format independently
-	 * of what the parent requests: for a single-column row it commonly yields
-	 * the scalar value directly rather than a 1-element {@code Object[]}. Since
-	 * that decision isn't something we can reliably override from the modify
-	 * side (tried forcing {@code Prefer.ARRAY} on the child — Calcite ignored
-	 * it for the single-column case), every DML entry point normalizes here
-	 * instead of assuming {@code Object[]} unconditionally.
-	 */
-	private static Object[] normalizeRow(Object rowObj) {
-		return (rowObj instanceof Object[] arr) ? arr : new Object[]{rowObj};
-	}
-
-	public long executeInsert(Enumerable<Object> input) {
+	public long executeInsert(Enumerable<?> input) {
 		try {
 			long count = 0;
-			for (Object rowObj : input) {
-				Object[] row = normalizeRow(rowObj);
-				if (insertRow(row)) {
+			for (Object value : input) {
+				Object[] row=normaliseRow(value);
+				if (row != null && insertRow(row)) {
 					count++;
 				}
 			}
@@ -205,7 +174,7 @@ public class ConvexTable extends AbstractQueryableTable
 		}
 	}
 
-	public long executeUpdate(Enumerable<Object> input, int columnCount, int[] updateIndices) {
+	public long executeUpdate(Enumerable<?> input, int columnCount, int[] updateIndices) {
 		try {
 			boolean pkBeingUpdated = false;
 			for (int idx : updateIndices) {
@@ -218,8 +187,9 @@ public class ConvexTable extends AbstractQueryableTable
 			ConvexColumnType[] types = getColumnTypes();
 
 			long count = 0;
-			for (Object rowObj : input) {
-				Object[] row = normalizeRow(rowObj);
+			for (Object value : input) {
+				Object[] row=normaliseRow(value);
+				if (row == null) continue;
 
 				Object[] updatedRow = new Object[columnCount];
 				for (int i = 0; i < columnCount; i++) {
@@ -256,12 +226,12 @@ public class ConvexTable extends AbstractQueryableTable
 		}
 	}
 
-	public long executeDelete(Enumerable<Object> input) {
+	public long executeDelete(Enumerable<?> input) {
 		try {
 			long count = 0;
-			for (Object rowObj : input) {
-				Object[] row = normalizeRow(rowObj);
-				if (row.length > 0) {
+			for (Object value : input) {
+				Object[] row=normaliseRow(value);
+				if (row != null && row.length > 0) {
 					ACell pk = toCell(row[0], 0);
 					if (schema.getTables().deleteByKey(tableName, pk)) {
 						count++;
@@ -272,6 +242,13 @@ public class ConvexTable extends AbstractQueryableTable
 		} catch (ExceptionInInitializerError e) {
 			throw wrapTypeError(e, "DELETE");
 		}
+	}
+
+	/** Normalises Calcite's scalar representation for single-column rows. */
+	private static Object[] normaliseRow(Object value) {
+		if (value==null) return null;
+		if (value instanceof Object[] row) return row;
+		return new Object[] {value};
 	}
 
 	private RuntimeException wrapTypeError(ExceptionInInitializerError e, String operation) {

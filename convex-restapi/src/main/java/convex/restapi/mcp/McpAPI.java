@@ -7,6 +7,8 @@ import java.io.PrintWriter;
 import java.security.SecureRandom;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,7 +35,6 @@ import convex.core.data.AccountKey;
 import convex.core.data.MapEntry;
 import convex.core.data.Symbol;
 import convex.core.data.Blob;
-import convex.core.data.Cells;
 import convex.core.data.Format;
 import convex.core.data.Hash;
 import convex.core.data.Maps;
@@ -45,17 +46,18 @@ import convex.core.data.Vectors;
 import convex.core.data.prim.CVMBool;
 import convex.core.data.prim.CVMLong;
 import convex.core.exceptions.BadFormatException;
-import convex.core.exceptions.MissingDataException;
 import convex.core.lang.RT;
 import convex.core.lang.Reader;
 import convex.core.util.JSON;
 import convex.core.util.Utils;
+import convex.restapi.PreparedTransaction;
 import convex.restapi.RESTServer;
+import convex.restapi.SeedTransport;
 import convex.restapi.api.ABaseAPI;
 import convex.restapi.api.ChainAPI;
 import convex.restapi.auth.AuthMiddleware;
 import jakarta.servlet.http.HttpServletResponse;
-import io.javalin.Javalin;
+import io.javalin.config.RoutesConfig;
 import io.javalin.http.Context;
 
 /**
@@ -86,7 +88,7 @@ import io.javalin.http.Context;
  * dedicated API/gateway peers rather than core validators.</p>
  *
  * @see <a href="https://www.jsonrpc.org/specification">JSON-RPC 2.0</a>
- * @see <a href="https://modelcontextprotocol.io/specification/2025-06-18">MCP Specification</a>
+ * @see <a href="https://modelcontextprotocol.io/specification/2025-11-25">MCP Specification</a>
  */
 public class McpAPI extends ABaseAPI {
 
@@ -107,7 +109,9 @@ public class McpAPI extends ABaseAPI {
 	public static final StringShort ARG_BYTES = Strings.intern("bytes");
 	public static final StringShort ARG_ACCOUNT_KEY = Strings.intern("accountKey");
 	public static final StringShort ARG_FAUCET = Strings.intern("faucet");
+	public static final StringShort ARG_RESOLVE = Strings.intern("resolve");
 	public static final StringShort ARG_HASH = Strings.intern("hash");
+	public static final StringShort ARG_DATA = Strings.intern("data");
 	public static final StringShort ARG_CAD3 = Strings.intern("cad3");
 	public static final StringShort ARG_GET_PATH = Strings.intern("getPath");
 	public static final StringShort ARG_NAME = Strings.intern("name");
@@ -126,7 +130,7 @@ public class McpAPI extends ABaseAPI {
 	/** Maximum concurrent McpConnections. Each holds a virtual thread + TCP socket. */
 	public static final int MAX_CONNECTIONS = 1000;
 
-	/** Maximum watches per connection. Caps polling overhead per client. */
+	/** Maximum watches per connection. Caps resolution work per state update. */
 	public static final int MAX_WATCHES_PER_CONNECTION = 16;
 
 	/** Size threshold for queryState responses (bytes). Values larger than this are omitted. */
@@ -149,9 +153,23 @@ public class McpAPI extends ABaseAPI {
 	/** Convex-specific state watcher */
 	private final ConvexStateWatcher stateWatcher = new ConvexStateWatcher();
 
+	/**
+	 * When true, seed-carrying tools accept cleartext HTTP from any client (#554).
+	 * Default false: seeds require HTTPS or a loopback client. Configure via
+	 * {@code rest.allowHttpSeeds} for trusted development or test networks only.
+	 */
+	private final boolean allowHttpSeeds;
+
 	public McpAPI(RESTServer restServer, McpServer mcpServer) {
 		super(restServer);
 		this.mcpServer = mcpServer;
+
+		// #552: restrict MCP Origins if configured (DNS rebinding protection)
+		java.util.Set<String> origins = restServer.getRESTConfig().getAllowedOrigins();
+		if (origins != null) mcpServer.setAllowedOrigins(origins);
+
+		// #554: HTTPS enforcement for seed-based tools, opt-out for private networks
+		this.allowHttpSeeds = restServer.getRESTConfig().isHttpSeedsAllowed();
 
 		// Enrich server info with peer details
 		AMap<AString, ACell> info = mcpServer.getServerInfo();
@@ -170,6 +188,63 @@ public class McpAPI extends ABaseAPI {
 		return mcpServer;
 	}
 
+	/**
+	 * Stops peer-state observation for this API instance.
+	 */
+	public void shutdown() {
+		stateWatcher.shutdown();
+	}
+
+	/**
+	 * Transport-security check for tools that receive sensitive key material (#554).
+	 * A seed sent over cleartext HTTP is fully compromised in transit, so
+	 * seed-carrying tools require HTTPS — either directly or via an
+	 * {@code X-Forwarded-Proto: https} header from a TLS-terminating proxy.
+	 * Loopback clients are exempt (local development), and the check can be
+	 * disabled entirely with the {@code rest.allowHttpSeeds} config option for
+	 * trusted development or test networks.
+	 *
+	 * @return null if the transport is acceptable, otherwise a tool error result
+	 */
+	AMap<AString, ACell> checkSeedTransport() {
+		return checkSeedTransport(true);
+	}
+
+	/** Transport-security check made before a tool returns a newly generated seed. */
+	AMap<AString, ACell> checkSeedOutputTransport() {
+		return checkSeedTransport(false);
+	}
+
+	private AMap<AString, ACell> checkSeedTransport(boolean sensitiveInputReceived) {
+		if (allowHttpSeeds) return null;
+		Context ctx = McpServer.getCurrentContext();
+		if (ctx == null) return null; // not an HTTP request (internal or test invocation)
+		if (SeedTransport.isSecure(ctx)) {
+			return null;
+		}
+		String message=sensitiveInputReceived
+				?SeedTransport.rejectedIncomingMessage()
+				:SeedTransport.rejectedOutputMessage();
+		return toolError(message);
+	}
+
+	/**
+	 * Pure transport-security decision for seed-carrying requests (#554).
+	 *
+	 * <p>Note {@code X-Forwarded-Proto} is client-forgeable when no proxy is
+	 * present; this check protects a well-meaning client from a misconfigured
+	 * cleartext deployment, not against a client that chooses to lie about its
+	 * own transport (which only defeats its own protection).
+	 *
+	 * @param scheme Request scheme ("http" or "https")
+	 * @param forwardedProto X-Forwarded-Proto header value, or null
+	 * @param remoteAddr Remote IP address of the client, or null
+	 * @return true if the transport is acceptable for seed material
+	 */
+	static boolean isSecureSeedTransport(String scheme, String forwardedProto, String remoteAddr) {
+		return SeedTransport.isSecure(scheme,forwardedProto,remoteAddr);
+	}
+
 	public AMap<AString, ACell> getServerInfo() {
 		return mcpServer.getServerInfo();
 	}
@@ -179,11 +254,11 @@ public class McpAPI extends ABaseAPI {
 	}
 
 	@Override
-	public void addRoutes(Javalin app) {
+	public void addRoutes(RoutesConfig routes) {
 		// McpServer handles POST /mcp and GET /.well-known/mcp
 		// We add only the SSE session routes (Convex-specific watch support)
-		app.get("/mcp", this::handleMcpGet);
-		app.delete("/mcp", this::handleMcpDelete);
+		routes.get("/mcp", this::handleMcpGet);
+		routes.delete("/mcp", this::handleMcpDelete);
 	}
 
 	/**
@@ -200,7 +275,9 @@ public class McpAPI extends ABaseAPI {
 			return;
 		}
 
-		// Enforce global connection limit (soft cap)
+		// Fast-path cap and session-reuse checks, so the common rejection cases get a
+		// clean response before we commit to an SSE stream. The authoritative, atomic
+		// versions of both checks happen in registerConnection below.
 		if (connections.size() >= MAX_CONNECTIONS) {
 			ctx.status(429);
 			return;
@@ -210,6 +287,10 @@ public class McpAPI extends ABaseAPI {
 		String sessionId = ctx.header(HEADER_SESSION_ID);
 		if (sessionId == null) {
 			sessionId = UUID.randomUUID().toString();
+		} else if (connections.containsKey(sessionId)) {
+			// A session ID with a live connection: refuse rather than replacing it.
+			ctx.status(409);
+			return;
 		}
 
 		try {
@@ -222,9 +303,21 @@ public class McpAPI extends ABaseAPI {
 
 			PrintWriter writer = res.getWriter();
 			McpConnection conn = new McpConnection(writer);
-			// Register connection BEFORE flushing headers so POSTs using
-			// the session ID can find it immediately.
-			connections.put(sessionId, conn);
+			// Register atomically BEFORE flushing headers so POSTs using the session ID
+			// can find it immediately, and so a reused ID or a raced cap cannot orphan
+			// a connection (#659).
+			switch (registerConnection(connections, sessionId, conn, MAX_CONNECTIONS)) {
+				case SESSION_IN_USE:
+					conn.close();
+					ctx.status(409);
+					return;
+				case CAP_EXCEEDED:
+					conn.close();
+					ctx.status(429);
+					return;
+				case OK:
+					break;
+			}
 			res.flushBuffer();
 			try {
 				// Keep-alive loop — blocks virtual thread until client disconnects
@@ -232,17 +325,56 @@ public class McpAPI extends ABaseAPI {
 					writer.write(": keepalive\n\n");
 					writer.flush();
 					if (writer.checkError()) break;
-					Thread.sleep(McpProtocol.SSE_KEEPALIVE_MS);
+					conn.awaitClosed(McpProtocol.SSE_KEEPALIVE_MS,TimeUnit.MILLISECONDS);
 				}
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
 			} finally {
 				conn.close();
-				connections.remove(sessionId);
+				// Conditional remove: only evict our own connection, never one a later
+				// open registered under the same session ID (#659).
+				connections.remove(sessionId, conn);
+				stateWatcher.stopIfIdle();
 			}
 		} catch (IOException e) {
 			log.debug("SSE connection setup failed", e);
 		}
+	}
+
+	/** Outcome of {@link #registerConnection}. */
+	enum RegisterResult { OK, SESSION_IN_USE, CAP_EXCEEDED }
+
+	/**
+	 * Atomically register an SSE connection under a session ID, enforcing the connection
+	 * cap. Fixes two races in the old {@code size()}-then-{@code put} pattern (#659):
+	 *
+	 * <ul>
+	 *   <li>{@code putIfAbsent} never replaces a live connection, so a reused session ID
+	 *       cannot orphan an existing socket/thread — it is refused instead.</li>
+	 *   <li>The cap is checked <em>after</em> the insert, so concurrent opens cannot
+	 *       collectively exceed {@code maxConnections} (an over-cap opener rolls back its
+	 *       own slot). At most it over-rejects under contention; it never over-admits.</li>
+	 * </ul>
+	 *
+	 * <p>Package-private and static for direct unit testing.</p>
+	 *
+	 * @param connections The live connection registry
+	 * @param sessionId Session ID to register under
+	 * @param conn Connection to register
+	 * @param maxConnections Hard connection cap
+	 * @return the registration outcome; on anything but {@link RegisterResult#OK} the
+	 *         connection was not left in the registry
+	 */
+	static RegisterResult registerConnection(ConcurrentHashMap<String, McpConnection> connections,
+			String sessionId, McpConnection conn, int maxConnections) {
+		if (connections.putIfAbsent(sessionId, conn) != null) {
+			return RegisterResult.SESSION_IN_USE;
+		}
+		if (connections.size() > maxConnections) {
+			connections.remove(sessionId, conn);
+			return RegisterResult.CAP_EXCEEDED;
+		}
+		return RegisterResult.OK;
 	}
 
 	/**
@@ -257,6 +389,7 @@ public class McpAPI extends ABaseAPI {
 		McpConnection conn = connections.remove(sessionId);
 		if (conn != null) {
 			conn.close();
+			stateWatcher.stopIfIdle();
 			ctx.status(200);
 		} else {
 			ctx.status(404);
@@ -323,24 +456,30 @@ public class McpAPI extends ABaseAPI {
 		registerTool(new WatchStateTool());
 		registerTool(new UnwatchStateTool());
 
-		// Signing service tools (standard + elevated)
-		new SigningMcpTools(this).registerAll();
+		// Signing service access is a separate opt-in from public MCP access.
+		if ((restServer.getSigningService() != null) && restServer.getRESTConfig().isSigningEnabled()) {
+			new SigningMcpTools(this).registerAll(restServer.getRESTConfig().isElevatedEnabled());
+		}
 	}
 
 	void registerTool(McpTool tool) {
-		mcpServer.registerTool(tool);
+		if (restServer.getRESTConfig().isToolEnabled(tool.getName())) {
+			mcpServer.registerTool(tool);
+		}
 	}
 
 	void registerPrompt(McpPrompt prompt) {
 		mcpServer.registerPrompt(prompt);
 	}
 
-	private ATransaction decodeTransaction(Blob encodedBlob) throws BadFormatException, MissingDataException {
-		ACell value = server.getStore().decodeRef(encodedBlob).getValue();
-		if (!(value instanceof ATransaction transaction)) {
-			throw new BadFormatException("Value with data " + encodedBlob.toHexString() + " is not a transaction");
+	private ATransaction decodeTransaction(Blob hash, AMap<AString, ACell> arguments) throws BadFormatException {
+		AString dataCell = RT.ensureString(arguments.get(ARG_DATA));
+		if (dataCell == null) {
+			throw new BadFormatException("'data' is required; pass the complete data returned by prepare");
 		}
-		return transaction;
+		Blob data = Blob.parse(dataCell);
+		if (data == null) throw new BadFormatException("data must be valid hex");
+		return PreparedTransaction.decode(data, hash);
 	}
 
 	private class QueryTool extends McpTool {
@@ -355,21 +494,15 @@ public class McpAPI extends ABaseAPI {
 				return toolError("Query requires 'source' string");
 			}
 			String source = sourceCell.toString();
+			ACell form;
 			try {
-				ACell form;
-				try {
-					form = Reader.read(source);
-				} catch (Exception e) {
-					return toolError("Failed to parse query source: " + e.getMessage());
-				}
-				Address address = resolveAddress(arguments.get(ARG_ADDRESS)); // OK if null
-				Convex convex = restServer.getConvex();
-				Result result = convex.querySync(form, address);
-				return toolResult(result);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				return toolError("Tool call interrupted");
-			} 
+				form = Reader.read(source);
+			} catch (Exception e) {
+				return toolError("Failed to parse query source: " + e.getMessage());
+			}
+			Address address = resolveAddress(arguments.get(ARG_ADDRESS)); // OK if null
+			Result result = restServer.getPublicQueryService().execute(form,address);
+			return toolResult(result);
 		}
 	}
 
@@ -388,6 +521,8 @@ public class McpAPI extends ABaseAPI {
 			if (seedCell == null) {
 				return toolError("Transact requires 'seed' string");
 			}
+			AMap<AString, ACell> transportError = checkSeedTransport();
+			if (transportError != null) return transportError;
 			AString addressCell = RT.ensureString(arguments.get(ARG_ADDRESS));
 			if (addressCell == null) {
 				return toolError("Transact requires 'address' string");
@@ -467,7 +602,6 @@ public class McpAPI extends ABaseAPI {
 
 			try {
 				ATransaction transaction = Invoke.create(address, sequence, code);
-				transaction = Cells.persist(transaction, server.getStore());
 				Ref<ATransaction> ref = transaction.getRef();
 				String hashHex = SignedData.getMessageForRef(ref).toHexString();
 				String dataHex = Format.encodeMultiCell(transaction, true).toHexString();
@@ -536,6 +670,8 @@ public class McpAPI extends ABaseAPI {
 			if (seedCell == null) {
 				return toolError("Sign tool requires Ed25519 'seed' string");
 			}
+			AMap<AString, ACell> transportError = checkSeedTransport();
+			if (transportError != null) return transportError;
 			String seedHex = seedCell.toString();
 			Blob seedBlob = Blob.parse(seedHex);
 			if ((seedBlob == null) || (seedBlob.count() != AKeyPair.SEED_LENGTH)) {
@@ -573,7 +709,7 @@ public class McpAPI extends ABaseAPI {
 				return toolError("hash must be valid hex");
 			}
 			try {
-				ATransaction transaction = decodeTransaction(hashBlob);
+				ATransaction transaction = decodeTransaction(hashBlob, arguments);
 				AString accountKeyCell = RT.ensureString(arguments.get(ARG_ACCOUNT_KEY));
 				if (accountKeyCell == null) {
 					return toolError("Submit requires 'accountKey' string");
@@ -623,12 +759,14 @@ public class McpAPI extends ABaseAPI {
 			if (seedCell == null) {
 				return toolError("signAndSubmit requires 'seed' string");
 			}
+			AMap<AString, ACell> transportError = checkSeedTransport();
+			if (transportError != null) return transportError;
 			Blob seedBlob = Blob.parse(seedCell);
 			if (seedBlob == null || seedBlob.count() != AKeyPair.SEED_LENGTH) {
 				return toolError("seed must be a 32-byte hex string (64 hex characters)");
 			}
 			try {
-				ATransaction transaction = decodeTransaction(hashBlob);
+				ATransaction transaction = decodeTransaction(hashBlob, arguments);
 				AKeyPair keyPair = AKeyPair.create(seedBlob);
 				SignedData<ATransaction> signed = keyPair.signData(transaction);
 				Result result = restServer.getConvex().transactSync(signed);
@@ -720,6 +858,9 @@ public class McpAPI extends ABaseAPI {
 			try {
 				AString seedCell = RT.ensureString(arguments != null ? arguments.get(ARG_SEED) : null);
 				if (seedCell != null) {
+					// A caller-provided seed crosses the network: enforce transport security
+					AMap<AString, ACell> transportError = checkSeedTransport();
+					if (transportError != null) return transportError;
 					// Use provided seed
 					String seedHex = seedCell.toString();
 					seedBlob = Blob.parse(seedHex);
@@ -730,6 +871,8 @@ public class McpAPI extends ABaseAPI {
 						return toolError("Seed must be 32-byte hex string (64 hex characters)");
 					}
 				} else {
+					AMap<AString, ACell> transportError = checkSeedOutputTransport();
+					if (transportError != null) return transportError;
 					// Generate secure random seed
 					seedBlob = Blob.createRandom(new SecureRandom(), AKeyPair.SEED_LENGTH);
 				}
@@ -928,7 +1071,6 @@ public class McpAPI extends ABaseAPI {
 
 				Address token = resolveTokenAddress(arguments.get(ARG_TOKEN));
 
-				Convex convex = restServer.getConvex();
 				String source;
 				if (token == null) {
 					source = "(balance " + address + ")";
@@ -936,7 +1078,7 @@ public class McpAPI extends ABaseAPI {
 					source = "(@convex.fungible/balance " + token + " " + address + ")";
 				}
 
-				Result result = convex.querySync(source);
+				Result result = restServer.getPublicQueryService().execute(Reader.read(source),null);
 				if (result.isError()) {
 					return toolResult(result);
 				}
@@ -949,9 +1091,8 @@ public class McpAPI extends ABaseAPI {
 					out = out.assoc(ARG_TOKEN, CVMLong.create(token.longValue()));
 				}
 				return toolSuccess(out);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				return toolError("Tool call interrupted");
+			} catch (Exception e) {
+				return toolError("Failed to query balance: "+e.getMessage());
 			}
 		}
 	}
@@ -967,6 +1108,8 @@ public class McpAPI extends ABaseAPI {
 			if (seedCell == null) {
 				return toolError("transfer requires 'seed' string");
 			}
+			AMap<AString, ACell> transportError = checkSeedTransport();
+			if (transportError != null) return transportError;
 			AString addressCell = RT.ensureString(arguments.get(ARG_ADDRESS));
 			if (addressCell == null) {
 				return toolError("transfer requires 'address' string");
@@ -1435,6 +1578,7 @@ public class McpAPI extends ABaseAPI {
 				}
 				removed = conn.removeWatchesByPathPrefix(prefixVec);
 			}
+			stateWatcher.stopIfIdle();
 			return toolSuccess(Maps.of("removed", CVMLong.create(removed)));
 		}
 	}
@@ -1442,51 +1586,43 @@ public class McpAPI extends ABaseAPI {
 	// ===== Convex state watcher =====
 
 	/**
-	 * Convex-specific state watcher. Polls CVM global state and pushes
-	 * notifications to McpConnections when watched paths change.
+	 * Convex-specific state watcher. Observes finalised peer state updates and
+	 * pushes notifications to McpConnections when watched paths change.
 	 *
-	 * <p>Daemon virtual thread. Starts on first watch, exits when no watches remain.</p>
+	 * <p>Registers on the shared Server observation point only while watches are
+	 * present. State resolution and notification run on a StateWatcher distributor
+	 * thread, never on the CVM executor thread.</p>
 	 */
 	private class ConvexStateWatcher {
-		static final long POLL_INTERVAL_MS = 1000;
 		static final long VALUE_SIZE_THRESHOLD = 1024;
 
-		private volatile Thread thread;
-		private volatile boolean running;
+		private convex.core.util.StateWatcher<Peer> updates;
+		private Consumer<Peer> updateObserver;
 
 		synchronized void ensureRunning() {
-			if (running) return;
-			running = true;
-			thread = Thread.ofVirtual().name("convex-state-watcher").start(this::pollLoop);
+			if (updateObserver!=null) return;
+			var newUpdates=new convex.core.util.StateWatcher<Peer>(this::checkAllConnections);
+			Consumer<Peer> newObserver=newUpdates::update;
+			server.addStateUpdateObserver(newObserver);
+			updates=newUpdates;
+			updateObserver=newObserver;
 		}
 
-		void shutdown() {
-			running = false;
-			Thread t = thread;
-			if (t != null) t.interrupt();
+		synchronized void stopIfIdle() {
+			if (!hasAnyWatches()) shutdown();
+		}
+
+		synchronized void shutdown() {
+			Consumer<Peer> observer=updateObserver;
+			var watcher=updates;
+			updateObserver=null;
+			updates=null;
+			if (observer!=null) server.removeStateUpdateObserver(observer);
+			if (watcher!=null) watcher.close();
 		}
 
 		ACell resolveValue(ACell[] path) {
 			return RT.getIn(server.getState(), path);
-		}
-
-		private void pollLoop() {
-			try {
-				while (running) {
-					if (!hasAnyWatches()) break;
-					try {
-						checkAllConnections();
-					} catch (Exception e) {
-						log.debug("Error in state watcher poll", e);
-					}
-					Thread.sleep(POLL_INTERVAL_MS);
-				}
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-			} finally {
-				running = false;
-				thread = null;
-			}
 		}
 
 		private boolean hasAnyWatches() {
@@ -1496,12 +1632,12 @@ public class McpAPI extends ABaseAPI {
 			return false;
 		}
 
-		private void checkAllConnections() {
+		private void checkAllConnections(Peer peer) {
 			for (McpConnection conn : connections.values()) {
 				if (conn.isClosed() || !conn.hasWatches()) continue;
 				for (StateWatcher.WatchEntry entry : conn.watches.values()) {
 					try {
-						ACell value = resolveValue(entry.path);
+						ACell value = RT.getIn(peer.getConsensusState(),entry.path);
 						Hash currentHash = Hash.get(value);
 						if (!currentHash.equals(entry.lastHash)) {
 							entry.lastHash = currentHash;

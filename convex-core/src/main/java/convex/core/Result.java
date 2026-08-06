@@ -450,7 +450,7 @@ public final class Result extends ARecordGeneric {
 		hm.put("result", RT.print(getValue()));
 		
 		AVector<AVector<ACell>> log = getLog();
-		if (log!=null) hm.put("info", JSON.json(log));
+		if (log!=null) hm.put("log", JSON.json(log));
 		
 		AMap<Keyword, ACell> info = getInfo();
 		if (info!=null) hm.put("info", JSON.json(info));
@@ -497,9 +497,9 @@ public final class Result extends ARecordGeneric {
 		if (data instanceof Result) {
 			return (Result) data;
 		} else if (data instanceof AMap) {
-			AMap<Keyword,ACell> m=RT.ensureMap(data);
+			AMap<Keyword,ACell> m=RT.castMap(data);
 			ACell info=m.get(Keywords.INFO);
-			return create(RT.ensureLong(m.get(Keywords.ID)),m.get(Keywords.RESULT),m.get(Keywords.ERROR),RT.ensureVector(m.get(Keywords.LOG)),(info==null)?null:RT.ensureMap(info));
+			return create(RT.ensureLong(m.get(Keywords.ID)),m.get(Keywords.RESULT),m.get(Keywords.ERROR),RT.ensureVector(m.get(Keywords.LOG)),(info==null)?null:RT.castMap(info));
 		}
 		throw new IllegalArgumentException("Unrecognised data of type: "+Utils.getClassName(data));
 	}

@@ -3,6 +3,7 @@ package convex.restapi.api;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -38,7 +39,6 @@ import convex.core.data.AVector;
 import convex.core.data.AccountKey;
 import convex.core.data.Blob;
 import convex.core.data.Blobs;
-import convex.core.data.Cells;
 import convex.core.data.Format;
 import convex.core.data.Hash;
 import convex.core.data.Keyword;
@@ -50,7 +50,6 @@ import convex.core.data.Strings;
 import convex.core.data.prim.AInteger;
 import convex.core.data.prim.CVMLong;
 import convex.core.exceptions.BadFormatException;
-import convex.core.exceptions.MissingDataException;
 import convex.core.exceptions.ParseException;
 import convex.core.exceptions.ResultException;
 import convex.core.lang.RT;
@@ -59,8 +58,11 @@ import convex.core.message.Message;
 import convex.core.message.MessageType;
 import convex.core.util.JSON;
 import convex.peer.Config;
+import convex.restapi.PreparedTransaction;
 import convex.restapi.RESTServer;
+import convex.restapi.SeedTransport;
 import convex.restapi.handler.ConcurrentLimit;
+import convex.restapi.handler.RequestBody;
 import convex.restapi.model.CreateAccountRequest;
 import convex.restapi.model.CreateAccountResponse;
 import convex.restapi.model.FaucetRequest;
@@ -71,7 +73,7 @@ import convex.restapi.model.TransactRequest;
 import convex.restapi.model.TransactionPrepareRequest;
 import convex.restapi.model.TransactionPrepareResponse;
 import convex.restapi.model.TransactionSubmitRequest;
-import io.javalin.Javalin;
+import io.javalin.config.RoutesConfig;
 import io.javalin.http.BadRequestResponse;
 import io.javalin.http.Context;
 import io.javalin.http.ForbiddenResponse;
@@ -101,42 +103,43 @@ public class ChainAPI extends ABaseAPI {
 	private ConcurrentLimit transactLimit=new ConcurrentLimit(2);
 	
 	@Override
-	public void addRoutes(Javalin app) {
+	public void addRoutes(RoutesConfig routes) {
 		String prefix = ROUTE;
 
-		app.post(prefix + "query", this::query);
+		routes.post(prefix + "query", this::query);
 
-		app.post(prefix + "transaction/prepare", this::transactionPrepare);
-		app.post(prefix + "transaction/submit", this::transactionSubmit);
-		app.post(prefix + "transact", transactLimit.handler(this::transact));
+		routes.post(prefix + "transaction/prepare", this::transactionPrepare);
+		routes.post(prefix + "transaction/submit", this::transactionSubmit);
+		routes.post(prefix + "transact", transactLimit.handler(this::transact));
 
-		app.post(prefix + "createAccount", faucetLimit.handler(this::createAccount));
-		app.post(prefix + "faucet",  faucetLimit.handler(this::faucetRequest));
+		routes.post(prefix + "createAccount", faucetLimit.handler(this::createAccount));
+		routes.post(prefix + "faucet",  faucetLimit.handler(this::faucetRequest));
 
 
-		app.get(prefix + "accounts/{addr}", this::queryAccount);
-		app.get(prefix + "peers/{addr}", this::queryPeer);
+		routes.get(prefix + "accounts/{addr}", this::queryAccount);
+		routes.get(prefix + "peers/{addr}", this::queryPeer);
 
 	
-		app.get(prefix + "data/{hash}", this::getData);
-		app.post(prefix + "data/encode", this::encodeData);
-		app.post(prefix + "data/decode", this::decodeData);
+		routes.get(prefix + "data/{hash}", this::getData);
+		routes.post(prefix + "data/encode", this::encodeData);
+		routes.post(prefix + "data/decode", this::decodeData);
 		
 		
-		app.get(prefix + "tx", this::getTransaction);
+		routes.get(prefix + "tx", this::getTransaction);
 		
-		app.get(prefix + "blocks", this::getBlocks);
-		app.get(prefix + "blocks/{blockNum}", this::getBlock);
+		routes.get(prefix + "blocks", this::getBlocks);
+		routes.get(prefix + "blocks/{blockNum}", this::getBlock);
 		
-		app.get(prefix + "status", this::getStatus);
+		routes.get(prefix + "status", this::getStatus);
 
-		app.post(prefix + "message", this::handleMessage);
+		if (restServer.getRESTConfig().isMessageEndpointEnabled()) {
+			routes.post(prefix + "message", this::handleMessage);
+		}
 
-		app.get("/identicon/{hex}", identiconLimit.handler(this::getIdenticon));
+		routes.get("/identicon/{hex}", identiconLimit.handler(this::getIdenticon));
 	}
 
 	@OpenApi(path = ROUTE + "data/{hash}", 
-			versions="peer-v1",
 			methods = HttpMethod.GET, 
 			tags = { "Data Lattice"},
 			summary = "Get data from the server with the specified hash", 
@@ -167,7 +170,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 	
 	@OpenApi(path = ROUTE + "data/encode", 
-			versions="peer-v1",
 			methods = HttpMethod.POST, 
 			tags = { "Data Lattice"},
 			summary = "Encode data in CAD3 multi-cell format", 
@@ -200,8 +202,9 @@ public class ChainAPI extends ABaseAPI {
 				throw new BadRequestResponse("Could not parse CVX data: "+e.getMessage());
 			}
 		} else if (ContentTypes.CVX.equals(type)||ContentTypes.TEXT.equals(type)) {
+			InputStream body=RequestBody.boundedInputStream(ctx);
 			try {
-				value=Reader.read(ctx.bodyInputStream());
+				value=Reader.read(body);
 			} catch (Exception e) {
 				throw new BadRequestResponse("Could not parse CVX content: "+e.getMessage());
 			}
@@ -226,7 +229,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 	
 	@OpenApi(path = ROUTE + "data/decode", 
-			versions="peer-v1",
 			methods = HttpMethod.POST, 
 			tags = { "Data Lattice"},
 			summary = "Decode CAD3 data", 
@@ -250,8 +252,9 @@ public class ChainAPI extends ABaseAPI {
 			if (field==null) throw new BadRequestResponse("Decode requires 'cad3' field");
 			value=Blob.parse(field);
 		} else if (ContentTypes.CVX.equals(type)||ContentTypes.BYTES.equals(type)) {
+			InputStream body=RequestBody.boundedInputStream(ctx);
 			try {
-				value=Blobs.fromStream(ctx.bodyInputStream());
+				value=Blobs.fromStream(body);
 			} catch (Exception e) {
 				throw new BadRequestResponse("Could not read CAD3 content: "+e.getMessage());
 			}
@@ -277,7 +280,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE + "tx", 
-			versions="peer-v1",
 			methods = HttpMethod.GET, 
 			tags = { "Transactions"},
 			summary = "Get transaction by hash", 
@@ -335,7 +337,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE + "blocks", 
-			versions="peer-v1",
 			methods = HttpMethod.GET, 
 			tags = { "Blocks"},
 			summary = "Get blocks with pagination", 
@@ -440,7 +441,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE + "blocks/{blockNum}", 
-			versions="peer-v1",
 			methods = HttpMethod.GET, 
 			tags = { "Blocks"},
 			summary = "Get a specific block by block number", 
@@ -504,7 +504,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE + "status", 
-			versions="peer-v1",
 			methods = HttpMethod.GET, 
 			tags = { "Peer"},
 			summary = "Get the status map from the peer server. Can be used as a heartbeat check to ensure the peer is still running.", 
@@ -524,10 +523,17 @@ public class ChainAPI extends ABaseAPI {
 
 	/**
 	 * Generic message endpoint. Accepts a Message in CAD3 raw or CVX text format,
-	 * delivers it to the server, and returns the Result honouring the Accept header.
+	 * delivers it through the normal Peer message dispatcher, and returns the Result
+	 * honouring the Accept header.
 	 *
 	 * CAD3 raw supports all message types including SignedData. CVX text supports
 	 * vector-based messages (queries, status requests, etc.) but not SignedData.
+	 *
+	 * <p>When explicitly enabled this is a protocol transport, equivalent in trust
+	 * and admission semantics to exposing the Peer protocol port. TRANSACT, QUERY
+	 * and DATA_REQUEST messages therefore reach the same bounded Peer queues and
+	 * backpressure path used by port 18888. {@link GenericMessagePolicy} is the
+	 * deliberate classification point for any future HTTP-specific restrictions.</p>
 	 */
 	public void handleMessage(Context ctx) {
 		try {
@@ -536,16 +542,22 @@ public class ChainAPI extends ABaseAPI {
 				throw new BadRequestResponse("JSON not acceptable as message format");
 			}
 
-			CompletableFuture<Result> cf;
+			Message message;
 			if (ContentTypes.CVX_RAW.equals(contentType)) {
 				Blob rawData = Blob.wrap(ctx.bodyAsBytes());
-				cf = convex.messageRaw(rawData);
+				message = Message.create(rawData);
+				message.getPayload(server.getStore());
 			} else {
 				// Accept CVX text or default — parse as CVX data
 				ACell body = getCVXBody(ctx);
-				Message message = Message.create(MessageType.UNKNOWN, body);
-				cf = convex.message(message);
+				message = Message.create(MessageType.UNKNOWN, body);
 			}
+
+			MessageType type=message.getType();
+			if (!GenericMessagePolicy.allows(type)) {
+				throw new ForbiddenResponse("Message type not permitted over HTTP: "+type);
+			}
+			CompletableFuture<Result> cf = convex.message(message);
 
 			Result r = cf.get(Config.DEFAULT_CLIENT_TIMEOUT, TimeUnit.MILLISECONDS);
 			setResult(ctx, r);
@@ -557,7 +569,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE + "createAccount", 
-			versions="peer-v1",
 			methods = HttpMethod.POST, 
 			operationId = "createAccount", 
 			tags = { "Account"},
@@ -612,7 +623,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE + "accounts/{address}", 
-			versions="peer-v1",
 			methods = HttpMethod.GET, 
 			operationId = "queryAccount", 
 			tags = { "Account"},
@@ -634,7 +644,7 @@ public class ChainAPI extends ABaseAPI {
 						description = "Account does not exist" )
 			}
 		)
-	public void queryAccount(Context ctx) throws InterruptedException {
+	public void queryAccount(Context ctx) {
 		Address addr = null;
 		String addrParam = ctx.pathParam("addr");
 
@@ -643,7 +653,7 @@ public class ChainAPI extends ABaseAPI {
 			throw new BadRequestResponse("Invalid address: " + addrParam);
 		}
 
-		Result r = convex.querySync(Lists.of(Symbols.ACCOUNT, addr));
+		Result r = restServer.getPublicQueryService().execute(Lists.of(Symbols.ACCOUNT, addr),null);
 
 		if (r.isError()) {
 			setContent(ctx,r);
@@ -679,7 +689,7 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	
-	public void queryPeer(Context ctx) throws InterruptedException {
+	public void queryPeer(Context ctx) {
 		AccountKey addr = null;
 		String addrParam = ctx.pathParam("addr");
 
@@ -688,7 +698,8 @@ public class ChainAPI extends ABaseAPI {
 			throw new BadRequestResponse("Invalid peer key: " + addrParam);
 		}
  
-		Result r = convex.querySync(Reader.read("(get-in *state* [:peers " + addr + "])"));
+		Result r = restServer.getPublicQueryService().execute(
+				Reader.read("(get-in *state* [:peers " + addr + "])"),null);
 
 		if (r.isError()) {
 			setContent(ctx,r);
@@ -706,7 +717,6 @@ public class ChainAPI extends ABaseAPI {
 	public static final Keyword K_FAUCET=Keyword.intern("faucet");
 	
 	@OpenApi(path = ROUTE + "faucet", 
-			versions="peer-v1",
 			methods = HttpMethod.POST, 
 			operationId = "faucetRequest", 
 			tags = { "Account"},
@@ -777,11 +787,10 @@ public class ChainAPI extends ABaseAPI {
 
 
 	@OpenApi(path = ROUTE+"transaction/prepare",
-			versions="peer-v1",
 			methods = HttpMethod.POST,
 			operationId = "transactionPrepare",
 			tags= {"Transactions"},
-			summary="Prepare a Convex transaction. If sucessful, will return an encoding to be signed.",
+			summary="Prepare a Convex transaction. If successful, will return an encoding to be signed.",
 			requestBody = @OpenApiRequestBody(
 					description = "Transaction preparation request",
 					content= {
@@ -837,7 +846,6 @@ public class ChainAPI extends ABaseAPI {
 		}
 
 		ATransaction trans = Invoke.create(addr, sequence, code);
-		trans=Cells.persist(trans, server.getStore()); // persist data so we have a full copy if needed
 		Ref<ATransaction> ref = trans.getRef();
 		HashMap<String, Object> result = new HashMap<>();
 		result.put("source", srcValue);
@@ -852,11 +860,10 @@ public class ChainAPI extends ABaseAPI {
 
 	@SuppressWarnings("unchecked")
 	@OpenApi(path = ROUTE+"transact",
-			versions="peer-v1",
 			methods = HttpMethod.POST,
 			operationId = "transact",
 			tags= {"Transactions"},
-			summary="Execute a Convex transaction. WARNING: sends Ed25519 seed over the network for peer to complete signature. Only do this with a secure HTTPS connection to a peer that you trust.",
+			summary="Execute a Convex transaction. Sends an Ed25519 seed for peer-side signing and therefore requires HTTPS for non-loopback clients. If an HTTP attempt is rejected, key rotation is suggested because the seed has already crossed the network.",
 			requestBody = @OpenApiRequestBody(
 					description = "Transaction execution request",
 					content= {@OpenApiContent(
@@ -923,6 +930,10 @@ public class ChainAPI extends ABaseAPI {
 		} else {
 			// Assume JSON type using simple form including seed
 			Map<String, Object> req = getJSONBody(ctx);
+			if (req.containsKey("seed") && !restServer.getRESTConfig().isHttpSeedsAllowed()
+					&& !SeedTransport.isSecure(ctx)) {
+				throw new ForbiddenResponse(SeedTransport.rejectedIncomingMessage());
+			}
 	
 			Address addr = Address.parse(req.get("address"));
 			if (addr == null)
@@ -973,7 +984,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE+"transaction/submit",
-			versions="peer-v1",
 			methods = HttpMethod.POST,
 			operationId = "transactionSubmit",
 			tags= {"Transactions"},
@@ -1017,19 +1027,21 @@ public class ChainAPI extends ABaseAPI {
 		if (h == null)
 			throw new BadRequestResponse("Parameter 'hash' did not parse correctly, must be a hex string.");
 
-		ATransaction trans = null;
+		// Preparation is intentionally stateless. Requiring the complete data here
+		// prevents public prepare requests from populating the Peer's primary store.
+		Object dataValue = req.get("data");
+		if (!(dataValue instanceof String))
+			throw new BadRequestResponse("Parameter 'data' is required. Submit the complete 'data' value returned by transaction/prepare.");
+		Blob data = Blob.parse((String) dataValue);
+		if (data == null)
+			throw new BadRequestResponse("Parameter 'data' did not parse correctly, must be a hex string.");
+
+		ATransaction trans;
 		try {
-			ACell maybeTrans = server.getStore().decodeRef(h).getValue();
-			if (!(maybeTrans instanceof ATransaction))
-				throw new BadFormatException("Value with hash " + h + " is not a transaction: can't submit it!");
-			trans = (ATransaction) maybeTrans;
-		} catch (MissingDataException e) {
-			setResult(ctx,Result.error(ErrorCodes.MISSING, "Missing data for transaction. Possible need to prepare first?"));
-			return;
+			trans = PreparedTransaction.decode(data, h);
 		} catch (BadFormatException e) {
-			setResult(ctx,Result.error(ErrorCodes.FORMAT, "Bad format: "+e));
-			return;
-		} 
+			throw new BadRequestResponse("Invalid transaction data: " + e.getMessage());
+		}
 
 		// Get the account key
 		Object keyValue = req.get("accountKey");
@@ -1055,7 +1067,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 
 	@OpenApi(path = ROUTE+"query",
-		versions="peer-v1",
 		methods = HttpMethod.POST,
 		operationId = "query",
 		tags= {"Transactions"},
@@ -1101,7 +1112,7 @@ public class ChainAPI extends ABaseAPI {
 						description = "Query service unavailable" )
 			}
 		)
-	public void query(Context ctx) throws InterruptedException {
+	public void query(Context ctx) {
 		try {
 			Address addr;
 			ACell form;
@@ -1125,7 +1136,7 @@ public class ChainAPI extends ABaseAPI {
 				form = Reader.read(srcValue);
 			}
 	
-			Result r = convex.querySync(form, addr);
+			Result r = restServer.getPublicQueryService().execute(form,addr);
 			setContent(ctx,r);
 		} catch (ParseException e) {
 			throw new BadRequestResponse(e.getMessage());
@@ -1133,7 +1144,6 @@ public class ChainAPI extends ABaseAPI {
 	}
 	
 	@OpenApi(path = "/identicon/{hex}", 
-			versions="peer-v1",
 			methods = HttpMethod.GET, 
 			tags = { "Utility"},
 			summary = "Get the identicon for a hash / public key", 

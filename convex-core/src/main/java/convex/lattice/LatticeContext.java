@@ -7,6 +7,7 @@ import convex.core.data.ABlob;
 import convex.core.data.ACell;
 import convex.core.data.AccountKey;
 import convex.core.data.prim.CVMLong;
+import convex.core.util.Utils;
 
 /**
  * Context for lattice merge operations.
@@ -56,6 +57,51 @@ public class LatticeContext {
 	}
 
 	/**
+	 * Creates a context snapshot with a different timestamp, preserving this
+	 * context's signing key and owner verifier.
+	 *
+	 * <p>This is an immutable value-copy operation. It does not establish
+	 * field-level inheritance from this context; subsequent changes to the source
+	 * from which this context was obtained are not reflected in the result.</p>
+	 *
+	 * @param timestamp New timestamp, or null to clear it
+	 * @return Context snapshot with the supplied timestamp
+	 */
+	public LatticeContext withTimestamp(CVMLong timestamp) {
+		return create(timestamp, signingKey, ownerVerifier);
+	}
+
+	/**
+	 * Creates a context snapshot with a different signing key, preserving this
+	 * context's timestamp and owner verifier.
+	 *
+	 * <p>This is an immutable value-copy operation. It does not establish
+	 * field-level inheritance from this context; subsequent changes to the source
+	 * from which this context was obtained are not reflected in the result.</p>
+	 *
+	 * @param signingKey New signing key, or null to clear it
+	 * @return Context snapshot with the supplied signing key
+	 */
+	public LatticeContext withSigningKey(AKeyPair signingKey) {
+		return create(timestamp, signingKey, ownerVerifier);
+	}
+
+	/**
+	 * Creates a context snapshot with a different owner verifier, preserving this
+	 * context's timestamp and signing key.
+	 *
+	 * <p>This is an immutable value-copy operation. It does not establish
+	 * field-level inheritance from this context; subsequent changes to the source
+	 * from which this context was obtained are not reflected in the result.</p>
+	 *
+	 * @param ownerVerifier New owner verifier, or null to clear it
+	 * @return Context snapshot with the supplied owner verifier
+	 */
+	public LatticeContext withOwnerVerifier(BiPredicate<ACell, AccountKey> ownerVerifier) {
+		return create(timestamp, signingKey, ownerVerifier);
+	}
+
+	/**
 	 * Verifies that the given signer key is valid for the specified owner.
 	 *
 	 * For blob/AccountKey owners, checks direct equality with the signer key.
@@ -81,11 +127,36 @@ public class LatticeContext {
 	}
 
 	/**
-	 * Gets the timestamp for this context.
+	 * Gets the explicit timestamp set on this context, or null if none was supplied.
 	 * @return Timestamp or null if not set
 	 */
 	public CVMLong getTimestamp() {
 		return timestamp;
+	}
+
+	/**
+	 * Resolves the current write/merge timestamp (#561). Lattice value and merge code must
+	 * obtain "now" from here rather than reading the system clock directly — time is the
+	 * responsibility of the driving (merging or test) process, injected via this context.
+	 *
+	 * <p>Returns the explicit timestamp when the driver supplied one (giving full determinism
+	 * — tests inject a fixed value); this boundary is the single place a wall-clock is read,
+	 * and only as the fallback when no timestamp was supplied (standalone use).</p>
+	 *
+	 * @return the write/merge timestamp to stamp new values with
+	 */
+	public CVMLong currentTimestamp() {
+		return (timestamp != null) ? timestamp : CVMLong.create(Utils.getCurrentTimestamp());
+	}
+
+	/**
+	 * The {@code long} form of {@link #currentTimestamp()} — the resolved write/merge time in
+	 * epoch millis. Used for expiry checks and arithmetic without boxing.
+	 *
+	 * @return resolved current timestamp in epoch milliseconds
+	 */
+	public long currentTimestampValue() {
+		return (timestamp != null) ? timestamp.longValue() : Utils.getCurrentTimestamp();
 	}
 
 	/**

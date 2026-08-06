@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -13,6 +14,8 @@ import java.util.HashMap;
 
 import org.junit.jupiter.api.Test;
 
+import convex.auth.did.DID;
+import convex.core.crypto.AKeyPair;
 import convex.core.cvm.Keywords;
 import convex.core.data.ACell;
 import convex.core.data.AMap;
@@ -65,6 +68,64 @@ public class RESTConfigTest {
 		assertTrue(config.isFaucetEnabled());
 	}
 
+	@Test
+	public void testQueryWatchDefault() {
+		RESTConfig config = RESTConfig.parse("{}");
+		assertFalse(config.isQueryWatchEnabled());
+		assertFalse(config.toLegacy().containsKey(Keywords.QUERY_WATCH));
+	}
+
+	@Test
+	public void testQueryWatchEnabled() {
+		RESTConfig config = RESTConfig.parse("{\"rest\": {\"queryWatch\": true}}");
+		assertTrue(config.isQueryWatchEnabled());
+		assertEquals(true,config.toLegacy().get(Keywords.QUERY_WATCH));
+	}
+
+	@Test
+	public void testAdminDefaultAndExplicitEnablement() {
+		assertFalse(RESTConfig.parse("{}").isAdminEnabled());
+		assertTrue(RESTConfig.parse("{rest:{admin:true}}").isAdminEnabled());
+		assertTrue(RESTConfig.parse("{rest:{admin:{enabled:true}}}").isAdminEnabled());
+		assertFalse(RESTConfig.parse("{rest:{admin:{enabled:false}}}").isAdminEnabled());
+		assertThrows(IllegalArgumentException.class,
+			()->RESTConfig.parse("{rest:{admin:\"true\"}}").isAdminEnabled());
+	}
+
+	@Test
+	public void testAdminAuthorityAndProxyConfiguration() {
+		RESTConfig defaults=RESTConfig.parse("{rest:{admin:{enabled:true}}}");
+		assertNull(defaults.getAdminKeys(),"missing keys select the dynamic operational/controller defaults");
+		assertTrue(defaults.getAdminTrustedProxies().isEmpty());
+
+		AString adminKey=DID.forKey(AKeyPair.generate().getAccountKey());
+		RESTConfig explicit=RESTConfig.parse("""
+			{rest:{admin:{enabled:true,keys:["%s"],trustedProxies:["10.0.0.10"]}}}
+			""".formatted(adminKey));
+		assertEquals(java.util.Set.of(adminKey),explicit.getAdminKeys());
+		assertEquals(java.util.Set.of("10.0.0.10"),explicit.getAdminTrustedProxies());
+
+		RESTConfig denyAll=RESTConfig.parse("{rest:{admin:{enabled:true,keys:[]}}}");
+		assertNotNull(denyAll.getAdminKeys());
+		assertTrue(denyAll.getAdminKeys().isEmpty());
+	}
+
+	@Test
+	public void testMessageEndpointRequiresExplicitEnablement() {
+		assertFalse(RESTConfig.parse("{}").isMessageEndpointEnabled());
+		assertTrue(RESTConfig.parse("{rest:{messageEndpoint:true}}").isMessageEndpointEnabled());
+	}
+
+	@Test
+	public void testCorsOrigins() {
+		assertNull(RESTConfig.parse("{}").getCorsAllowedOrigins());
+		assertNull(RESTConfig.parse("{rest:{cors:\"*\"}}").getCorsAllowedOrigins());
+		assertEquals(java.util.Set.of("https://app.example"),
+				RESTConfig.parse("{rest:{cors:\"https://app.example\"}}").getCorsAllowedOrigins());
+		assertEquals(java.util.Set.of("https://one.example","https://two.example"),
+				RESTConfig.parse("{rest:{cors:[\"https://one.example\",\"https://two.example\"]}}").getCorsAllowedOrigins());
+	}
+
 	// ========== MCP accessors ==========
 
 	@Test
@@ -92,12 +153,15 @@ public class RESTConfigTest {
 	}
 
 	@Test
-	public void testElevatedDefaultFollowsSigning() {
+	public void testElevatedRequiresExplicitEnablement() {
 		RESTConfig off = RESTConfig.parse("{\"mcp\": {\"signing\": false}}");
 		assertFalse(off.isElevatedEnabled());
 
 		RESTConfig on = RESTConfig.parse("{\"mcp\": {\"signing\": true}}");
-		assertTrue(on.isElevatedEnabled());
+		assertFalse(on.isElevatedEnabled());
+
+		RESTConfig elevated = RESTConfig.parse("{mcp:{signing:true,elevated:true}}");
+		assertTrue(elevated.isElevatedEnabled());
 	}
 
 	@Test
@@ -119,6 +183,15 @@ public class RESTConfigTest {
 	public void testToolsConfigDefault() {
 		RESTConfig config = RESTConfig.parse("{}");
 		assertTrue(config.getToolsConfig().isEmpty());
+	}
+
+	@Test
+	public void testPerToolPolicyDefaultsToEnabled() {
+		RESTConfig config=RESTConfig.parse("{mcp:{tools:{query:false,transact:{enabled:false},status:true}}}");
+		assertFalse(config.isToolEnabled("query"));
+		assertFalse(config.isToolEnabled("transact"));
+		assertTrue(config.isToolEnabled("status"));
+		assertTrue(config.isToolEnabled("missing"));
 	}
 
 	// ========== OAuth accessors ==========
@@ -166,6 +239,22 @@ public class RESTConfigTest {
 		assertEquals(3600L, config.getTokenExpiry());
 	}
 
+	@Test
+	public void testPublicAccessDefaultsToTrue() {
+		assertTrue(RESTConfig.parse("{}").isPublicAccess());
+		assertFalse(RESTConfig.parse("{auth:{publicAccess:false}}").isPublicAccess());
+	}
+
+	@Test
+	public void testHttpSeedsRequireExplicitDevelopmentOverride() {
+		assertFalse(RESTConfig.parse("{}").isHttpSeedsAllowed());
+		assertTrue(RESTConfig.parse("{rest:{allowHttpSeeds:true}}").isHttpSeedsAllowed());
+		// Retain compatibility with the original MCP-scoped setting.
+		assertTrue(RESTConfig.parse("{mcp:{allowHttpSeeds:true}}").isHttpSeedsAllowed());
+		// The REST-scoped setting is canonical when both are present.
+		assertFalse(RESTConfig.parse("{rest:{allowHttpSeeds:false},mcp:{allowHttpSeeds:true}}").isHttpSeedsAllowed());
+	}
+
 	// ========== toLegacy ==========
 
 	@Test
@@ -173,6 +262,7 @@ public class RESTConfigTest {
 		RESTConfig config = RESTConfig.parse(
 			"{\"rest\": {\"baseUrl\": \"https://example.com\", \"faucet\": true}}");
 		HashMap<Keyword, Object> legacy = config.toLegacy();
+		assertEquals(config,legacy.get(RESTConfig.CONFIG));
 		assertEquals("https://example.com", legacy.get(Keywords.BASE_URL));
 		assertEquals(true, legacy.get(Keywords.FAUCET));
 	}
@@ -184,6 +274,23 @@ public class RESTConfigTest {
 		HashMap<Keyword, Object> legacy = config.toLegacy();
 		assertEquals(18888, legacy.get(Keywords.PORT));
 		assertEquals(false, legacy.get(Keywords.RESTORE));
+	}
+
+	@Test
+	public void testLegacyRestKeysAreNormalised() {
+		HashMap<Keyword,Object> legacy=new HashMap<>();
+		legacy.put(Keywords.BASE_URL,"https://legacy.example");
+		legacy.put(Keywords.FAUCET,true);
+		legacy.put(Keywords.QUERY_WATCH,true);
+		legacy.put(Keywords.ALLOWED_ORIGINS,java.util.Set.of("https://app.example"));
+		legacy.put(Keywords.ALLOW_HTTP_SEEDS,true);
+
+		RESTConfig config=RESTConfig.fromLegacy(legacy);
+		assertEquals("https://legacy.example",config.getBaseUrl());
+		assertTrue(config.isFaucetEnabled());
+		assertTrue(config.isQueryWatchEnabled());
+		assertEquals(java.util.Set.of("https://app.example"),config.getAllowedOrigins());
+		assertTrue(config.isHttpSeedsAllowed());
 	}
 
 	@Test
@@ -243,6 +350,9 @@ public class RESTConfigTest {
 		RESTConfig config = loadExampleConfig();
 		assertEquals(8080, config.getRestPort());
 		assertFalse(config.isFaucetEnabled());
+		assertFalse(config.isQueryWatchEnabled());
+		assertFalse(config.isMessageEndpointEnabled());
+		assertFalse(config.isAdminEnabled());
 		assertNull(config.getBaseUrl());
 	}
 
@@ -268,6 +378,7 @@ public class RESTConfigTest {
 		assertNotNull(legacy);
 		assertNull(legacy.get(Keywords.PORT));
 		assertEquals(false, legacy.get(Keywords.FAUCET));
+		assertEquals(false, legacy.get(Keywords.QUERY_WATCH));
 		assertEquals(true, legacy.get(Keywords.RESTORE));
 		assertEquals(true, legacy.get(Keywords.PERSIST));
 		assertEquals(true, legacy.get(Keywords.AUTO_MANAGE));

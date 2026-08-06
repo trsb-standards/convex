@@ -2,7 +2,11 @@
 
 #######################################
 # Build stage
-FROM maven:3.9.9-eclipse-temurin-22-jammy AS build
+# JDK matches CI (build.yml / release.yml run on JDK 25), so the peer image runs
+# the exact JDK the pipeline tested. The project targets Java 21 bytecode
+# (maven.compiler.release=21) for library reach, which runs forward-compatibly on
+# this JDK 25. Bump together with CI.
+FROM maven:3.9.15-eclipse-temurin-25 AS build
 WORKDIR /build
 
 # Copy POMs first for dependency caching
@@ -18,12 +22,15 @@ COPY convex-observer/pom.xml convex-observer/
 COPY convex-integration/pom.xml convex-integration/
 RUN mvn dependency:go-offline -B || true
 
-# Copy source and build
+# Copy source and build. Tests are skipped: every imaged commit is already
+# tested by CI on the same JDK (build.yml on push, release.yml on tag), and the
+# reproducible-build configuration makes this rebuild equivalent.
 COPY . .
-RUN mvn -B clean install
+RUN mvn -B clean install -DskipTests
 
 #######################################
 # Run stage
+# JRE matches the JDK everything is built and tested on (see build stage note)
 FROM eclipse-temurin:25-jre-alpine
 
 LABEL org.opencontainers.image.title="Convex" \

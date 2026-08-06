@@ -1,13 +1,14 @@
 package convex.restapi.api;
 
-import convex.core.cvm.AccountStatus;
+import convex.core.crypto.util.Base58;
+import convex.core.crypto.util.Multikey;
 import convex.core.cvm.Address;
 import convex.core.data.AccountKey;
-import convex.core.data.Strings;
 import convex.core.util.JSON;
 import convex.restapi.RESTServer;
-import io.javalin.Javalin;
+import io.javalin.config.RoutesConfig;
 import io.javalin.http.Context;
+import io.javalin.http.HttpStatus;
 import io.javalin.http.NotFoundResponse;
 
 import java.util.ArrayList;
@@ -26,25 +27,22 @@ import java.util.Map;
  */
 public class DIDAPI extends ABaseAPI {
 
-	private static final String BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
 	public DIDAPI(RESTServer restServer) {
 		super(restServer);
 	}
 
 	@Override
-	public void addRoutes(Javalin app) {
-		app.get("/.well-known/did.json", this::handlePeerDID);
-		app.get("/did/{identifier}/did.json", this::handleAccountDID);
-		app.get("/{identifier}/did.json", this::handleAccountDID);
+	public void addRoutes(RoutesConfig routes) {
+		routes.get("/.well-known/did.json", this::handlePeerDID);
+		routes.get("/did/{identifier}/did.json", this::handleAccountDID);
+		routes.get("/{identifier}/did.json", this::handleAccountDID);
 	}
 
 	/**
 	 * Serve the peer's own DID document at /.well-known/did.json
 	 */
 	protected void handlePeerDID(Context ctx) {
-		String hostname = getHostname(ctx);
-		String did = "did:web:" + hostname;
+		String did = getVenueDID(ctx);
 
 		AccountKey peerKey = server.getPeer().getPeerKey();
 		Address peerController = server.getPeerController();
@@ -67,51 +65,27 @@ public class DIDAPI extends ABaseAPI {
 	 */
 	protected void handleAccountDID(Context ctx) {
 		String identifier = ctx.pathParam("identifier");
-		Address address = resolveIdentifier(identifier);
-		if (address == null) {
-			throw new NotFoundResponse("Account not found: " + identifier);
+		String did = getVenueDID(ctx) + ":" + identifier;
+		DIDResolver.Resolution resolution = DIDResolver.resolve(server.getState(), identifier, did);
+		Map<String, Object> doc;
+		switch (resolution.status()) {
+			case ACTIVE -> doc = resolution.document();
+			case DEACTIVATED -> {
+				Map<String, Object> result = new HashMap<>();
+				result.put("didResolutionMetadata", Map.of());
+				result.put("didDocument", null);
+				result.put("didDocumentMetadata", resolution.documentMetadata());
+				ctx.status(HttpStatus.GONE);
+				ctx.contentType("application/did-resolution");
+				ctx.result(JSON.toString(result));
+				return;
+			}
+			case NOT_FOUND, INVALID -> throw new NotFoundResponse("DID not found: " + identifier);
+			default -> throw new IllegalStateException("Unexpected DID resolution status: " + resolution.status());
 		}
-
-		AccountStatus as = server.getState().getAccount(address);
-		if (as == null) {
-			throw new NotFoundResponse("Account not found: " + identifier);
-		}
-
-		AccountKey key = as.getAccountKey();
-
-		String hostname = getHostname(ctx);
-		String did = "did:web:" + hostname + ":" + identifier;
-
-		// alsoKnownAs: did:convex always, did:key only if account has a key
-		List<String> aliases = new ArrayList<>();
-		aliases.add("did:convex:" + address.longValue());
-		if (key != null) {
-			aliases.add("did:key:" + multibaseEncodeEd25519DIDKey(key));
-		}
-
-		Map<String, Object> doc = buildDIDDocument(did, key, aliases);
 
 		ctx.contentType("application/json");
 		ctx.result(JSON.toString(doc));
-	}
-
-	/**
-	 * Resolve an identifier string to an Address.
-	 * Numeric strings are parsed as account addresses, non-numeric as CNS names.
-	 */
-	private Address resolveIdentifier(String identifier) {
-		if (identifier == null || identifier.isEmpty()) return null;
-
-		// Try numeric address first
-		Address addr = Address.parse(identifier);
-		if (addr != null) return addr;
-
-		// Try CNS resolution
-		try {
-			return resolveAddress(Strings.create(identifier));
-		} catch (Exception e) {
-			return null;
-		}
 	}
 
 	/**
@@ -145,11 +119,39 @@ public class DIDAPI extends ABaseAPI {
 	}
 
 	/**
+	 * Gets the host for did:web identifiers. Per the did:web method
+	 * specification, a non-default port is percent-encoded (host%3Aport)
+	 * since ":" is the path separator in did:web identifiers.
+	 */
+	static String getWebHost(Context ctx) {
+		String host = ctx.header("X-Forwarded-Host");
+		if (host == null) {
+			host = ctx.host(); // e.g. "localhost:8080" or "my-server.org"
+		}
+		int colon = host.indexOf(':');
+		if (colon >= 0) {
+			String port = host.substring(colon + 1);
+			String name = host.substring(0, colon);
+			host = ("80".equals(port) || "443".equals(port)) ? name : name + "%3A" + port;
+		}
+		return host;
+	}
+
+	/**
+	 * Gets the venue identity. A configured base URL is the canonical source;
+	 * request headers are retained only as a compatibility fallback for public
+	 * DID discovery and are never used as an administrator-token audience.
+	 */
+	private String getVenueDID(Context ctx) {
+		if (restServer.getVenueDID()!=null) return restServer.getVenueDID().toString();
+		return "did:web:"+getWebHost(ctx);
+	}
+
+	/**
 	 * Encode an Ed25519 public key as multibase base58btc (z prefix).
 	 */
 	public static String multibaseEncode(AccountKey key) {
-		byte[] bytes = key.getBytes();
-		return "z" + encodeBase58(bytes);
+		return "z" + Base58.encode(key.getBytes());
 	}
 
 	/**
@@ -158,60 +160,6 @@ public class DIDAPI extends ABaseAPI {
 	 * The 0xed01 prefix is the multicodec for Ed25519 public keys.
 	 */
 	public static String multibaseEncodeEd25519DIDKey(AccountKey key) {
-		byte[] rawKey = key.getBytes();
-		byte[] prefixed = new byte[2 + rawKey.length];
-		prefixed[0] = (byte) 0xed;
-		prefixed[1] = (byte) 0x01;
-		System.arraycopy(rawKey, 0, prefixed, 2, rawKey.length);
-		return "z" + encodeBase58(prefixed);
-	}
-
-	/**
-	 * Base58btc encoding using the Bitcoin alphabet.
-	 */
-	static String encodeBase58(byte[] input) {
-		if (input.length == 0) return "";
-
-		// Count leading zeros
-		int zeros = 0;
-		while (zeros < input.length && input[zeros] == 0) {
-			zeros++;
-		}
-
-		// Convert to big integer and encode
-		// Work with unsigned bytes
-		int[] number = new int[input.length];
-		for (int i = 0; i < input.length; i++) {
-			number[i] = input[i] & 0xFF;
-		}
-
-		char[] encoded = new char[input.length * 2]; // upper bound
-		int outputStart = encoded.length;
-
-		int start = zeros;
-		while (start < number.length) {
-			int remainder = 0;
-			int newStart = start;
-			boolean started = false;
-			for (int i = start; i < number.length; i++) {
-				int digit = number[i] + remainder * 256;
-				number[i] = digit / 58;
-				remainder = digit % 58;
-				if (!started && number[i] != 0) {
-					newStart = i;
-					started = true;
-				}
-			}
-			if (!started) newStart = number.length;
-			encoded[--outputStart] = BASE58_ALPHABET.charAt(remainder);
-			start = newStart;
-		}
-
-		// Add leading '1's for each leading zero byte
-		for (int i = 0; i < zeros; i++) {
-			encoded[--outputStart] = '1';
-		}
-
-		return new String(encoded, outputStart, encoded.length - outputStart);
+		return Multikey.encodePublicKey(key).toString();
 	}
 }

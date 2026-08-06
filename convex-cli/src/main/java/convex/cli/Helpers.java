@@ -9,9 +9,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import convex.core.crypto.PFXTools;
+import convex.core.cvm.Migrations;
+import convex.core.cvm.State;
 import convex.core.util.Utils;
-import picocli.CommandLine.Help.Ansi.Style;
-import picocli.CommandLine.Help.ColorScheme;
 
 /**
  *
@@ -21,18 +21,29 @@ import picocli.CommandLine.Help.ColorScheme;
  *
 */
 public class Helpers {
-	
-	public static final ColorScheme usageColourScheme = new ColorScheme.Builder()
-	        .commands    (Style.bold, Style.underline)    // combine multiple styles
-	        .options     (Style.fg_yellow)                // yellow foreground color
-	        .parameters  (Style.fg_yellow)
-	        .optionParams(Style.italic)
-	        .errors      (Style.fg_red, Style.bold)
-	        .stackTraces (Style.italic)
-	        .build();
 
 	/**
-	 * Split a parameter list by ','. 
+	 * Applies the requested protocol version to a freshly created genesis state for
+	 * a NEW network. Defaults to the latest supported version — a fresh network has
+	 * no history to preserve, so it should not launch with known-fixed bugs. Pin a
+	 * lower version with --protocol-version (e.g. 0 to match a network that has not
+	 * yet upgraded).
+	 *
+	 * @param genesis Freshly created genesis state
+	 * @param protocolVersion Requested protocol version, or null for latest
+	 * @return Genesis state at the requested protocol version
+	 */
+	public static State applyGenesisProtocol(State genesis, Long protocolVersion) {
+		long target = (protocolVersion == null) ? Migrations.MAX_VERSION : protocolVersion;
+		if ((target < 0) || (target > Migrations.MAX_VERSION)) {
+			throw new CLIError(ExitCodes.USAGE,
+					"--protocol-version must be in range 0.." + Migrations.MAX_VERSION);
+		}
+		return Migrations.applyTo(genesis, target);
+	}
+
+	/**
+	 * Split a parameter list by ','.
 	 * Handles internal separators (sublists in strings)
 	 * Trims resulting Strings of whitespace
 	 * @param parameterValues Array of parameter values
@@ -42,8 +53,8 @@ public class Helpers {
 		List<String> result = new ArrayList<>(parameterValues.length);
 		for (int index = 0; index < parameterValues.length; index ++) {
 			String value = parameterValues[index];
-			
-			if (value.indexOf(",") > 0) {
+
+			if (value.indexOf(",") >= 0) {
 				String[] items  = value.split(",");
 				for (int itemIndex = 0; itemIndex < items.length; itemIndex ++ ) {
 					String newValue = items[itemIndex].trim();
@@ -87,7 +98,8 @@ public class Helpers {
 				Matcher matcher = rangePattern.matcher(item);
 				if (matcher.matches()) {
 					int portFrom = Integer.parseInt(matcher.group(1));
-					int portTo = portFrom  + count + 1;
+					// Open-ended range: allow up to `count` ports from the start of the range
+					int portTo = portFrom + count - 1;
 					if (!matcher.group(2).isEmpty()) {
 						portTo = Integer.parseInt(matcher.group(2));
 					}

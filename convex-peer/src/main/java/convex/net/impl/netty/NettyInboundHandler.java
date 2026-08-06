@@ -1,6 +1,7 @@
 package convex.net.impl.netty;
 
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 
@@ -46,10 +47,22 @@ class NettyInboundHandler extends ByteToMessageDecoder {
 	 */
 	private final Function<Message, Predicate<Message>> deliver;
 
+	/** Per-server maximum encoded message length, checked before full allocation. */
+	private volatile int maxMessageLength;
+
 	/**
 	 * Connection associated with this handler. Set for server-side inbound channels.
 	 */
 	private AConnection connection;
+
+	/** No-op disconnect action, used as the default and the null-reset value. */
+	private static final Consumer<AConnection> NO_DISCONNECT = c -> {};
+
+	/**
+	 * Action invoked when this channel goes inactive (closes), so the server can release
+	 * per-connection state eagerly (#566). Default no-op.
+	 */
+	private Consumer<AConnection> onDisconnect = NO_DISCONNECT;
 
 	/**
 	 * Count of complete messages decoded on this channel.
@@ -72,13 +85,53 @@ class NettyInboundHandler extends ByteToMessageDecoder {
 	 * @param returnAction Unused, kept for compatibility (will be removed)
 	 */
 	public NettyInboundHandler(Function<Message, Predicate<Message>> deliver, Predicate<Message> returnAction)  {
+		this(deliver, returnAction, (int) CPoSConstants.MAX_MESSAGE_LENGTH);
+	}
+
+	public NettyInboundHandler(Function<Message, Predicate<Message>> deliver,
+			Predicate<Message> returnAction, int maxMessageLength) {
 		this.deliver=deliver;
+		setMaxMessageLength(maxMessageLength);
+	}
+
+	/**
+	 * Updates the encoded-message limit for this channel. The field is volatile because
+	 * peer verification completes off the Netty event loop: an outbound connection starts
+	 * with the conservative untrusted limit and may be promoted after its key is verified.
+	 *
+	 * @param limit maximum encoded body length in bytes
+	 */
+	void setMaxMessageLength(int limit) {
+		if (limit <= 0) throw new IllegalArgumentException("Maximum message length must be positive");
+		maxMessageLength = limit;
+	}
+
+	int getMaxMessageLength() {
+		return maxMessageLength;
 	}
 
 	@Override
 	public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
 		log.debug("Closed Netty channel due to: "+cause.getMessage(),cause);
 		ctx.close();
+	}
+
+	@Override
+	public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+		// Deliver any final decoded messages / run decoder cleanup first, then fire the
+		// disconnect callback so the server can release per-connection state (#566).
+		try {
+			super.channelInactive(ctx);
+		} finally {
+			AConnection conn = connection;
+			if (conn != null) {
+				try {
+					onDisconnect.accept(conn);
+				} catch (Exception e) {
+					log.debug("Disconnect action failed: {}", e.getMessage());
+				}
+			}
+		}
 	}
 
 	public long getReceivedCount() {
@@ -92,6 +145,14 @@ class NettyInboundHandler extends ByteToMessageDecoder {
 	 */
 	void setConnection(AConnection conn) {
 		this.connection = conn;
+	}
+
+	/**
+	 * Sets the action invoked when this channel closes (#566).
+	 * @param action Disconnect action (null resets to a no-op)
+	 */
+	void setDisconnectAction(Consumer<AConnection> action) {
+		this.onDisconnect = (action != null) ? action : NO_DISCONNECT;
 	}
 
 	@Override
@@ -127,7 +188,7 @@ class NettyInboundHandler extends ByteToMessageDecoder {
 
 	   			int bm=(b&0x7f); // new bits for length
 	   		    mlen=(mlen<<7)+bm;
-				if (mlen>CPoSConstants.MAX_MESSAGE_LENGTH) throw new BadFormatException("Message too long: "+mlen);
+				if (mlen>maxMessageLength) throw new BadFormatException("Message too long: "+mlen);
 				if ((b&0x80)==0) {
 					// we have a complete message length
 					break;
@@ -195,7 +256,15 @@ class NettyInboundHandler extends ByteToMessageDecoder {
 				});
 			}
 		} catch (Throwable e) {
-			log.warn("Inbound message handling error: {}",e.getMessage());
+			if (e instanceof BadFormatException) {
+				// Malformed input from a remote client is an expected event on a
+				// public port (exceptionCaught closes the channel); debug level so
+				// hostile clients cannot spam the operator log. Sustained abuse is
+				// surfaced by the #566 circuit-breaker instead.
+				log.debug("Rejecting malformed inbound message: {}",e.getMessage());
+			} else {
+				log.warn("Inbound message handling error: {}",e.getMessage());
+			}
 			throw e;
 		}
 	}

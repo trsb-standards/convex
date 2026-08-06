@@ -2,11 +2,11 @@ package convex.auth.ucan;
 
 import java.security.SecureRandom;
 
+import convex.auth.did.DID;
 import convex.auth.jwt.JWT;
 import convex.core.crypto.AKeyPair;
 import convex.core.crypto.ASignature;
 import convex.core.crypto.Ed25519Signature;
-import convex.core.crypto.util.Multikey;
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
 import convex.core.data.AMap;
@@ -25,8 +25,10 @@ import convex.core.lang.RT;
  * UCAN (User Controlled Authorization Networks) token for Convex.
  *
  * <p>Tokens are native CVM values encoded via CAD3. Signatures are Ed25519
- * over the Ref encoding of the payload (matching the SignedData pattern).
- * No JWT, no JSON, no base64 — pure Convex data end-to-end.</p>
+ * over the Ref encoding of the payload (matching the SignedData pattern) —
+ * pure Convex data end-to-end. A standard JWT encoding is also supported for
+ * transport interoperability (see {@link #toJWT} / {@link #fromJWT}); note the
+ * JWT signature covers the base64url signing input, not the CAD3 encoding.</p>
  *
  * <p>Token structure:</p>
  * <pre>
@@ -62,7 +64,6 @@ public class UCAN {
 		UCV, Strings.create("0.10.0")
 	);
 
-	private static final String DID_KEY_PREFIX = "did:key:";
 	private static final SecureRandom RANDOM = new SecureRandom();
 
 	// Cached fields
@@ -153,9 +154,55 @@ public class UCAN {
 	 */
 	public static AMap<AString, ACell> buildPayload(AccountKey issuerKey, AccountKey audience,
 			long expiry, Long notBefore, AVector<ACell> capabilities, AVector<ACell> proofs, ACell facts) {
+		if (audience == null) throw new IllegalArgumentException("Audience key cannot be null");
+		return buildPayload(issuerKey, toDIDKey(audience), expiry, notBefore,
+			capabilities, proofs, facts);
+	}
+
+	/**
+	 * Build a UCAN payload for an audience identified by any valid DID method.
+	 *
+	 * @param issuerKey Issuer's public key
+	 * @param audienceDID Audience DID
+	 * @param expiry Expiry time in unix seconds
+	 * @param notBefore Not-before time in unix seconds (null to omit)
+	 * @param capabilities Capabilities vector (null for empty)
+	 * @param proofs Proof tokens vector (null for empty)
+	 * @param facts Facts value (null to omit)
+	 * @return Payload map ready for signing
+	 */
+	public static AMap<AString, ACell> buildPayload(AccountKey issuerKey, AString audienceDID,
+			long expiry, Long notBefore, AVector<ACell> capabilities, AVector<ACell> proofs, ACell facts) {
+		return buildPayload(issuerKey, audienceDID, expiry, notBefore, generateNonce(),
+			capabilities, proofs, facts);
+	}
+
+	/**
+	 * Build a UCAN payload with an explicit nonce.
+	 *
+	 * @param issuerKey Issuer's public key
+	 * @param audienceDID Audience DID
+	 * @param expiry Expiry time in Unix seconds
+	 * @param notBefore Not-before time in Unix seconds (null to omit)
+	 * @param nonce Application nonce
+	 * @param capabilities Capabilities vector (null for empty)
+	 * @param proofs Proof tokens vector (null for empty)
+	 * @param facts Facts value (null to omit)
+	 * @return Payload map ready for signing
+	 */
+	public static AMap<AString, ACell> buildPayload(AccountKey issuerKey, AString audienceDID,
+			long expiry, Long notBefore, AString nonce, AVector<ACell> capabilities,
+			AVector<ACell> proofs, ACell facts) {
+		if (issuerKey == null) throw new IllegalArgumentException("Issuer key cannot be null");
+		AString audDID = requireDID(audienceDID, "Audience");
+		if (expiry <= 0) throw new IllegalArgumentException("Expiry must be positive");
+		if (notBefore != null && notBefore >= expiry) {
+			throw new IllegalArgumentException("Not-before must be before expiry");
+		}
+		if (nonce == null || nonce.isEmpty()) {
+			throw new IllegalArgumentException("Nonce cannot be empty");
+		}
 		AString issDID = toDIDKey(issuerKey);
-		AString audDID = toDIDKey(audience);
-		AString nonce = generateNonce();
 
 		AMap<AString, ACell> payload = Maps.of(
 			ISS, issDID,
@@ -174,6 +221,21 @@ public class UCAN {
 		}
 
 		return payload;
+	}
+
+	private static AString requireDID(AString value, String name) {
+		if (value == null || value.isEmpty()) {
+			throw new IllegalArgumentException(name+" DID cannot be empty");
+		}
+		try {
+			DID did = DID.fromString(value.toString());
+			if (did.getMethod().isEmpty() || did.getID().isEmpty()) {
+				throw new IllegalArgumentException(name+" must be a valid DID");
+			}
+			return value;
+		} catch (RuntimeException ex) {
+			throw new IllegalArgumentException(name+" must be a valid DID", ex);
+		}
 	}
 
 	/**
@@ -196,7 +258,7 @@ public class UCAN {
 	public static UCAN parse(AMap<AString, ACell> tokenMap) {
 		if (tokenMap == null) return null;
 
-		AMap<AString, ACell> payload = RT.ensureMap(tokenMap.get(PAYLOAD));
+		AMap<AString, ACell> payload = RT.castMap(tokenMap.get(PAYLOAD));
 		if (payload == null) return null;
 
 		ACell sigCell = tokenMap.get(SIG);
@@ -227,15 +289,15 @@ public class UCAN {
 	}
 
 	/**
-	 * Get the audience DID string (did:key:z6Mk...).
+	 * Get the audience DID string.
 	 */
 	public AString getAudience() {
 		return RT.ensureString(payload.get(AUD));
 	}
 
 	/**
-	 * Get the audience's AccountKey, decoded from the did:key.
-	 * Returns null if the DID is malformed.
+	 * Get the audience's AccountKey, decoded from a did:key audience.
+	 * Returns null for other DID methods or if the DID is malformed.
 	 */
 	public AccountKey getAudienceKey() {
 		return fromDIDKey(getAudience());
@@ -308,46 +370,45 @@ public class UCAN {
 	}
 
 	/**
+	 * Get the signing message for a native (CAD3) token: the Ref encoding of the payload,
+	 * i.e. exactly the bytes covered by the signature. Note this does NOT apply to
+	 * JWT-parsed tokens, whose signature covers the base64url JWT signing input instead.
+	 *
+	 * @return Signing message bytes
+	 */
+	public Blob getSigningMessage() {
+		return Ref.get(payload).getEncoding();
+	}
+
+	/**
 	 * Verify the token's signature against the issuer's public key.
 	 * @return true if signature is valid
 	 */
 	public boolean verifySignature() {
 		AccountKey issKey = getIssuerKey();
 		if (issKey == null) return false;
-		Blob message = Ref.get(payload).getEncoding();
-		return signature.verify(message, issKey);
+		return signature.verify(getSigningMessage(), issKey);
 	}
 
 	/**
-	 * Convert an AccountKey to a did:key string.
+	 * Convert an AccountKey to a did:key string. See {@link DID#forKey}.
 	 */
 	public static AString toDIDKey(AccountKey key) {
-		AString multikey = Multikey.encodePublicKey(key);
-		return Strings.create(DID_KEY_PREFIX + multikey);
+		return DID.forKey(key);
 	}
 
 	/**
 	 * Extract an AccountKey from a did:key string. Returns null if malformed.
+	 * See {@link DID#keyFromDID}.
 	 */
 	public static AccountKey fromDIDKey(AString did) {
-		if (did == null) return null;
-		String s = did.toString();
-		if (!s.startsWith(DID_KEY_PREFIX)) return null;
-		try {
-			return Multikey.decodePublicKey(s.substring(DID_KEY_PREFIX.length()));
-		} catch (Exception e) {
-			return null;
-		}
+		return DID.keyFromDID(did);
 	}
 
 	private static AString generateNonce() {
 		byte[] bytes = new byte[12];
 		RANDOM.nextBytes(bytes);
-		StringBuilder sb = new StringBuilder(24);
-		for (byte b : bytes) {
-			sb.append(String.format("%02x", b & 0xff));
-		}
-		return Strings.create(sb.toString());
+		return Strings.create(Blob.wrap(bytes).toHexString());
 	}
 
 	// ==================== JWT Encoding ====================
@@ -367,6 +428,25 @@ public class UCAN {
 	 * @return JWT-encoded UCAN string
 	 */
 	public AString toJWT(AKeyPair issuerKP) {
+		return signJWT(payload, issuerKP);
+	}
+
+	/**
+	 * Sign a pre-built UCAN payload as a JWT, requiring the did:key issuer to
+	 * match the signing key.
+	 *
+	 * @param payload UCAN payload
+	 * @param issuerKP Issuer key pair
+	 * @return JWT-encoded UCAN
+	 */
+	public static AString signJWT(AMap<AString, ACell> payload, AKeyPair issuerKP) {
+		if (payload == null) throw new IllegalArgumentException("UCAN payload is required");
+		if (issuerKP == null) throw new IllegalArgumentException("Issuer key pair is required");
+		AccountKey claimedKey = DID.keyFromDID(RT.ensureString(payload.get(ISS)));
+		if (claimedKey == null || !claimedKey.equals(issuerKP.getAccountKey())) {
+			throw new IllegalArgumentException(
+				"UCAN did:key issuer does not match the signing key");
+		}
 		return JWT.signPublic(payload, issuerKP);
 	}
 
@@ -387,8 +467,10 @@ public class UCAN {
 	}
 
 	/**
-	 * Parse a JWT-encoded UCAN. Verifies the EdDSA signature using the public key
-	 * from the JWT {@code kid} header. Returns null if malformed or signature invalid.
+	 * Parse a JWT-encoded UCAN. Verifies the EdDSA signature against the public key
+	 * bound in the {@code iss} DID (a {@code did:key} encodes the issuer's key); the
+	 * attacker-controlled {@code kid} header is ignored. Returns null if malformed or
+	 * signature invalid.
 	 *
 	 * @param jwtString The JWT string
 	 * @return Parsed UCAN, or null if invalid
@@ -398,20 +480,23 @@ public class UCAN {
 		JWT parsed = JWT.parse(jwtString);
 		if (parsed == null) return null;
 
-		// Verify signature via kid header
-		if (!parsed.verifyEdDSA()) return null;
-
 		AMap<AString, ACell> claims = parsed.getClaims();
 		if (claims == null) return null;
 
-		// Extract issuer key for internal use
-		AString issuerDID = RT.ensureString(claims.get(ISS));
-		AccountKey issuerKey = fromDIDKey(issuerDID);
+		// Derive the verification key from the `iss` DID (did:key encodes the issuer's
+		// public key) and verify the signature against THAT key.
+		//
+		// SECURITY: the verification key MUST be bound to the claimed issuer. The JWT `kid`
+		// header is attacker-controlled and must not select the verification key — otherwise
+		// an attacker could sign with their own key, name it in `kid`, and forge any `iss`
+		// (issuer spoofing / authorization bypass). For a did:key UCAN the issuer IS the key,
+		// so we ignore `kid` and verify directly against the iss key.
+		AccountKey issuerKey = fromDIDKey(RT.ensureString(claims.get(ISS)));
 		if (issuerKey == null) return null;
+		if (!parsed.verifyEdDSA(issuerKey)) return null;
 
-		// Build the signature from the JWT's raw bytes
-		// We store the JWT's signature but note: verifySignature() uses CAD3,
-		// so for JWT-parsed tokens use verifyJWT() instead
+		// Build the signature from the JWT's raw bytes. Note: verifySignature() uses CAD3,
+		// so for JWT-parsed tokens use the JWT verification path, not verifySignature().
 		ASignature sig = ASignature.fromBlob(Blob.wrap(parsed.getSignatureBytes()));
 
 		return new UCAN(claims, sig);

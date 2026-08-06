@@ -12,6 +12,7 @@ import convex.cli.CLIError;
 import convex.cli.Constants;
 import convex.cli.ExitCodes;
 import convex.cli.Helpers;
+import convex.cli.TraySupport;
 import convex.core.cvm.State;
 import convex.core.crypto.AKeyPair;
 import convex.core.data.AccountKey;
@@ -19,10 +20,10 @@ import convex.core.init.Init;
 import convex.peer.API;
 import convex.peer.PeerException;
 import convex.peer.Server;
+import convex.gui.utils.TrayManager;
 import convex.restapi.RESTServer;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
-import picocli.CommandLine.ParentCommand;
 
 /*
  * 		local start command
@@ -37,9 +38,6 @@ import picocli.CommandLine.ParentCommand;
 public class LocalStart extends ALocalCommand {
 
 	private static final Logger log = LoggerFactory.getLogger(LocalStart.class);
-
-	@ParentCommand
-	private Local localParent;
 
 	@Option(names={"--count"},
 		defaultValue = "" + Constants.LOCAL_START_PEER_COUNT,
@@ -61,6 +59,18 @@ public class LocalStart extends ALocalCommand {
 	@Option(names={"--api-port"},
 		description="REST API port, enables REST API to the first peer in the local cluster. If unspecified, takes 8080 if available.")
 	private Integer apiPort;
+
+	@Option(names={"--norest"},
+		description="Disable the REST API server.")
+	private boolean norest;
+
+	@Option(names={"--no-tray"},
+		description="Disable the system tray icon.")
+	private boolean noTray;
+
+	@Option(names={"--protocol-version"},
+		description="Protocol version for the new local network genesis. Default: latest version supported by this release.")
+	private Long protocolVersion;
 
     /**
      * Gets n public keys for local test cluster
@@ -121,28 +131,45 @@ public class LocalStart extends ALocalCommand {
     
 	@Override
 	public void execute() throws InterruptedException {
+		if (count < 1) {
+			throw new CLIError(ExitCodes.USAGE, "--count must be at least 1");
+		}
 		List<AKeyPair> keyPairList = getPeerKeyPairs(count);
 		int peerPorts[] = getPeerPorts();
-		
+
 		inform("Starting local test network with "+count+" peer(s)");
 		List<Server> servers=launchLocalPeers(keyPairList, peerPorts);
 		int n=servers.size();
-		
 
-		launchRestAPI(servers.get(0));
-		
-		// informWarning("Failed to start REST server: "+t);
-		
-		informSuccess("Started: "+ n+" local peer"+((n>1)?"s":"")+" launched");
-		cli().notifyStartup();
-		servers.get(0).waitForShutdown();
-		informWarning("Peer shutdown complete");
+		// Report the actual ports in use: with auto-assigned ports this is the
+		// only way for users (and tests) to discover where the peers are listening
+		String portList=servers.stream().map(s->Integer.toString(s.getPort())).collect(Collectors.joining(","));
+		inform("Peer ports: "+portList);
+
+		RESTServer restServer=null;
+		boolean trayInstalled=false;
+		try {
+			if (!norest) restServer=launchRestAPI(servers.get(0));
+			Runnable closeServers=()->servers.forEach(Server::close);
+			trayInstalled=TraySupport.installPeerTray(
+				"Convex local network ("+n+" peer"+((n>1)?"s":"")+")",
+				servers.get(0),restServer,noTray,closeServers);
+
+			informSuccess("Started: "+ n+" local peer"+((n>1)?"s":"")+" launched");
+			cli().notifyStartup();
+			servers.get(0).waitForShutdown();
+			inform("Peer shutdown complete");
+		} finally {
+			if (trayInstalled) TrayManager.remove();
+			if (restServer!=null) restServer.close();
+			servers.forEach(Server::close);
+		}
 	}
 
 	public List<Server> launchLocalPeers(List<AKeyPair> keyPairList, int peerPorts[]) throws InterruptedException {
 		List<AccountKey> keyList=keyPairList.stream().map(kp->kp.getAccountKey()).collect(Collectors.toList());
 
-		State genesisState=Init.createState(keyList);
+		State genesisState=Helpers.applyGenesisProtocol(Init.createState(keyList),protocolVersion);
 		try {
 			return API.launchLocalPeers(keyPairList,genesisState, peerPorts);
 		} catch (PeerException e) {

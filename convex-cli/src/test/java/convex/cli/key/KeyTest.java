@@ -2,16 +2,23 @@ package convex.cli.key;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.AclFileAttributeView;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.GeneralSecurityException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
 
 import convex.cli.CLTester;
 import convex.cli.ExitCodes;
+import convex.core.crypto.BIP39;
 import convex.core.crypto.PFXTools;
 import convex.core.util.Utils;
 
@@ -69,12 +76,92 @@ public class KeyTest {
 				"--keystore", "foo.bar");
 		tester.assertExitCode(ExitCodes.NOINPUT);
 	}
-	
+
+	@Test
+	public void testKeyGenerateMnemonicExplicitStdoutAtV0() {
+		CLTester tester = CLTester.run(
+				"key",
+				"generate",
+				"-v0",
+				"-p", KEY_PASSWORD,
+				"--type", "bip39",
+				"--mnemonic-file", "-",
+				"--passphrase", "testBIP39pass",
+				"--storepass", KEYSTORE_PASSWORD,
+				"--keystore", KEYSTORE_FILENAME);
+		tester.assertExitCode(ExitCodes.SUCCESS);
+		String[] lines=tester.getOutput().strip().split("\\R");
+		assertEquals(2,lines.length);
+		assertNull(BIP39.checkMnemonic(lines[0]));
+		assertEquals(64,lines[1].length());
+		assertFalse(tester.getError().contains(lines[0]),"mnemonic must not be written to stderr");
+	}
+
+	@Test
+	public void testKeyGenerateMnemonicFile() throws IOException {
+		Path mnemonicFile=newMnemonicPath();
+		CLTester tester = CLTester.run(
+				"key", "generate",
+				"-p", KEY_PASSWORD,
+				"--type", "bip39",
+				"--mnemonic-file", mnemonicFile.toString(),
+				"--passphrase", "testBIP39pass",
+				"--storepass", KEYSTORE_PASSWORD,
+				"--keystore", KEYSTORE_FILENAME);
+		tester.assertExitCode(ExitCodes.SUCCESS);
+
+		String mnemonic=Files.readString(mnemonicFile).strip();
+		assertNull(BIP39.checkMnemonic(mnemonic));
+		assertEquals(64,tester.getOutput().trim().length());
+		assertFalse(tester.getError().contains(mnemonic),"mnemonic must not be written to stderr");
+
+		PosixFileAttributeView posix=Files.getFileAttributeView(mnemonicFile,PosixFileAttributeView.class);
+		if (posix!=null) {
+			assertEquals(PosixFilePermissions.fromString("rw-------"),posix.readAttributes().permissions());
+		} else {
+			AclFileAttributeView acl=Files.getFileAttributeView(mnemonicFile,AclFileAttributeView.class);
+			assertEquals(1,acl.getAcl().size());
+			assertEquals(Files.getOwner(mnemonicFile),acl.getAcl().get(0).principal());
+		}
+	}
+
+	@Test
+	public void testKeyGenerateMnemonicFileDoesNotOverwrite() throws IOException {
+		Path mnemonicFile=Files.createTempFile("convex-mnemonic-existing", ".txt");
+		mnemonicFile.toFile().deleteOnExit();
+		Files.writeString(mnemonicFile,"keep me");
+
+		CLTester tester = CLTester.run(
+				"key", "generate",
+				"-p", KEY_PASSWORD,
+				"--type", "bip39",
+				"--mnemonic-file", mnemonicFile.toString(),
+				"--passphrase", "testBIP39pass",
+				"--storepass", KEYSTORE_PASSWORD,
+				"--keystore", KEYSTORE_FILENAME);
+		tester.assertExitCode(ExitCodes.IOERR);
+		assertEquals("keep me",Files.readString(mnemonicFile));
+	}
+
+	@Test
+	public void testNonInteractiveBIP39RequiresMnemonicTarget() {
+		CLTester tester = CLTester.run(
+				"key", "generate", "-n",
+				"-p", KEY_PASSWORD,
+				"--type", "bip39",
+				"--passphrase", "testBIP39pass",
+				"--storepass", KEYSTORE_PASSWORD,
+				"--keystore", KEYSTORE_FILENAME);
+		tester.assertExitCode(ExitCodes.USAGE);
+		assertTrue(tester.getError().contains("--mnemonic-file"));
+	}
+
 	@Test
 	public void testKeyGenerateAndUse() throws IOException {
 		File f=TEMP_FILE;
 		f.delete();
 		String fileName =KEYSTORE_FILENAME;
+		Path mnemonicFile=newMnemonicPath();
 		
 		// command key.generate
 		CLTester tester =  CLTester.run(
@@ -82,6 +169,7 @@ public class KeyTest {
 				"generate", 
 				"-p", KEY_PASSWORD, 
 				"--type","bip39",
+				"--mnemonic-file",mnemonicFile.toString(),
 				"--passphrase","testBIP39pass",
 				"--storepass", KEYSTORE_PASSWORD, 
 				"--keystore", fileName);
@@ -115,5 +203,12 @@ public class KeyTest {
 		tester.assertExitCode(ExitCodes.SUCCESS);
 		assertFalse(tester.getOutput().contains(key));
 
+	}
+
+	private static Path newMnemonicPath() throws IOException {
+		Path path=Files.createTempFile("convex-mnemonic", ".txt");
+		Files.delete(path);
+		path.toFile().deleteOnExit();
+		return path;
 	}
 }

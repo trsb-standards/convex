@@ -15,9 +15,12 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
+import convex.lattice.fs.DLFileSystem;
 import convex.restapi.auth.AuthMiddleware;
-import io.javalin.Javalin;
+import io.javalin.config.RoutesConfig;
 import io.javalin.http.Context;
+import io.javalin.http.Handler;
+import io.javalin.http.HandlerType;
 
 /**
  * WebDAV-compatible HTTP handler with multi-drive support.
@@ -35,6 +38,8 @@ import io.javalin.http.Context;
  * {@link FileSystem} implementation.
  */
 public class DLFSWebDAV {
+	/** Maximum children returned by one PROPFIND response. */
+	public static final int MAX_DIRECTORY_ENTRIES = 10_000;
 
 	private static final String ROUTE = "/dlfs/";
 	private static final String ROUTE_BARE = "/dlfs";
@@ -42,6 +47,7 @@ public class DLFSWebDAV {
 
 	private final DLFSDriveManager driveManager;
 	private boolean requireAuthForWrites = false;
+	private long maxFileSize = DLFSServer.DEFAULT_MAX_REQUEST_SIZE;
 
 	public DLFSWebDAV(DLFSDriveManager driveManager) {
 		this.driveManager = driveManager;
@@ -63,50 +69,60 @@ public class DLFSWebDAV {
 		return this;
 	}
 
+	/** Sets the maximum file body accepted or buffered by WebDAV operations. */
+	public DLFSWebDAV setMaxFileSize(long bytes) {
+		if (bytes <= 0) throw new IllegalArgumentException("Maximum file size must be positive");
+		this.maxFileSize = bytes;
+		return this;
+	}
+
+	// Custom WebDAV HTTP methods, supported natively by Javalin 7+
+	private static final HandlerType PROPFIND = HandlerType.findOrCreate("PROPFIND");
+	private static final HandlerType PROPPATCH = HandlerType.findOrCreate("PROPPATCH");
+	private static final HandlerType MKCOL = HandlerType.findOrCreate("MKCOL");
+	private static final HandlerType MOVE = HandlerType.findOrCreate("MOVE");
+	private static final HandlerType COPY = HandlerType.findOrCreate("COPY");
+	private static final HandlerType LOCK = HandlerType.findOrCreate("LOCK");
+	private static final HandlerType UNLOCK = HandlerType.findOrCreate("UNLOCK");
+
 	/**
-	 * Registers WebDAV routes on the given Javalin app.
+	 * Registers WebDAV routes on the given routes configuration.
 	 */
-	public void addRoutes(Javalin app) {
-		app.get(ROUTE_PATH, this::handleGet);
-		app.get(ROUTE, this::handleGet);
-		app.put(ROUTE_PATH, this::handlePut);
-		app.delete(ROUTE_PATH, this::handleDelete);
-		app.head(ROUTE_PATH, this::handleHead);
-		app.head(ROUTE, this::handleHead);
-		app.head(ROUTE_BARE, this::handleHead);
-		app.options(ROUTE_PATH, this::handleOptions);
-		app.options(ROUTE, this::handleOptions);
-		app.options(ROUTE_BARE, this::handleOptions);
+	public void addRoutes(RoutesConfig routes) {
+		routes.get(ROUTE_PATH, this::handleGet);
+		routes.get(ROUTE, this::handleGet);
+		routes.put(ROUTE_PATH, this::handlePut);
+		routes.delete(ROUTE_PATH, this::handleDelete);
+		routes.head(ROUTE_PATH, this::handleHead);
+		routes.head(ROUTE, this::handleHead);
+		routes.head(ROUTE_BARE, this::handleHead);
+		routes.options(ROUTE_PATH, this::handleOptions);
+		routes.options(ROUTE, this::handleOptions);
+		routes.options(ROUTE_BARE, this::handleOptions);
 
-		// Custom WebDAV methods — Javalin has no built-in handler type for these
-		app.before(ctx -> {
-			String method = ctx.req().getMethod();
-			String uri = ctx.req().getRequestURI();
-			if (!uri.startsWith(ROUTE_BARE)) return;
+		// Root-level DAV discovery (Windows WebClient sends OPTIONS / then PROPFIND /)
+		routes.options("/", this::handleOptions);
+		routes.addHttpHandler(PROPFIND, "/", this::handleRootPropfind);
 
-			if ("PROPFIND".equals(method)) {
-				handlePropfind(ctx);
-				ctx.skipRemainingHandlers();
-			} else if ("MKCOL".equals(method)) {
-				handleMkcol(ctx);
-				ctx.skipRemainingHandlers();
-			} else if ("MOVE".equals(method)) {
-				handleMove(ctx);
-				ctx.skipRemainingHandlers();
-			} else if ("COPY".equals(method)) {
-				handleCopy(ctx);
-				ctx.skipRemainingHandlers();
-			} else if ("PROPPATCH".equals(method)) {
-				handleProppatch(ctx);
-				ctx.skipRemainingHandlers();
-			} else if ("LOCK".equals(method)) {
-				handleLock(ctx);
-				ctx.skipRemainingHandlers();
-			} else if ("UNLOCK".equals(method)) {
-				ctx.status(204);
-				ctx.skipRemainingHandlers();
-			}
-		});
+		// Custom WebDAV methods on the DLFS paths
+		addDLFSMethod(routes, PROPFIND, this::handlePropfind);
+		addDLFSMethod(routes, MKCOL, this::handleMkcol);
+		addDLFSMethod(routes, MOVE, this::handleMove);
+		addDLFSMethod(routes, COPY, this::handleCopy);
+		// These methods are deliberately explicit failures. Advertising or returning
+		// successful locks/properties without enforcing them is unsafe for clients.
+		addDLFSMethod(routes, PROPPATCH, this::handleUnsupported);
+		addDLFSMethod(routes, LOCK, this::handleUnsupported);
+		addDLFSMethod(routes, UNLOCK, this::handleUnsupported);
+	}
+
+	/**
+	 * Registers a handler for a WebDAV method on all DLFS path forms.
+	 */
+	private static void addDLFSMethod(RoutesConfig routes, HandlerType method, Handler handler) {
+		routes.addHttpHandler(method, ROUTE_BARE, handler);
+		routes.addHttpHandler(method, ROUTE, handler);
+		routes.addHttpHandler(method, ROUTE_PATH, handler);
 	}
 
 	// ==================== Path Resolution ====================
@@ -130,11 +146,11 @@ public class DLFSWebDAV {
 	DrivePath parseDrivePath(Context ctx) {
 		String pathParam = null;
 
-		// Try Javalin path param first (standard routes, already URL-decoded)
+		// Try Javalin path param first (routes registered on ROUTE_PATH, already URL-decoded)
 		try {
 			pathParam = ctx.pathParam("path");
 		} catch (Exception e) {
-			// not available (custom methods in before handler)
+			// not available (bare /dlfs routes have no path param)
 		}
 
 		// Fall back to URI extraction
@@ -159,12 +175,17 @@ public class DLFSWebDAV {
 
 		// Split into drive name + remainder
 		int slash = pathParam.indexOf('/');
-		if (slash < 0) {
-			return new DrivePath(pathParam, ""); // drive root
-		}
+		if (slash < 0) return validatedDrivePath(pathParam, "");
 		String driveName = pathParam.substring(0, slash);
 		String filePath = pathParam.substring(slash + 1);
-		return new DrivePath(driveName, filePath);
+		return validatedDrivePath(driveName, filePath);
+	}
+
+	private static DrivePath validatedDrivePath(String driveName, String filePath) {
+		if (!DLFSPathValidator.isValidDriveName(driveName)) {
+			throw new IllegalArgumentException("Invalid drive name");
+		}
+		return new DrivePath(driveName, DLFSPathValidator.canonicalRelativePath(filePath));
 	}
 
 	/**
@@ -185,6 +206,34 @@ public class DLFSWebDAV {
 		Path root = fs.getRootDirectories().iterator().next();
 		if (dp.filePath() == null || dp.filePath().isEmpty()) return root;
 		return fs.getPath("/" + dp.filePath());
+	}
+
+	/**
+	 * Syncs the DLFS drive after a mutating operation to ensure lattice persistence.
+	 */
+	private void syncDrive(Context ctx, DrivePath dp) {
+		if (dp.driveName() == null) return;
+		FileSystem fs = driveManager.getDrive(getIdentity(ctx), dp.driveName());
+		if (fs instanceof DLFileSystem dlfs) {
+			dlfs.sync();
+		}
+	}
+
+	private static void prepareMutation(Path path) {
+		FileSystem fs = path.getFileSystem();
+		if (fs instanceof DLFileSystem dlfs) dlfs.updateTimestamp();
+	}
+
+	private boolean writeCompleteFile(Path path, byte[] data) throws IOException {
+		if (data.length > maxFileSize) return false;
+		prepareMutation(path);
+		if (path.getFileSystem() instanceof DLFileSystem dlfs) {
+			dlfs.writeAllBytes((convex.lattice.fs.DLPath) path, data);
+		} else {
+			Files.write(path, data, StandardOpenOption.CREATE,
+				StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+		}
+		return true;
 	}
 
 	// ==================== Handlers ====================
@@ -231,11 +280,17 @@ public class DLFSWebDAV {
 		}
 
 		if (attrs.isRegularFile()) {
-			byte[] bytes = Files.readAllBytes(path);
+			String etag = calculateETag(path);
+			if (headerMatches(ctx.header("If-None-Match"), etag)) {
+				ctx.header("ETag", etag);
+				ctx.status(304);
+				return;
+			}
 			ctx.contentType(guessContentType(path.toString()));
-			ctx.header("Content-Length", String.valueOf(bytes.length));
+			ctx.header("Content-Length", String.valueOf(attrs.size()));
 			setLastModified(ctx, attrs);
-			ctx.result(bytes);
+			setETag(ctx, path);
+			ctx.result(Files.newInputStream(path));
 			return;
 		}
 
@@ -263,7 +318,16 @@ public class DLFSWebDAV {
 			return;
 		}
 
+		long declaredLength = ctx.contentLength();
+		if (declaredLength > maxFileSize) {
+			ctx.status(413).result("Content Too Large");
+			return;
+		}
 		byte[] body = ctx.bodyAsBytes();
+		if (body.length > maxFileSize) {
+			ctx.status(413).result("Content Too Large");
+			return;
+		}
 
 		// Ensure parent directory exists
 		Path parent = path.getParent();
@@ -273,12 +337,10 @@ public class DLFSWebDAV {
 		}
 
 		boolean isNew = !Files.exists(path);
+		if (!checkWritePreconditions(ctx, path, !isNew)) return;
+		writeCompleteFile(path, body);
 
-		Files.write(path, body,
-				StandardOpenOption.CREATE,
-				StandardOpenOption.TRUNCATE_EXISTING,
-				StandardOpenOption.WRITE);
-
+		syncDrive(ctx, dp);
 		ctx.status(isNew ? 201 : 204);
 	}
 
@@ -295,6 +357,7 @@ public class DLFSWebDAV {
 		if (dp.filePath() == null || dp.filePath().isEmpty()) {
 			boolean deleted = driveManager.deleteDrive(getIdentity(ctx), dp.driveName());
 			if (deleted) {
+				driveManager.sync();
 				ctx.status(204);
 			} else {
 				ctx.status(404).result("Not Found");
@@ -309,7 +372,9 @@ public class DLFSWebDAV {
 		}
 
 		try {
+			prepareMutation(path);
 			Files.delete(path);
+			syncDrive(ctx, dp);
 			ctx.status(204);
 		} catch (NoSuchFileException e) {
 			ctx.status(404).result("Not Found");
@@ -342,15 +407,37 @@ public class DLFSWebDAV {
 			ctx.contentType(guessContentType(path.toString()));
 			ctx.header("Content-Length", String.valueOf(attrs.size()));
 			setLastModified(ctx, attrs);
+			setETag(ctx, path);
 		}
 
 		ctx.status(200);
 	}
 
+	/**
+	 * Handles PROPFIND on root (/), listing /dlfs/ as a child collection.
+	 * Required for Windows WebDAV client discovery.
+	 */
+	void handleRootPropfind(Context ctx) {
+		String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+			+ "<D:multistatus xmlns:D=\"DAV:\">"
+			+ "<D:response><D:href>/</D:href><D:propstat><D:prop>"
+			+ "<D:displayname>/</D:displayname>"
+			+ "<D:resourcetype><D:collection/></D:resourcetype>"
+			+ "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+			+ "<D:response><D:href>/dlfs/</D:href><D:propstat><D:prop>"
+			+ "<D:displayname>dlfs</D:displayname>"
+			+ "<D:resourcetype><D:collection/></D:resourcetype>"
+			+ "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+			+ "</D:multistatus>";
+		ctx.contentType("application/xml; charset=utf-8");
+		ctx.status(207);
+		ctx.result(xml);
+	}
+
 	void handleOptions(Context ctx) {
-		ctx.header("DAV", "1, 2");
+		ctx.header("DAV", "1");
 		ctx.header("MS-Author-Via", "DAV");
-		ctx.header("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, PROPFIND, MOVE, COPY, LOCK, UNLOCK");
+		ctx.header("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, PROPFIND, MOVE, COPY");
 		ctx.status(200);
 	}
 
@@ -388,6 +475,10 @@ public class DLFSWebDAV {
 		if (depth >= 1 && attrs.isDirectory()) {
 			try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
 				for (Path child : stream) {
+					if (children.size() >= MAX_DIRECTORY_ENTRIES) {
+						ctx.status(507).result("Directory listing limit exceeded");
+						return;
+					}
 					children.add(child);
 				}
 			}
@@ -412,6 +503,7 @@ public class DLFSWebDAV {
 		if (dp.filePath() == null || dp.filePath().isEmpty()) {
 			boolean created = driveManager.createDrive(getIdentity(ctx), dp.driveName());
 			if (created) {
+				driveManager.sync();
 				ctx.header("Location", ROUTE + encodePathComponent(dp.driveName()) + "/");
 				ctx.status(201);
 			} else {
@@ -428,7 +520,9 @@ public class DLFSWebDAV {
 		}
 
 		try {
+			prepareMutation(path);
 			Files.createDirectory(path);
+			syncDrive(ctx, dp);
 			ctx.header("Location", ROUTE + encodePathComponent(dp.driveName()) + "/" + encodePath(dp.filePath()) + "/");
 			ctx.status(201);
 		} catch (FileAlreadyExistsException e) {
@@ -453,6 +547,7 @@ public class DLFSWebDAV {
 			}
 			boolean renamed = driveManager.renameDrive(getIdentity(ctx), dp.driveName(), destDp.driveName());
 			if (renamed) {
+				driveManager.sync();
 				ctx.header("Location", ROUTE + encodePathComponent(destDp.driveName()) + "/");
 				ctx.status(201);
 			} else {
@@ -467,14 +562,31 @@ public class DLFSWebDAV {
 			return;
 		}
 
-		Path dest = resolveDestination(ctx);
-		if (dest == null) {
+		DrivePath destDp = parseDestinationDrivePath(ctx);
+		if (destDp == null || !dp.driveName().equals(destDp.driveName())) {
+			ctx.status(409).result("Conflict: destination must be within the same drive");
+			return;
+		}
+		Path dest = resolveFilePath(ctx, destDp);
+		if (dest == null || destDp.filePath().isEmpty()) {
 			ctx.status(400).result("Bad Request: missing or invalid Destination header");
 			return;
 		}
 
 		if (!Files.exists(source)) {
 			ctx.status(404).result("Not Found");
+			return;
+		}
+		if (!Files.isRegularFile(source)) {
+			ctx.status(501).result("Directory MOVE is not implemented");
+			return;
+		}
+		if (source.equals(dest)) {
+			ctx.status(204);
+			return;
+		}
+		if (!Files.isDirectory(dest.getParent())) {
+			ctx.status(409).result("Conflict: destination parent does not exist");
 			return;
 		}
 
@@ -485,13 +597,20 @@ public class DLFSWebDAV {
 			return;
 		}
 
-		byte[] data = Files.readAllBytes(source);
-		Files.write(dest, data,
-				StandardOpenOption.CREATE,
-				StandardOpenOption.TRUNCATE_EXISTING,
-				StandardOpenOption.WRITE);
-		Files.delete(source);
+		long sourceSize = Files.size(source);
+		if (sourceSize > maxFileSize) {
+			ctx.status(413).result("Source file is too large to move");
+			return;
+		}
+		FileSystem fs = source.getFileSystem();
+		synchronized (fs) {
+			byte[] data = Files.readAllBytes(source);
+			writeCompleteFile(dest, data);
+			prepareMutation(source);
+			Files.delete(source);
+		}
 
+		syncDrive(ctx, dp);
 		ctx.status(destExists ? 204 : 201);
 	}
 
@@ -504,14 +623,31 @@ public class DLFSWebDAV {
 			return;
 		}
 
-		Path dest = resolveDestination(ctx);
-		if (dest == null) {
+		DrivePath destDp = parseDestinationDrivePath(ctx);
+		if (destDp == null || !dp.driveName().equals(destDp.driveName())) {
+			ctx.status(409).result("Conflict: destination must be within the same drive");
+			return;
+		}
+		Path dest = resolveFilePath(ctx, destDp);
+		if (dest == null || destDp.filePath().isEmpty()) {
 			ctx.status(400).result("Bad Request: missing or invalid Destination header");
 			return;
 		}
 
 		if (!Files.exists(source)) {
 			ctx.status(404).result("Not Found");
+			return;
+		}
+		if (!Files.isRegularFile(source)) {
+			ctx.status(501).result("Directory COPY is not implemented");
+			return;
+		}
+		if (source.equals(dest)) {
+			ctx.status(204);
+			return;
+		}
+		if (!Files.isDirectory(dest.getParent())) {
+			ctx.status(409).result("Conflict: destination parent does not exist");
 			return;
 		}
 
@@ -522,55 +658,20 @@ public class DLFSWebDAV {
 			return;
 		}
 
+		long sourceSize = Files.size(source);
+		if (sourceSize > maxFileSize) {
+			ctx.status(413).result("Source file is too large to copy");
+			return;
+		}
 		byte[] data = Files.readAllBytes(source);
-		Files.write(dest, data,
-				StandardOpenOption.CREATE,
-				StandardOpenOption.TRUNCATE_EXISTING,
-				StandardOpenOption.WRITE);
+		writeCompleteFile(dest, data);
 
+		syncDrive(ctx, dp);
 		ctx.status(destExists ? 204 : 201);
 	}
 
-	void handleProppatch(Context ctx) throws IOException {
-		DrivePath dp = parseDrivePath(ctx);
-		Path path = resolveFilePath(ctx, dp);
-		if (path == null || !Files.exists(path)) {
-			ctx.status(404).result("Not Found");
-			return;
-		}
-
-		String href = ROUTE + dp.driveName() + "/" + path.toString().replaceFirst("^/", "");
-		String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-				+ "<D:multistatus xmlns:D=\"DAV:\">"
-				+ "<D:response>"
-				+ "<D:href>" + href + "</D:href>"
-				+ "<D:propstat>"
-				+ "<D:prop/>"
-				+ "<D:status>HTTP/1.1 200 OK</D:status>"
-				+ "</D:propstat>"
-				+ "</D:response>"
-				+ "</D:multistatus>";
-		ctx.status(207);
-		ctx.contentType("application/xml; charset=utf-8");
-		ctx.result(xml);
-	}
-
-	void handleLock(Context ctx) {
-		String token = "opaquelocktoken:" + java.util.UUID.randomUUID();
-		String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-				+ "<D:prop xmlns:D=\"DAV:\">"
-				+ "<D:lockdiscovery><D:activelock>"
-				+ "<D:locktype><D:write/></D:locktype>"
-				+ "<D:lockscope><D:exclusive/></D:lockscope>"
-				+ "<D:depth>0</D:depth>"
-				+ "<D:timeout>Second-3600</D:timeout>"
-				+ "<D:locktoken><D:href>" + token + "</D:href></D:locktoken>"
-				+ "</D:activelock></D:lockdiscovery>"
-				+ "</D:prop>";
-		ctx.status(200);
-		ctx.contentType("application/xml; charset=utf-8");
-		ctx.header("Lock-Token", "<" + token + ">");
-		ctx.result(xml);
+	void handleUnsupported(Context ctx) {
+		ctx.status(501).result("WebDAV method is not implemented");
 	}
 
 	// ==================== Utilities ====================
@@ -602,9 +703,9 @@ public class DLFSWebDAV {
 
 			int slash = remainder.indexOf('/');
 			if (slash < 0) {
-				return new DrivePath(remainder, "");
+				return validatedDrivePath(remainder, "");
 			}
-			return new DrivePath(remainder.substring(0, slash), remainder.substring(slash + 1));
+			return validatedDrivePath(remainder.substring(0, slash), remainder.substring(slash + 1));
 		} catch (Exception e) {
 			return null;
 		}
@@ -678,6 +779,50 @@ public class DLFSWebDAV {
 			ctx.header("Last-Modified", DateTimeFormatter.RFC_1123_DATE_TIME
 					.format(ft.toInstant().atZone(ZoneOffset.UTC)));
 		}
+	}
+
+	private static void setETag(Context ctx, Path path) {
+		ctx.header("ETag", calculateETag(path));
+	}
+
+	private static String calculateETag(Path path) {
+		if (path.getFileSystem() instanceof DLFileSystem dlfs && path instanceof convex.lattice.fs.DLPath dlp) {
+			convex.core.data.Hash hash = dlfs.getNodeHash(dlp);
+			if (hash != null) return "\"" + hash.toHexString() + "\"";
+		}
+		try {
+			BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class);
+			return "W/\"" + attrs.size() + "-" + attrs.lastModifiedTime().toMillis() + "\"";
+		} catch (IOException e) {
+			return "\"missing\"";
+		}
+	}
+
+	private static boolean headerMatches(String header, String etag) {
+		if (header == null) return false;
+		for (String token : header.split(",")) {
+			String candidate = token.strip();
+			if (candidate.equals("*") || candidate.equals(etag)) return true;
+		}
+		return false;
+	}
+
+	private static boolean checkWritePreconditions(Context ctx, Path path, boolean exists) {
+		String ifMatch = ctx.header("If-Match");
+		if (ifMatch != null) {
+			boolean matched = exists && (ifMatch.strip().equals("*")
+				|| headerMatches(ifMatch, calculateETag(path)));
+			if (!matched) {
+				ctx.status(412).result("Precondition Failed");
+				return false;
+			}
+		}
+		String ifNoneMatch = ctx.header("If-None-Match");
+		if (exists && ifNoneMatch != null && headerMatches(ifNoneMatch, calculateETag(path))) {
+			ctx.status(412).result("Precondition Failed");
+			return false;
+		}
+		return true;
 	}
 
 	/**

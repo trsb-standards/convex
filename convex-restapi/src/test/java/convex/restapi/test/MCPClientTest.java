@@ -82,7 +82,9 @@ public class MCPClientTest extends ARESTTest {
 
 	@Test
 	public void testProtocol() {
-		assertEquals("2025-06-18", mcp.getCurrentInitializationResult().protocolVersion());
+		String negotiated = mcp.getCurrentInitializationResult().protocolVersion();
+		assertTrue(convex.restapi.mcp.McpServer.SUPPORTED_PROTOCOL_VERSIONS.contains(negotiated),
+				"Negotiated protocol version should be supported: " + negotiated);
 		mcp.ping();
 	}
 
@@ -283,14 +285,16 @@ public class MCPClientTest extends ARESTTest {
 		Map<String, Object> prepared = callToolOK("prepare",
 				Map.of("source", "(+ 10 20)", "address", "#" + testAddr));
 		String hash = (String) prepared.get("hash");
+		String data = (String) prepared.get("data");
 		assertNotNull(hash);
+		assertNotNull(data);
 
 		Map<String, Object> signed = callToolOK("sign",
 				Map.of("value", hash, "seed", testSeed));
 		String sig = (String) signed.get("signature");
 
 		Map<String, Object> submitted = callToolOK("submit", Map.of(
-				"hash", hash, "accountKey", testPublicKey, "sig", sig));
+				"hash", hash, "data", data, "accountKey", testPublicKey, "sig", sig));
 		assertEquals(30, ((Number) submitted.get("value")).intValue());
 	}
 
@@ -300,9 +304,10 @@ public class MCPClientTest extends ARESTTest {
 		Map<String, Object> prepared = callToolOK("prepare",
 				Map.of("source", "(str :a :b)", "address", "#" + testAddr));
 		String hash = (String) prepared.get("hash");
+		String data = (String) prepared.get("data");
 
 		Map<String, Object> result = callToolOK("signAndSubmit",
-				Map.of("hash", hash, "seed", testSeed));
+				Map.of("hash", hash, "data", data, "seed", testSeed));
 		assertEquals(":a:b", result.get("value").toString());
 	}
 

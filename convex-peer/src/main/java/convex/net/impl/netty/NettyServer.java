@@ -10,10 +10,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import convex.core.Constants;
+import convex.core.cvm.Keywords;
 import convex.core.data.ACell;
 import convex.core.message.Message;
 import convex.core.store.NullStore;
 import convex.core.util.Shutdown;
+import convex.core.util.Utils;
 import convex.net.AServer;
 import convex.peer.Config;
 import convex.peer.Server;
@@ -44,6 +46,15 @@ public class NettyServer extends AServer {
 	 */
 	private final ChannelGroup clientChannels =
 		new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
+
+	/**
+	 * Maximum number of inbound client connections accepted (#482).
+	 * Configurable via Keywords.MAX_CONNECTIONS; defaults to Config.MAX_CLIENT_CONNECTIONS.
+	 */
+	private volatile int maxClientConnections = Config.MAX_CLIENT_CONNECTIONS;
+
+	/** Maximum encoded inbound message length, enforced before full message allocation. */
+	private volatile int maxMessageLength = (int) convex.core.cpos.CPoSConstants.MAX_MESSAGE_LENGTH;
 
 	/**
 	 * Delivery function for inbound messages. Returns null if accepted,
@@ -84,7 +95,29 @@ public class NettyServer extends AServer {
 		NettyServer ns=new NettyServer(null);
 		ns.receiveAction=server.getReceiveAction();
 		ns.deliver=server::deliverMessage;
+		Object maxConns=server.getConfig().get(Keywords.MAX_CONNECTIONS);
+		if (maxConns!=null) {
+			ns.setMaxClientConnections(Utils.toInt(maxConns));
+		}
 		return ns;
+	}
+
+	/**
+	 * Sets the maximum number of inbound client connections (#482). New
+	 * connections beyond this limit are rejected and closed. Takes effect for
+	 * connections accepted after the call; existing connections are unaffected.
+	 * @param limit Maximum connections (must be positive)
+	 */
+	public void setMaxClientConnections(int limit) {
+		if (limit<=0) throw new IllegalArgumentException("Connection limit must be positive: "+limit);
+		this.maxClientConnections=limit;
+	}
+
+	/**
+	 * @return Maximum number of inbound client connections currently configured
+	 */
+	public int getMaxClientConnections() {
+		return maxClientConnections;
 	}
 
 
@@ -98,19 +131,20 @@ public class NettyServer extends AServer {
              @Override
              public void initChannel(SocketChannel ch) throws Exception {
             	 // Enforce connection limit
-            	 if (clientChannels.size() >= Config.MAX_CLIENT_CONNECTIONS) {
+            	 if (clientChannels.size() >= maxClientConnections) {
             		 log.warn("Connection limit reached ({}), rejecting {}",
-            			 Config.MAX_CLIENT_CONNECTIONS, ch.remoteAddress());
+            			 maxClientConnections, ch.remoteAddress());
             		 ch.close();
             		 return;
             	 }
             	 clientChannels.add(ch);
 
-            	 Function<Message, Predicate<Message>> deliverFn =
-            		 (deliver != null) ? deliver : wrapReceiveAction();
-            	 NettyInboundHandler inbound=new NettyInboundHandler(deliverFn,null);
+				 Function<Message, Predicate<Message>> deliverFn =
+					 (deliver != null) ? deliver : wrapReceiveAction();
+				 NettyInboundHandler inbound=new NettyInboundHandler(deliverFn,null,maxMessageLength);
             	 NettyServerConnection conn=new NettyServerConnection(ch,inbound);
             	 inbound.setConnection(conn);
+            	 inbound.setDisconnectAction(getDisconnectAction()); // #566: eager per-connection cleanup
                  ch.pipeline().addLast(inbound,new NettyOutboundHandler());
              }
          })
@@ -125,7 +159,7 @@ public class NettyServer extends AServer {
         	try {
         		f = b.bind(bindAddress).sync();
          	} catch (java.nio.channels.UnsupportedAddressTypeException e) {
-        		f= b.bind("0.0.0.0", port);
+        		f= b.bind("0.0.0.0", port).sync();
         		log.warn("Unable to bind IPv6 address, falling back to IPv4");
         	}
         } catch (Exception e) {
@@ -139,7 +173,7 @@ public class NettyServer extends AServer {
         	try {
         		f = b.bind(bindAddress).sync();
         	} catch (java.nio.channels.UnsupportedAddressTypeException e) {
-        		f= b.bind("0.0.0.0", port);
+        		f= b.bind("0.0.0.0", port).sync();
         		log.warn("Unable to bind IPv6 address, falling back to IPv4");
         	}
         }
@@ -178,9 +212,27 @@ public class NettyServer extends AServer {
 
 	@Override
 	public void close() {
-		clientChannels.close();
-		if (channel!=null) {
-			channel.close();
+		// Stop accepting first, then close established clients. Waiting for both
+		// operations makes close a real lifecycle boundary, which NodeServer relies on
+		// when rolling back a launch that failed after binding successfully. A handler
+		// is still allowed to initiate close from its own event loop; that case must not
+		// wait on itself and completion remains asynchronous.
+		Channel serverChannel = channel;
+		boolean eventLoopThread = serverChannel != null && serverChannel.eventLoop().inEventLoop();
+		if (!eventLoopThread) {
+			for (Channel client : clientChannels) {
+				if (client.eventLoop().inEventLoop()) {
+					eventLoopThread = true;
+					break;
+				}
+			}
+		}
+		channel = null;
+		ChannelFuture serverClose = (serverChannel != null) ? serverChannel.close() : null;
+		var clientsClose = clientChannels.close();
+		if (!eventLoopThread) {
+			if (serverClose != null) serverClose.syncUninterruptibly();
+			clientsClose.awaitUninterruptibly();
 		}
 	}
 
@@ -201,6 +253,30 @@ public class NettyServer extends AServer {
 
 	public void setReceiveAction(Consumer<Message> handler) {
 		receiveAction=handler;
+	}
+
+	/**
+	 * Sets the non-blocking message delivery function used by the Netty inbound handler.
+	 * A returned predicate is retried on a virtual thread while reads on that channel pause.
+	 *
+	 * @param handler delivery function implementing the backpressure contract
+	 */
+	public void setMessageDelivery(Function<Message, Predicate<Message>> handler) {
+		this.deliver=handler;
+	}
+
+	/**
+	 * Sets the maximum encoded inbound message length.
+	 *
+	 * @param limit maximum bytes, must be positive
+	 */
+	public void setMaxMessageLength(int limit) {
+		if (limit <= 0) throw new IllegalArgumentException("Message length limit must be positive: " + limit);
+		this.maxMessageLength=limit;
+	}
+
+	public int getMaxMessageLength() {
+		return maxMessageLength;
 	}
 
 }

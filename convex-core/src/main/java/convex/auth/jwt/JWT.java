@@ -22,6 +22,7 @@ import convex.core.data.AString;
 import convex.core.data.Blob;
 import convex.core.data.Maps;
 import convex.core.data.Strings;
+import convex.core.data.prim.CVMLong;
 import convex.core.data.util.BlobBuilder;
 import convex.core.lang.RT;
 import convex.core.util.JSON;
@@ -60,6 +61,14 @@ public class JWT {
 	public static final AString ISS = Strings.intern("iss");
 	public static final AString IAT = Strings.intern("iat");
 	public static final AString AUD = Strings.intern("aud");
+	public static final AString NBF = Strings.intern("nbf");
+	public static final AString JTI = Strings.intern("jti");
+	public static final AString CLIENT_ID = Strings.intern("client_id");
+	public static final AString SCOPE = Strings.intern("scope");
+
+	private static final AString[] ACCESS_TOKEN_RESERVED = {
+		ISS, SUB, AUD, EXP, NBF, IAT, JTI, CLIENT_ID, SCOPE
+	};
 
 	// ========== Instance fields (parsed and cached) ==========
 
@@ -94,11 +103,11 @@ public class JWT {
 			if (dot2 < 0) return null;
 
 			String headerB64 = s.substring(0, dot1);
-			AMap<AString,ACell> header = RT.ensureMap(JSON.parse(Strings.wrap(decoder.decode(headerB64))));
+			AMap<AString,ACell> header = RT.castMap(JSON.parse(Strings.wrap(decoder.decode(headerB64))));
 			if (header == null) return null;
 
 			String claimsB64 = s.substring(dot1 + 1, dot2);
-			AMap<AString,ACell> claims = RT.ensureMap(JSON.parse(Strings.wrap(decoder.decode(claimsB64))));
+			AMap<AString,ACell> claims = RT.castMap(JSON.parse(Strings.wrap(decoder.decode(claimsB64))));
 			if (claims == null) return null;
 
 			String sigB64 = s.substring(dot2 + 1);
@@ -126,6 +135,12 @@ public class JWT {
 	/** Get the raw signature bytes */
 	public byte[] getSignatureBytes() { return signatureBytes; }
 
+	/**
+	 * Get the signing input: the base64url {@code header.payload} portion of the JWT,
+	 * i.e. exactly the bytes (UTF-8) covered by the signature.
+	 */
+	public String getSigningInput() { return signingInput; }
+
 	/** Get the algorithm from the header (e.g. "EdDSA", "RS256", "HS256") */
 	public String getAlgorithm() {
 		AString alg = RT.ensureString(header.get(ALG));
@@ -141,8 +156,16 @@ public class JWT {
 	// ========== Instance verification methods ==========
 
 	/**
-	 * Verify this JWT as a self-issued EdDSA token.
-	 * Extracts the public key from the {@code kid} header (multikey format).
+	 * Verify this JWT as a self-issued EdDSA token, taking the public key from the
+	 * {@code kid} header (multikey format).
+	 *
+	 * <p><b>SECURITY WARNING:</b> this trusts the {@code kid} header to supply the
+	 * verification key, so a valid result only proves "signed by whoever is named in
+	 * {@code kid}" — which the sender chooses. Do NOT use this where an identity claim
+	 * ({@code iss}, {@code sub}, ...) is trusted unless you separately bind that claim to
+	 * the signing key (e.g. require {@code sub == did:key(kid)}). For tokens whose identity
+	 * is itself a key (did:key), verify against the key derived from that claim using
+	 * {@link #verifyEdDSA(AccountKey)} instead.</p>
 	 *
 	 * @return true if signature is valid
 	 */
@@ -263,6 +286,67 @@ public class JWT {
 	// ========== Static signing methods (unchanged) ==========
 
 	/**
+	 * Build the claims for a JWT access token.
+	 *
+	 * <p>The issuer, subject, audience, issued-at, expiry and token ID claims are
+	 * required. Client ID, scope and not-before are optional. Additional claims
+	 * cannot replace fields managed by this method.</p>
+	 *
+	 * @param issuer Token issuer
+	 * @param subject Principal represented by the token
+	 * @param audience Intended resource server or API
+	 * @param issuedAt Issue time in Unix seconds
+	 * @param notBefore Optional lower validity bound in Unix seconds
+	 * @param expiry Expiry time in Unix seconds
+	 * @param tokenID Unique token identifier
+	 * @param clientID Optional OAuth client identifier
+	 * @param scope Optional space-separated OAuth scopes
+	 * @param additionalClaims Additional non-standard claims, or null
+	 * @return Access-token claims ready for signing
+	 */
+	public static AMap<AString,ACell> buildAccessTokenClaims(
+			AString issuer, AString subject, AString audience,
+			long issuedAt, Long notBefore, long expiry, AString tokenID,
+			AString clientID, AString scope, AMap<AString,ACell> additionalClaims) {
+		requireClaim(issuer, "Issuer");
+		requireClaim(subject, "Subject");
+		requireClaim(audience, "Audience");
+		requireClaim(tokenID, "JWT ID");
+		if (expiry <= issuedAt) {
+			throw new IllegalArgumentException("Expiry must be after issued-at");
+		}
+		if (notBefore != null && notBefore >= expiry) {
+			throw new IllegalArgumentException("Not-before must be before expiry");
+		}
+
+		AMap<AString,ACell> claims =
+			(additionalClaims == null) ? Maps.empty() : additionalClaims;
+		for (AString key : ACCESS_TOKEN_RESERVED) {
+			if (claims.containsKey(key)) {
+				throw new IllegalArgumentException(
+					"Additional claims must not redefine '"+key+"'");
+			}
+		}
+
+		claims = claims.assoc(ISS, issuer);
+		claims = claims.assoc(SUB, subject);
+		claims = claims.assoc(AUD, audience);
+		claims = claims.assoc(IAT, CVMLong.create(issuedAt));
+		claims = claims.assoc(EXP, CVMLong.create(expiry));
+		claims = claims.assoc(JTI, tokenID);
+		if (notBefore != null) claims = claims.assoc(NBF, CVMLong.create(notBefore));
+		if (clientID != null && !clientID.isEmpty()) claims = claims.assoc(CLIENT_ID, clientID);
+		if (scope != null && !scope.isEmpty()) claims = claims.assoc(SCOPE, scope);
+		return claims;
+	}
+
+	private static void requireClaim(AString value, String name) {
+		if (value == null || value.isEmpty()) {
+			throw new IllegalArgumentException(name+" is required");
+		}
+	}
+
+	/**
 	 * Get the claims string for a JWT before encoding
 	 * @param claimData Structured claim data
 	 * @return Claims String in UTF-8 JSON
@@ -373,6 +457,12 @@ public class JWT {
 	 *
 	 * Extracts the public key from the {@code kid} header parameter (multikey format),
 	 * verifies the Ed25519 signature, and returns the parsed claims map.
+	 *
+	 * <p><b>SECURITY WARNING:</b> the {@code kid} header is sender-controlled, so this only
+	 * proves the token was signed by the key named in {@code kid}. Do NOT trust any identity
+	 * claim from the returned map unless you bind it to the signing key. Prefer
+	 * {@link #verifyPublic(AString, AccountKey)} against a key you trust out-of-band, or the
+	 * key derived from the identity claim itself. See {@link #verifyEdDSA()}.</p>
 	 *
 	 * @param jwt The encoded JWT string
 	 * @return Claims map if signature is valid, or null if verification fails
