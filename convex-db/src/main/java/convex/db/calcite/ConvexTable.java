@@ -1,5 +1,6 @@
 package convex.db.calcite;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 
@@ -205,8 +206,8 @@ public class ConvexTable extends AbstractQueryableTable
 					}
 				}
 
-				ACell oldPk = toCell(row[0], 0);
-				ACell newPk = toCell(updatedRow[0], 0);
+				List<ACell> oldPk = primaryKeyCells(row);
+				List<ACell> newPk = primaryKeyCells(updatedRow);
 
 				if (pkBeingUpdated && !oldPk.equals(newPk)) {
 					if (schema.getTables().selectByKey(tableName, newPk) != null) {
@@ -232,7 +233,7 @@ public class ConvexTable extends AbstractQueryableTable
 			for (Object value : input) {
 				Object[] row=normaliseRow(value);
 				if (row != null && row.length > 0) {
-					ACell pk = toCell(row[0], 0);
+					List<ACell> pk = primaryKeyCells(row);
 					if (schema.getTables().deleteByKey(tableName, pk)) {
 						count++;
 					}
@@ -277,5 +278,22 @@ public class ConvexTable extends AbstractQueryableTable
 		ConvexColumnType[] types = getColumnTypes();
 		ConvexColumnType type = (types != null && columnIndex < types.length) ? types[columnIndex] : ConvexColumnType.of(ConvexType.ANY);
 		return type.toCell(v);
+	}
+
+	/**
+	 * Converts the leading PK columns of a row into ACells, in column order —
+	 * one per column of the table's actual primary key (composite or not).
+	 * Used to build the exact same key shape {@link SQLSchema#insert} uses,
+	 * so UPDATE/DELETE can locate a row by key regardless of whether the PK
+	 * spans one column or several.
+	 */
+	private List<ACell> primaryKeyCells(Object[] row) {
+		SQLTable table = schema.getTables().getLiveTable(tableName);
+		int pkCount = (table != null) ? table.getPkCount() : 1;
+		List<ACell> keyCells = new ArrayList<>(pkCount);
+		for (int i = 0; i < pkCount; i++) {
+			keyCells.add(toCell(row[i], i));
+		}
+		return keyCells;
 	}
 }

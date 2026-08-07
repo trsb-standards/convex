@@ -58,6 +58,26 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	 * Being static means every write in any schema instance within this process gets
 	 * a unique version — no ties are possible even when multiple forks write
 	 * concurrently within the same millisecond.
+	 *
+	 * <p><b>Found + fixed 2026-08-07</b>: {@link #now()} used to be a plain
+	 * {@code incrementAndGet()} on this field, advancing by exactly 1 per
+	 * write regardless of how much real time passed between writes. That
+	 * makes values incomparable across different processes/nodes once
+	 * they've been running for different lengths of time with different
+	 * write volumes: a low-activity node's value stays pinned near its own
+	 * boot-time seed indefinitely, while a node that simply booted a few
+	 * seconds *later* starts with a higher seed than the first node will
+	 * accumulate through ordinary write-count increments alone — inverting
+	 * the intended chronological LWW ordering. Found live diagnosing a
+	 * DELETE that appeared to succeed locally but silently reverted within
+	 * seconds via ordinary background gossip: the deleting node's tombstone
+	 * (a low-activity node, timestamp still near its own boot seed) lost
+	 * every LWW comparison against a peer's live row written at THAT peer's
+	 * own, later boot-time seed — even though the peer's write chronologically
+	 * predated the delete by several minutes of real wall-clock time. Not
+	 * specific to any one table; every row in every table uses this same
+	 * mechanism for conflict resolution. Fixed in {@link #now()} below by
+	 * tracking real wall-clock time instead of a pure per-write increment.
 	 */
 	private static final AtomicLong WRITE_SEQ = new AtomicLong(System.currentTimeMillis());
 
@@ -97,9 +117,24 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 
 	// ========== Internal Helpers ==========
 
-	/** Returns the next unique write-sequence number for LWW ordering. */
+	/**
+	 * Returns the next unique write-sequence number for LWW ordering.
+	 *
+	 * <p>Always at least {@code System.currentTimeMillis()} -- so a value
+	 * genuinely reflects real elapsed time, staying comparable against
+	 * writes from other processes/nodes no matter how long this process has
+	 * been idle -- while still guaranteeing strict per-process monotonicity
+	 * (advances by at least 1 even if the wall clock hasn't ticked forward,
+	 * e.g. multiple writes within the same millisecond).
+	 */
 	private CVMLong now() {
-		return CVMLong.create(WRITE_SEQ.incrementAndGet());
+		long prev;
+		long next;
+		do {
+			prev = WRITE_SEQ.get();
+			next = Math.max(prev + 1, System.currentTimeMillis());
+		} while (!WRITE_SEQ.compareAndSet(prev, next));
+		return CVMLong.create(next);
 	}
 
 	/**
@@ -449,19 +484,31 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		return table.insertRows(sorted, ts);
 	}
 
-	/** Selects a row by primary key. */
+	/** Selects a row by primary key. Single-column PK only — use the List overload for composite keys. */
 	public AVector<ACell> selectByKey(String tableName, ACell primaryKey) {
 		return selectByKey(Strings.create(tableName), primaryKey);
 	}
 
 	public AVector<ACell> selectByKey(AString tableName, ACell primaryKey) {
+		return selectByKey(tableName, List.of(primaryKey));
+	}
+
+	/**
+	 * Selects a row by a (possibly composite) primary key — one ACell per PK
+	 * column, in column order. For a single-column PK, pass a singleton list.
+	 */
+	public AVector<ACell> selectByKey(String tableName, List<ACell> keyParts) {
+		return selectByKey(Strings.create(tableName), keyParts);
+	}
+
+	public AVector<ACell> selectByKey(AString tableName, List<ACell> keyParts) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return null;
 
 		Index<ABlob, ACell> rows = table.getRows();
 		if (rows == null) return null;
 
-		ABlob pk = toKey(primaryKey);
+		ABlob pk = toCompositeKey(Vectors.create(keyParts), keyParts.size());
 		ABlob bk = RowBlock.blockKey(pk);
 		ACell block = rows.get(bk);
 		AVector<ACell> row = RowBlock.get(block, pk);
@@ -469,15 +516,27 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		return SQLRow.getValues(row);
 	}
 
-	/** Deletes a row by primary key. */
+	/** Deletes a row by primary key. Single-column PK only — use the List overload for composite keys. */
 	public boolean deleteByKey(String tableName, ACell primaryKey) {
 		return deleteByKey(Strings.create(tableName), primaryKey);
 	}
 
 	public boolean deleteByKey(AString tableName, ACell primaryKey) {
+		return deleteByKey(tableName, List.of(primaryKey));
+	}
+
+	/**
+	 * Deletes a row by a (possibly composite) primary key — one ACell per PK
+	 * column, in column order. For a single-column PK, pass a singleton list.
+	 */
+	public boolean deleteByKey(String tableName, List<ACell> keyParts) {
+		return deleteByKey(Strings.create(tableName), keyParts);
+	}
+
+	public boolean deleteByKey(AString tableName, List<ACell> keyParts) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
-		ABlob key = toKey(primaryKey);
+		ABlob key = toCompositeKey(Vectors.create(keyParts), keyParts.size());
 		return table.deleteRow(key, now());
 	}
 

@@ -111,6 +111,80 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 		callback.accept(dbName);
 	}
 
+	/**
+	 * A request from another node asking this node to push its own future
+	 * writes back to the requester, made via the {@code REGISTER PEER}
+	 * statement (regex-intercepted in {@code ConvexMeta}, same pattern as
+	 * {@code REPLICATE DB}).
+	 *
+	 * @param host requester's own reachable hostname
+	 * @param port requester's own native lattice/peer wire-protocol port (not its SQL/PG port)
+	 * @param accountKeyHex requester's own AccountKey, hex-encoded
+	 */
+	public record PeerRegistration(String host, int port, String accountKeyHex) {}
+
+	/**
+	 * Handler for the {@code REGISTER PEER '<host>' <port> '<keyHex>'}
+	 * statement. Exists to close the "ongoing gossip is one-directional" gap:
+	 * a node that pulls from a peer registers that peer as an outbound target
+	 * on its own propagator (so its own future writes push out), but nothing
+	 * previously told the SOURCE peer to do the same back — so the source's
+	 * own subsequent writes never reached the puller without an explicit
+	 * re-pull. A node now calls REGISTER PEER against whatever it just synced
+	 * from, right after a successful pull, so the source starts pushing back
+	 * too. Same non-swallowing behaviour as {@link #onReplicateDb} — this IS
+	 * the operation, not a post-hoc refresh.
+	 */
+	public static volatile Consumer<PeerRegistration> onRegisterPeer;
+
+	/**
+	 * Invokes {@link #onRegisterPeer}, letting any exception it throws
+	 * propagate to the caller.
+	 *
+	 * @throws IllegalStateException if no handler is registered
+	 */
+	public static void fireRegisterPeer(String host, int port, String accountKeyHex) {
+		Consumer<PeerRegistration> callback = onRegisterPeer;
+		if (callback == null) {
+			throw new IllegalStateException("REGISTER PEER is not supported in this environment (no handler registered)");
+		}
+		callback.accept(new PeerRegistration(host, port, accountKeyHex));
+	}
+
+	/**
+	 * A request to replicate a single named schema within a db, made via the
+	 * {@code REPLICATE SCHEMA "<db>.<schema>"} statement (regex-intercepted
+	 * in {@code ConvexMeta}, same pattern as {@code REPLICATE DB}).
+	 *
+	 * @param dbName db the schema belongs to
+	 * @param schemaName the specific schema to replicate
+	 */
+	public record SchemaReplication(String dbName, String schemaName) {}
+
+	/**
+	 * Handler for the {@code REPLICATE SCHEMA "<db>.<schema>"} statement —
+	 * the schema-granularity counterpart to {@link #onReplicateDb}, for
+	 * replicating just one schema within a db rather than every schema that
+	 * db happens to hold. Same non-swallowing behaviour as
+	 * {@link #onReplicateDb} — this IS the operation, not a post-hoc
+	 * refresh, so a failure must be visible to the client as a query error.
+	 */
+	public static volatile Consumer<SchemaReplication> onReplicateSchema;
+
+	/**
+	 * Invokes {@link #onReplicateSchema}, letting any exception it throws
+	 * propagate to the caller.
+	 *
+	 * @throws IllegalStateException if no handler is registered
+	 */
+	public static void fireReplicateSchema(String dbName, String schemaName) {
+		Consumer<SchemaReplication> callback = onReplicateSchema;
+		if (callback == null) {
+			throw new IllegalStateException("REPLICATE SCHEMA is not supported in this environment (no handler registered)");
+		}
+		callback.accept(new SchemaReplication(dbName, schemaName));
+	}
+
 	public static final SqlParserImplFactory PARSER_FACTORY =
 		new SqlParserImplFactory() {
 			@Override public SqlAbstractParserImpl getParser(Reader stream) {
@@ -173,7 +247,8 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 
 		SQLDatabase newDb = cdb.database(registeredName);
 		cdb.register(registeredName);
-		rootSchema.add(registeredName, new ConvexSchema(newDb, registeredName));
+		// See ConvexDriver.connect's own comment on disabling schema caching.
+		rootSchema.add(registeredName, new ConvexSchema(newDb, registeredName)).setCache(false);
 		fireDdlExecuted(cdb);
 	}
 

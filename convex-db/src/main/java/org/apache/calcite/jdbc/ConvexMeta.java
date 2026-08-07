@@ -88,6 +88,22 @@ public class ConvexMeta extends CalciteMetaImpl {
 	private static final Pattern REPLICATE_DB = Pattern.compile(
 		"(?i)REPLICATE\\s+DB\\s+['\"]?(\\w+)['\"]?\\s*");
 
+	// REGISTER PEER 'host' port 'keyHex' — asks THIS connection's node to
+	// push its own future writes back to the requester; see
+	// ConvexDdlExecutor.onRegisterPeer for why this exists (closing the
+	// one-directional-gossip gap: syncing FROM a peer never used to tell
+	// that peer to sync back).
+	private static final Pattern REGISTER_PEER = Pattern.compile(
+		"(?i)REGISTER\\s+PEER\\s+['\"]?([\\w.\\-]+)['\"]?\\s+(\\d+)\\s+['\"]?([0-9a-fA-F]+)['\"]?\\s*");
+
+	// REPLICATE SCHEMA "<db>.<schema>" (or unquoted) — the schema-granularity
+	// counterpart to REPLICATE DB: replicates one named schema within a db,
+	// not every schema that db holds. See ConvexDdlExecutor.onReplicateSchema
+	// for why this only has any effect when REPLICATE DB was never issued
+	// for the containing db (a whole-db link already covers every schema in it).
+	private static final Pattern REPLICATE_SCHEMA = Pattern.compile(
+		"(?i)REPLICATE\\s+SCHEMA\\s+['\"]?(\\w+)\\.(\\w+)['\"]?\\s*");
+
 	@Override
 	public ExecuteResult prepareAndExecute(StatementHandle h, String sql,
 			long maxRowCount, int maxRowsInFirstFrame, PrepareCallback callback)
@@ -132,7 +148,86 @@ public class ConvexMeta extends CalciteMetaImpl {
 					MetaResultSet.count(h.connectionId, h.id, 0L)));
 		}
 
-		return super.prepareAndExecute(h, sql, maxRowCount, maxRowsInFirstFrame, callback);
+		m = REGISTER_PEER.matcher(sql.trim());
+		if (m.matches()) {
+			String host = m.group(1);
+			int port = Integer.parseInt(m.group(2));
+			String keyHex = m.group(3);
+			ConvexDdlExecutor.fireRegisterPeer(host, port, keyHex);
+			return new ExecuteResult(Collections.singletonList(
+					MetaResultSet.count(h.connectionId, h.id, 0L)));
+		}
+
+		m = REPLICATE_SCHEMA.matcher(sql.trim());
+		if (m.matches()) {
+			String dbName = m.group(1);
+			String schemaName = m.group(2);
+			ConvexDdlExecutor.fireReplicateSchema(dbName, schemaName);
+			return new ExecuteResult(Collections.singletonList(
+					MetaResultSet.count(h.connectionId, h.id, 0L)));
+		}
+
+		ExecuteResult result = super.prepareAndExecute(h, sql, maxRowCount, maxRowsInFirstFrame, callback);
+		syncIfAutoCommit();
+		return result;
+	}
+
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>Overridden for the same reason as {@link #prepareAndExecute} below --
+	 * a bound {@code PreparedStatement} (unlike a fresh simple-query string)
+	 * goes through this entry point instead.
+	 */
+	@Override
+	public ExecuteResult execute(StatementHandle h, java.util.List<org.apache.calcite.avatica.remote.TypedValue> parameterValues,
+			int maxRowsInFirstFrame) throws NoSuchStatementException {
+		ExecuteResult result = super.execute(h, parameterValues, maxRowsInFirstFrame);
+		syncIfAutoCommit();
+		return result;
+	}
+
+	/**
+	 * Syncs the current schema's database cursor after every autocommit
+	 * statement -- publishing it to {@code LatticePropagator} for ongoing
+	 * gossip to peers.
+	 *
+	 * <p>Found live 2026-08-06 diagnosing "dev"/"meta" dbase nodes never
+	 * catching up on each other's writes without a restart: {@link #commit}
+	 * below only ever synced {@link #txDatabase}, which is only non-null
+	 * during an explicit manual transaction ({@code setAutoCommit(false)} ...
+	 * {@code COMMIT}). Autocommit -- the JDBC default, and what {@code psql}'s
+	 * simple-query protocol and virtually every ordinary client actually
+	 * use -- forked nothing and therefore synced nothing: every INSERT/UPDATE/
+	 * DELETE wrote directly into the live, unforked database (so local reads
+	 * on the SAME node saw it immediately) but never told the node's own
+	 * propagator anything had changed, so it never got announced, persisted
+	 * for restart-durability, or broadcast to peers at all -- not "broadcast
+	 * and failed", genuinely never attempted. A restart happened to "fix" this
+	 * because a fresh boot's {@code pullPath} reads the target's current state
+	 * directly, a completely different, always-synchronous mechanism.
+	 *
+	 * <p>Called unconditionally after every statement (including SELECTs) for
+	 * simplicity and safety -- {@code sync()} on an unchanged cursor is cheap
+	 * (novelty-tracking finds nothing new to announce or broadcast). Skipped
+	 * entirely while {@link #autoCommit} is false: an in-progress manual
+	 * transaction's writes belong to {@link #txDatabase} and must not become
+	 * visible to peers (or even to this node's own non-transactional readers)
+	 * until {@link #commit} explicitly syncs it.
+	 */
+	private void syncIfAutoCommit() {
+		if (!autoCommit) return;
+		try {
+			SQLDatabase db = findDatabase();
+			if (db != null) db.sync();
+		} catch (Exception e) {
+			// Best-effort: the statement itself already succeeded and its
+			// result is already on its way back to the client: a
+			// publish/broadcast failure here must not turn into a client-
+			// visible statement failure. Matches the tolerance shown
+			// elsewhere in this class and in DbaseServer's own peer-sync
+			// helpers for the same class of best-effort operation.
+		}
 	}
 
 	/** Syncs fork to parent, then starts a new fork if still in manual-commit mode. */
@@ -210,7 +305,10 @@ public class ConvexMeta extends CalciteMetaImpl {
 		txDatabase = db.fork();
 
 		ConvexSchema txSchema = new ConvexSchema(txDatabase, schemaName);
-		calciteConnection.getRootSchema().add(schemaName, txSchema);
+		// See ConvexDriver.connect's own comment on setCacheEnabled(false) --
+		// same reasoning applies to every schema mount, not just the initial
+		// connection-time ones.
+		calciteConnection.getRootSchema().add(schemaName, txSchema).setCacheEnabled(false);
 	}
 
 	/** Restores the original schema and discards the fork. */
@@ -219,7 +317,7 @@ public class ConvexMeta extends CalciteMetaImpl {
 
 		String schemaName = getSchemaName();
 		if (schemaName != null && originalSchema != null) {
-			calciteConnection.getRootSchema().add(schemaName, originalSchema);
+			calciteConnection.getRootSchema().add(schemaName, originalSchema).setCacheEnabled(false);
 		}
 		txDatabase = null;
 		originalSchema = null;

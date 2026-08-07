@@ -133,7 +133,21 @@ public class ConvexDriver extends Driver {
 			SQLDatabase db = cdb.database(parsed.database);
 			ConvexSchema schema = new ConvexSchema(db, parsed.database);
 			SchemaPlus rootSchema = calciteConn.getRootSchema();
-			rootSchema.add(parsed.database, schema);
+			// Calcite's own CalciteSchema wrapper caches table/subschema
+			// lookups by default, on top of whatever caching (none) our own
+			// ConvexSchema.getTableMap() does -- meaning a table added live to
+			// an underlying SQLDatabase (e.g. via a live REPLICATE DB or
+			// CREATE TABLE on a DIFFERENT, already-open connection) would
+			// silently stay invisible to THIS connection until it happened to
+			// get closed and reopened. Disabled here since ConvexSchema's own
+			// lookups are already cheap/live (a HashMap-backed getTableNames()
+			// call, not a real remote or expensive query) — Calcite's cache
+			// buys nothing for this schema implementation and costs
+			// correctness. Found live 2026-08-07: a REPLICATE DB run on an
+			// already-open psql session left the new table unqueryable in
+			// that same session even though the data had genuinely arrived
+			// and a fresh connection saw it immediately.
+			rootSchema.add(parsed.database, schema).setCacheEnabled(false);
 			calciteConn.setSchema(parsed.database);
 
 			// Also mount every other currently-registered database as a
@@ -146,7 +160,8 @@ public class ConvexDriver extends Driver {
 				if (otherName.equals(parsed.database)) continue;
 				ConvexDB otherCdb = ConvexDB.lookup(otherName);
 				if (otherCdb == null) continue;
-				rootSchema.add(otherName, new ConvexSchema(otherCdb.database(otherName), otherName));
+				rootSchema.add(otherName, new ConvexSchema(otherCdb.database(otherName), otherName))
+					.setCacheEnabled(false);
 			}
 		}
 
