@@ -24,7 +24,7 @@ import convex.core.util.Utils;
  * <p>Growth tuning is deliberately local to this implementation. These values
  * affect only allocation and mapping frequency, not the Etch file format.</p>
  */
-final class FFMEtchFileMapper implements EtchFileMapper {
+final class FFMFileMapper extends AFileMapper {
 	/** Shift used for direct address-to-region conversion. */
 	private static final int REGION_SHIFT=30;
 
@@ -63,17 +63,31 @@ final class FFMEtchFileMapper implements EtchFileMapper {
 
 	private static final VarHandle ALIGNED_LONG=
 			ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN).varHandle();
+	private static final ValueLayout.OfLong UNALIGNED_LONG=
+			ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
 	private final FileChannel channel;
+	private final boolean readOnly;
 	private volatile Mapping[] mappings=EMPTY_MAPPINGS;
 	private volatile boolean closed;
 
-	FFMEtchFileMapper(FileChannel channel) {
+	FFMFileMapper(FileChannel channel) throws IOException {
+		this(channel,false,channel.size(),"memory-segment");
+	}
+
+	FFMFileMapper(FileChannel channel, boolean readOnly) throws IOException {
+		this(channel,readOnly,channel.size(),"memory-segment");
+	}
+
+	FFMFileMapper(FileChannel channel, boolean readOnly, long length, String fileName)
+			throws IOException {
+		super(fileName,length,channel.size(),readOnly);
 		this.channel=channel;
+		this.readOnly=readOnly;
 	}
 
 	@Override
-	public long readIndexSlotAcquire(long position) throws IOException {
+	long readLongAcquireMapped(long position) throws IOException {
 		checkAtomicLong(position);
 		ensureMapped(position,Long.BYTES,false);
 		Mapping current=mappingFor(position,null);
@@ -87,7 +101,7 @@ final class FFMEtchFileMapper implements EtchFileMapper {
 	}
 
 	@Override
-	public void get(long position, byte[] destination, int offset, int length) throws IOException {
+	void readMapped(long position, byte[] destination, int offset, int length) throws IOException {
 		checkRange(position,length);
 		if (length==0) return;
 		ensureMapped(position,length,false);
@@ -113,7 +127,78 @@ final class FFMEtchFileMapper implements EtchFileMapper {
 	}
 
 	@Override
-	public void writeIndexSlotRelease(long position, long value) throws IOException {
+	boolean matchesMapped(long position, byte[] expected, int offset, int length) throws IOException {
+		checkRange(position,length);
+		if (length==0) return true;
+		ensureMapped(position,length,false);
+
+		long currentPosition=position;
+		int expectedOffset=offset;
+		int remaining=length;
+		Mapping current=mappingFor(currentPosition,null);
+		while (remaining>0) {
+			int count=(int)Math.min(remaining,current.end()-currentPosition);
+			int compared=0;
+			try {
+				long segmentOffset=current.offset(currentPosition);
+				while (compared+Long.BYTES<=count) {
+					long actual=current.segment.get(UNALIGNED_LONG,segmentOffset+compared);
+					long wanted=Utils.readLong(expected,expectedOffset+compared,Long.BYTES);
+					if (actual!=wanted) return false;
+					compared+=Long.BYTES;
+				}
+				while (compared<count) {
+					byte actual=current.segment.get(ValueLayout.JAVA_BYTE,segmentOffset+compared);
+					if (actual!=expected[expectedOffset+compared]) return false;
+					compared++;
+				}
+			} catch (IllegalStateException e) {
+				current=mappingFor(currentPosition,current);
+				continue;
+			}
+			currentPosition+=count;
+			expectedOffset+=count;
+			remaining-=count;
+			if (remaining>0) current=mappingFor(currentPosition,null);
+		}
+		return true;
+	}
+
+	@Override
+	void readTransformedMapped(long position, byte[] destination, int offset, int length,
+			EtchFileCipher cipher) throws IOException {
+		checkRange(position,length);
+		if (length==0) return;
+		ensureMapped(position,length,false);
+
+		long currentPosition=position;
+		int currentOffset=offset;
+		int remaining=length;
+		Mapping current=mappingFor(currentPosition,null);
+		while (remaining>0) {
+			int count=(int)Math.min(remaining,current.end()-currentPosition);
+			ByteBuffer input;
+			try {
+				input=current.segment.asSlice(current.offset(currentPosition),count).asByteBuffer();
+			} catch (IllegalStateException e) {
+				current=mappingFor(currentPosition,current);
+				continue;
+			}
+			try {
+				cipher.decrypt(input,destination,currentOffset);
+			} catch (IllegalStateException e) {
+				// Retrying could reuse the wrong part of the cipher stream.
+				throw new IOException("Etch mapping changed during encrypted read",e);
+			}
+			currentPosition+=count;
+			currentOffset+=count;
+			remaining-=count;
+			if (remaining>0) current=mappingFor(currentPosition,null);
+		}
+	}
+
+	@Override
+	void writeLongReleaseMapped(long position, long value) throws IOException {
 		checkAtomicLong(position);
 		ensureMapped(position,Long.BYTES,true);
 		Mapping current=mappingFor(position,null);
@@ -128,12 +213,12 @@ final class FFMEtchFileMapper implements EtchFileMapper {
 	}
 
 	@Override
-	public void ensureWriteCapacity(long position, long length) throws IOException {
+	void ensureMapped(long position, long length) throws IOException {
 		ensureMapped(position,length,true);
 	}
 
 	@Override
-	public void put(long position, byte[] source, int offset, int length) {
+	void writeMapped(long position, byte[] source, int offset, int length) {
 		if (length==0) return;
 
 		long currentPosition=position;
@@ -148,6 +233,37 @@ final class FFMEtchFileMapper implements EtchFileMapper {
 			} catch (IllegalStateException e) {
 				current=mappingFor(currentPosition,current);
 				continue;
+			}
+			currentPosition+=count;
+			currentOffset+=count;
+			remaining-=count;
+			if (remaining>0) current=mappingFor(currentPosition,null);
+		}
+	}
+
+	@Override
+	void writeTransformedMapped(long position, byte[] source, int offset, int length,
+			EtchFileCipher cipher) throws IOException {
+		if (length==0) return;
+
+		long currentPosition=position;
+		int currentOffset=offset;
+		int remaining=length;
+		Mapping current=mappingFor(currentPosition,null);
+		while (remaining>0) {
+			int count=(int)Math.min(remaining,current.end()-currentPosition);
+			ByteBuffer output;
+			try {
+				output=current.segment.asSlice(current.offset(currentPosition),count).asByteBuffer();
+			} catch (IllegalStateException e) {
+				current=mappingFor(currentPosition,current);
+				continue;
+			}
+			try {
+				cipher.encrypt(source,currentOffset,output);
+			} catch (IllegalStateException e) {
+				// Retrying could reuse the wrong part of the cipher stream.
+				throw new IOException("Etch mapping changed during encrypted write",e);
 			}
 			currentPosition+=count;
 			currentOffset+=count;
@@ -213,7 +329,7 @@ final class FFMEtchFileMapper implements EtchFileMapper {
 		Arena arena=Arena.ofShared();
 		MemorySegment segment;
 		try {
-			segment=channel.map(MapMode.READ_WRITE,start,target,arena);
+			segment=channel.map(readOnly?MapMode.READ_ONLY:MapMode.READ_WRITE,start,target,arena);
 		} catch (IOException | RuntimeException e) {
 			arena.close();
 			throw e;
@@ -299,10 +415,30 @@ final class FFMEtchFileMapper implements EtchFileMapper {
 	}
 
 	@Override
-	public synchronized void force() {
+	public synchronized void force() throws IOException {
 		if (closed) throw new IllegalStateException("Etch mapping is closed");
+		if (readOnly) return;
 		for (Mapping mapping:mappings) {
 			if (mapping!=null) mapping.segment.force();
+		}
+		channel.force(false);
+	}
+
+	@Override
+	synchronized void forceRangeMapped(long position, long length) throws IOException {
+		checkRange(position,length);
+		if (closed) throw new IllegalStateException("Etch mapping is closed");
+		if (readOnly) return;
+		long end=position+length;
+		long current=position;
+		while (current<end) {
+			int index=regionIndex(current);
+			Mapping mapping=(index<mappings.length)?mappings[index]:null;
+			if (mapping==null) throw new IOException("Etch force range is not mapped: "+current);
+			long count=Math.min(end-current,mapping.end()-current);
+			if (count<=0L) throw new IOException("Etch force range exceeds mapping: "+current);
+			mapping.segment.asSlice(mapping.offset(current),count).force();
+			current+=count;
 		}
 	}
 
