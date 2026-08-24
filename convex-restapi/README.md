@@ -20,14 +20,14 @@ HTTP REST API server for accessing the [Convex](https://convex.world) network vi
 <dependency>
     <groupId>world.convex</groupId>
     <artifactId>convex-restapi</artifactId>
-    <version>0.8.11</version>
+    <version>0.8.15</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'world.convex:convex-restapi:0.8.11'
+implementation 'world.convex:convex-restapi:0.8.15'
 ```
 
 ## Usage
@@ -96,7 +96,7 @@ where possible so the private key never leaves the client.
 ```bash
 git clone https://github.com/Convex-Dev/convex.git
 cd convex
-mvn install -pl convex-restapi -am
+./mvnw -B -T1C install -pl convex-restapi -am
 ```
 
 ## License

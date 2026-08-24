@@ -1277,6 +1277,37 @@ public class Core {
 		}
 	});
 
+	/**
+	 * Predicate for Character values (#92), completing the type-predicate family
+	 * alongside {@code double?} etc.
+	 *
+	 * <p>NOT part of the genesis environment: installed into the core environment by
+	 * the v1 upgrade migration. Unlike codes 501–505, this definition is
+	 * <b>version-gated</b>: applied before v1 activation it fails with a
+	 * {@code :CAST} (function) error, charging nothing — mirroring releases without
+	 * code 506, which cannot materialise the cell as a function. The residual skew
+	 * against such releases is the juice consumed evaluating arguments, the
+	 * accepted class of UPGRADE.md's policy item 1. See the code 506 policy entry
+	 * in UPGRADE.md.</p>
+	 */
+	public static final CoreFn<CVMBool> CHAR_Q = regNonGenesis(new CorePred(Symbols.CHAR_Q,506) {
+		private static final long INTRODUCED_VERSION = 1;
+
+		@Override
+		public Context invoke(Context context, ACell[] args) {
+			// Version gate first, before arity or any other work, charging nothing
+			if (context.getState().getProtocolVersion() < INTRODUCED_VERSION) {
+				return context.withCastError(this, Types.FUNCTION);
+			}
+			return super.invoke(context, args);
+		}
+
+		@Override
+		public boolean test(ACell val) {
+			return val instanceof CVMChar;
+		}
+	});
+
 	public static final CoreFn<CVMLong> CREATE_PEER = reg(new CoreFn<>(Symbols.CREATE_PEER,65) {
 		
 		@Override
@@ -2186,7 +2217,7 @@ public class Core {
 			}
 			
 			ANumeric result = RT.plus(args);
-			if (result==null) return context.withError(ErrorMessages.INVALID_NUMERIC);
+			if (result==null) return context.withError(ErrorValue.INVALID_NUMERIC);
 			return context.withResult(Juice.ARITHMETIC, result);
 		}
 	});
@@ -2204,7 +2235,7 @@ public class Core {
 				if (context.isExceptional()) return context; // not not exceptional, might be something else
 			}
 			ANumeric result = RT.minus(args);
-			if (result==null) return context.withError(ErrorMessages.INVALID_NUMERIC);
+			if (result==null) return context.withError(ErrorValue.INVALID_NUMERIC);
 			return context.withResult(Juice.ARITHMETIC, result);
 		}
 	});
@@ -2230,7 +2261,7 @@ public class Core {
 			}
 
 			ANumeric result = RT.multiply(args);
-			if (result == null) return context.withError(ErrorMessages.INVALID_NUMERIC);
+			if (result == null) return context.withError(ErrorValue.INVALID_NUMERIC);
 			return context.withResult(Juice.ARITHMETIC, result);
 		}
 	});
@@ -2292,7 +2323,7 @@ public class Core {
 				int badVal=RT.findNonNumeric(args);
 				if (badVal<0) {
 					// this can happen for the minimum big integer value only
-					return context.withError(ErrorMessages.INVALID_NUMERIC);
+					return context.withError(ErrorValue.INVALID_NUMERIC);
 				}
 				return context.withCastError(badVal,args, Types.NUMBER);
 			}

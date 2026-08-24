@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
@@ -17,6 +18,7 @@ import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.nio.file.ProviderMismatchException;
 import java.nio.file.StandardCopyOption;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.Test;
 
@@ -24,33 +26,76 @@ import convex.core.data.ACell;
 import convex.core.data.AVector;
 import convex.core.data.Strings;
 import convex.core.data.prim.CVMLong;
+import convex.lattice.LatticeContext;
 import convex.lattice.fs.impl.DLFSLocal;
 
 public class DLFSMoveCopyTest {
+	private static void setContextTime(DLFSLocal fs, long timestamp) {
+		fs.getCursor().setContext(fs.getCursor().getContext().withTimestamp(CVMLong.create(timestamp)));
+	}
+
+	@Test
+	public void testLogicalMutationResolvesDynamicTimestampOnce() throws IOException {
+		DLFSLocal fs=DLFS.create();
+		AtomicLong clock=new AtomicLong(100);
+		fs.getCursor().setContext(new LatticeContext() {
+			@Override public CVMLong currentTimestamp() {
+				return CVMLong.create(clock.incrementAndGet());
+			}
+		});
+
+		DLPath source=(DLPath)Files.createDirectory(fs.getPath("/source"));
+		assertEquals(101L,DLFSNode.getUTime(fs.getNode(source)).longValue());
+		assertEquals(101L,DLFSNode.getUTime(fs.getNode(fs.getRoot())).longValue());
+		assertEquals(101L,clock.get(),"one policy resolution for create");
+
+		DLPath target=fs.getPath("/target");
+		Files.move(source,target);
+		assertEquals(102L,DLFSNode.getUTime(fs.getNode(target)).longValue());
+		assertEquals(102L,
+			DLFSNode.getTombstones(fs.getNode(fs.getRoot())).get(Strings.create("source")).longValue());
+		assertEquals(102L,clock.get(),"one policy resolution for move");
+	}
+
+	@Test
+	public void testMoveUsesConfiguredTimestampWithoutRatcheting() throws IOException {
+		DLFSLocal fs=DLFS.create();
+		setContextTime(fs,200);
+		DLPath source=(DLPath)Files.write(fs.getPath("/source"),new byte[] {1});
+
+		setContextTime(fs,100);
+		DLPath target=fs.getPath("/target");
+		Files.move(source,target);
+
+		assertEquals(CVMLong.create(100),DLFSNode.getUTime(fs.getNode(target)));
+		assertEquals(CVMLong.create(100),
+			DLFSNode.getTombstones(fs.getNode(fs.getRoot())).get(Strings.create("source")));
+	}
 
 	@Test
 	public void testFileMovePreservesNodeAndUpdatesDirectories() throws IOException {
 		DLFSLocal fs=DLFS.create();
-		fs.setTimestamp(CVMLong.create(10));
+		setContextTime(fs,10);
 		Path sourceDir=Files.createDirectory(fs.getPath("/source"));
 		Path targetDir=Files.createDirectory(fs.getPath("/target"));
 
-		fs.setTimestamp(CVMLong.create(100));
+		setContextTime(fs,100);
 		DLPath source=(DLPath)sourceDir.resolve("file.bin");
 		Files.write(source,new byte[] {1,2,3});
 		AVector<ACell> withMetadata=DLFSNode.withMetadata(fs.getNode(source),Strings.create("metadata"),CVMLong.create(100));
 		fs.updateNode(source,withMetadata);
 		AVector<ACell> original=fs.getNode(source);
 
-		fs.setTimestamp(CVMLong.create(200));
+		setContextTime(fs,200);
 		DLPath target=(DLPath)targetDir.resolve("renamed.bin");
 		Files.move(source,target,StandardCopyOption.ATOMIC_MOVE);
 
 		assertFalse(Files.exists(source));
-		assertSame(original,fs.getNode(target),"move must retain the exact immutable file node");
-		assertEquals(CVMLong.create(100),DLFSNode.getUTime(fs.getNode(target)));
+		assertNotSame(original,fs.getNode(target),"the moved node receives the move timestamp");
+		assertSame(DLFSNode.getData(original),DLFSNode.getData(fs.getNode(target)));
+		assertEquals(CVMLong.create(200),DLFSNode.getUTime(fs.getNode(target)));
 		assertEquals(Strings.create("metadata"),DLFSNode.getMetadata(fs.getNode(target)));
-		assertEquals(100L,Files.getLastModifiedTime(target).toMillis());
+		assertEquals(200L,Files.getLastModifiedTime(target).toMillis());
 		assertEquals(CVMLong.create(200),DLFSNode.getUTime(fs.getNode((DLPath)sourceDir)));
 		assertEquals(CVMLong.create(200),DLFSNode.getUTime(fs.getNode((DLPath)targetDir)));
 		assertEquals(CVMLong.create(200),DLFSNode.getUTime(fs.getNode(fs.getRoot())));
@@ -60,19 +105,20 @@ public class DLFSMoveCopyTest {
 	@Test
 	public void testDirectoryMovePreservesTreeAndUTime() throws IOException {
 		DLFSLocal fs=DLFS.create();
-		fs.setTimestamp(CVMLong.create(100));
+		setContextTime(fs,100);
 		DLPath source=(DLPath)Files.createDirectory(fs.getPath("/tree"));
 		Files.write(source.resolve("child.txt"),new byte[] {4,5,6});
 		AVector<ACell> original=fs.getNode(source);
 		CVMLong originalTime=DLFSNode.getUTime(original);
 
-		fs.setTimestamp(CVMLong.create(200));
+		setContextTime(fs,200);
 		DLPath target=fs.getPath("/renamed-tree");
 		Files.move(source,target,DLFSOption.RECURSIVE);
 
 		assertFalse(Files.exists(source));
-		assertSame(original,fs.getNode(target),"move must retain the complete immutable directory subtree");
-		assertEquals(originalTime,DLFSNode.getUTime(fs.getNode(target)));
+		assertNotSame(original,fs.getNode(target),"the moved root receives the move timestamp");
+		assertSame(DLFSNode.getDirectoryEntries(original),DLFSNode.getDirectoryEntries(fs.getNode(target)));
+		assertEquals(CVMLong.create(200),DLFSNode.getUTime(fs.getNode(target)));
 		assertArrayEquals(new byte[] {4,5,6},Files.readAllBytes(target.resolve("child.txt")));
 		assertEquals(CVMLong.create(200),DLFSNode.getUTime(fs.getNode(fs.getRoot())));
 	}
@@ -80,13 +126,13 @@ public class DLFSMoveCopyTest {
 	@Test
 	public void testFileCopyGetsNewUTimeAndSharesContent() throws IOException {
 		DLFSLocal fs=DLFS.create();
-		fs.setTimestamp(CVMLong.create(100));
+		setContextTime(fs,100);
 		DLPath source=(DLPath)Files.write(fs.getPath("/source.bin"),new byte[] {7,8,9});
 		AVector<ACell> withMetadata=DLFSNode.withMetadata(fs.getNode(source),Strings.create("metadata"),CVMLong.create(100));
 		fs.updateNode(source,withMetadata);
 		AVector<ACell> original=fs.getNode(source);
 
-		fs.setTimestamp(CVMLong.create(200));
+		setContextTime(fs,200);
 		DLPath target=fs.getPath("/copy.bin");
 		Files.copy(source,target);
 		AVector<ACell> copy=fs.getNode(target);
@@ -102,13 +148,13 @@ public class DLFSMoveCopyTest {
 	@Test
 	public void testDirectoryCopyIsShallowAndNew() throws IOException {
 		DLFSLocal fs=DLFS.create();
-		fs.setTimestamp(CVMLong.create(100));
+		setContextTime(fs,100);
 		DLPath source=(DLPath)Files.createDirectory(fs.getPath("/source"));
 		Files.write(source.resolve("child.txt"),new byte[] {1});
 		AVector<ACell> withMetadata=DLFSNode.withMetadata(fs.getNode(source),Strings.create("directory metadata"),CVMLong.create(100));
 		fs.updateNode(source,withMetadata);
 
-		fs.setTimestamp(CVMLong.create(200));
+		setContextTime(fs,200);
 		DLPath target=fs.getPath("/copy");
 		Files.copy(source,target);
 
@@ -121,9 +167,31 @@ public class DLFSMoveCopyTest {
 	}
 
 	@Test
+	public void testReplaceExistingCopySharesContent() throws IOException {
+		DLFSLocal fs=DLFS.create();
+		setContextTime(fs,100);
+		DLPath source=(DLPath)Files.write(fs.getPath("/source.bin"),new byte[] {7,8,9});
+		DLPath target=(DLPath)Files.write(fs.getPath("/target.bin"),new byte[] {1,2,3});
+		AVector<ACell> sourceNode=fs.getNode(source);
+
+		setContextTime(fs,200);
+		Files.copy(source,target,StandardCopyOption.REPLACE_EXISTING);
+		AVector<ACell> copy=fs.getNode(target);
+
+		assertSame(DLFSNode.getData(sourceNode),DLFSNode.getData(copy));
+		assertEquals(CVMLong.create(200),DLFSNode.getUTime(copy));
+		assertArrayEquals(new byte[] {7,8,9},Files.readAllBytes(target));
+
+		DLPath directory=(DLPath)Files.createDirectory(fs.getPath("/directory"));
+		Files.write(directory.resolve("child"),new byte[] {1});
+		assertThrows(DirectoryNotEmptyException.class,
+			()->Files.copy(source,directory,StandardCopyOption.REPLACE_EXISTING));
+	}
+
+	@Test
 	public void testRecursiveDirectoryCopySharesCompleteImmutableTree() throws IOException {
 		DLFSLocal fs=DLFS.create();
-		fs.setTimestamp(CVMLong.create(100));
+		setContextTime(fs,100);
 		DLPath source=(DLPath)Files.createDirectory(fs.getPath("/source"));
 		DLPath nested=(DLPath)Files.createDirectory(source.resolve("nested"));
 		DLPath sourceFile=(DLPath)Files.write(nested.resolve("file.bin"),new byte[] {1,2,3});
@@ -131,7 +199,7 @@ public class DLFSMoveCopyTest {
 		AVector<ACell> nestedNode=fs.getNode(nested);
 		AVector<ACell> fileNode=fs.getNode(sourceFile);
 
-		fs.setTimestamp(CVMLong.create(200));
+		setContextTime(fs,200);
 		DLPath target=fs.getPath("/copy");
 		Files.copy(source,target,DLFSOption.RECURSIVE);
 		AVector<ACell> targetNode=fs.getNode(target);
@@ -144,7 +212,7 @@ public class DLFSMoveCopyTest {
 		assertEquals(CVMLong.create(200),DLFSNode.getUTime(targetNode));
 		assertArrayEquals(new byte[] {1,2,3},Files.readAllBytes(target.resolve("nested/file.bin")));
 
-		fs.setTimestamp(CVMLong.create(300));
+		setContextTime(fs,300);
 		Files.write(target.resolve("nested/file.bin"),new byte[] {9});
 		assertArrayEquals(new byte[] {1,2,3},Files.readAllBytes(sourceFile));
 		assertArrayEquals(new byte[] {9},Files.readAllBytes(target.resolve("nested/file.bin")));
@@ -166,8 +234,28 @@ public class DLFSMoveCopyTest {
 		assertThrows(NoSuchFileException.class,()->Files.move(fs.getPath("/source"),fs.getPath("/missing/new")));
 		assertThrows(NotDirectoryException.class,()->Files.move(fs.getPath("/source"),fs.getPath("/parent-file/new")));
 		assertThrows(FileSystemException.class,()->Files.move(fs.getPath("/tree"),fs.getPath("/tree/child/moved")));
-		assertThrows(UnsupportedOperationException.class,
-			()->Files.move(fs.getPath("/source"),fs.getPath("/new"),StandardCopyOption.REPLACE_EXISTING));
+	}
+
+	@Test
+	public void testReplaceExistingMoveSharesContent() throws IOException {
+		DLFSLocal fs=DLFS.create();
+		setContextTime(fs,100);
+		DLPath source=(DLPath)Files.write(fs.getPath("/source"),new byte[] {1,2,3});
+		DLPath target=(DLPath)Files.write(fs.getPath("/target"),new byte[] {9});
+		AVector<ACell> sourceNode=fs.getNode(source);
+
+		setContextTime(fs,200);
+		Files.move(source,target,StandardCopyOption.REPLACE_EXISTING);
+
+		assertFalse(Files.exists(source));
+		assertSame(DLFSNode.getData(sourceNode),DLFSNode.getData(fs.getNode(target)));
+		assertEquals(CVMLong.create(200),DLFSNode.getUTime(fs.getNode(target)));
+		assertArrayEquals(new byte[] {1,2,3},Files.readAllBytes(target));
+
+		DLPath directory=(DLPath)Files.createDirectory(fs.getPath("/directory"));
+		Files.write(directory.resolve("child"),new byte[] {1});
+		assertThrows(DirectoryNotEmptyException.class,
+			()->Files.move(target,directory,StandardCopyOption.REPLACE_EXISTING));
 	}
 
 	@Test
@@ -204,12 +292,12 @@ public class DLFSMoveCopyTest {
 	public void testMovedSourceTombstoneConvergesAfterReplication() throws IOException {
 		DLFSLocal a=DLFS.create();
 		DLFSLocal b=DLFS.create();
-		a.setTimestamp(CVMLong.create(100));
+		setContextTime(a,100);
 		DLPath source=(DLPath)Files.write(a.getPath("/source"),new byte[] {1,2,3});
 		AVector<ACell> original=a.getNode(source);
 		b.replicate(a);
 
-		a.setTimestamp(CVMLong.create(200));
+		setContextTime(a,200);
 		DLPath target=a.getPath("/target");
 		Files.move(source,target);
 		b.replicate(a);
@@ -217,9 +305,51 @@ public class DLFSMoveCopyTest {
 
 		assertFalse(Files.exists(a.getPath("/source")));
 		assertFalse(Files.exists(b.getPath("/source")));
-		assertSame(original,a.getNode(target));
-		assertEquals(CVMLong.create(100),DLFSNode.getUTime(b.getNode(b.getPath("/target"))));
+		assertSame(DLFSNode.getData(original),DLFSNode.getData(a.getNode(target)));
+		assertEquals(CVMLong.create(200),DLFSNode.getUTime(b.getNode(b.getPath("/target"))));
 		assertEquals(CVMLong.create(200),DLFSNode.getTombstones(b.getNode(b.getRoot())).get(Strings.create("source")));
+		assertEquals(a.getRootHash(),b.getRootHash());
+	}
+
+	@Test
+	public void testMoveWinsOlderDestinationTombstoneAfterReplication() throws IOException {
+		DLFSLocal a=DLFS.create();
+		DLFSLocal b=DLFS.create();
+		setContextTime(a,100);
+		Files.write(a.getPath("/source"),new byte[] {1,2,3});
+		b.replicate(a);
+
+		setContextTime(b,150);
+		Files.write(b.getPath("/target"),new byte[] {9});
+		Files.delete(b.getPath("/target"));
+		setContextTime(a,200);
+		Files.move(a.getPath("/source"),a.getPath("/target"));
+
+		a.replicate(b);
+		b.replicate(a);
+		assertFalse(Files.exists(a.getPath("/source")));
+		assertArrayEquals(new byte[] {1,2,3},Files.readAllBytes(a.getPath("/target")));
+		assertEquals(a.getRootHash(),b.getRootHash());
+	}
+
+	@Test
+	public void testNewerDestinationTombstoneWinsMovedNode() throws IOException {
+		DLFSLocal a=DLFS.create();
+		DLFSLocal b=DLFS.create();
+		setContextTime(a,100);
+		Files.write(a.getPath("/source"),new byte[] {1,2,3});
+		b.replicate(a);
+
+		setContextTime(a,200);
+		Files.move(a.getPath("/source"),a.getPath("/target"));
+		setContextTime(b,250);
+		Files.write(b.getPath("/target"),new byte[] {9});
+		Files.delete(b.getPath("/target"));
+
+		a.replicate(b);
+		b.replicate(a);
+		assertFalse(Files.exists(a.getPath("/source")));
+		assertFalse(Files.exists(a.getPath("/target")));
 		assertEquals(a.getRootHash(),b.getRootHash());
 	}
 }

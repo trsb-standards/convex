@@ -230,17 +230,7 @@ public class DLFSBrowser extends AbstractGUI {
 		fileMenu.add(Toolkit.makeMenu("Change Store...", this::promptChangeStore));
 		fileMenu.addSeparator();
 		fileMenu.add(Toolkit.makeMenu("Explore Node...", () -> {
-			DLFileSystem drive = getCurrentDrive();
-			if (drive == null) return;
-			Path p = panel.getSelectedPath();
-			if (p instanceof DLPath) {
-				AVector<ACell> node = drive.getNode((DLPath) p);
-				if (node != null) {
-					StateExplorer.explore(node);
-				} else {
-					StateExplorer.explore(drive.getNode(drive.getRoot()));
-				}
-			}
+			panel.exploreSelectedNode();
 			panel.refreshView();
 		}));
 		fileMenu.add(Toolkit.makeMenu("New Folder...", () -> panel.promptNewFolder()));
@@ -318,7 +308,6 @@ public class DLFSBrowser extends AbstractGUI {
 					String name = entry.getKey().toString();
 					ALatticeCursor<AVector<ACell>> driveCursor = drivesCursor.path(entry.getKey());
 					DLFSLocal driveFS = new DLFSLocal(DLFS.provider(), name, driveCursor);
-					driveFS.updateTimestamp();
 					drives.put(name, driveFS);
 				}
 				log.info("Restored {} drives from store: {}", drives.size(), file);
@@ -396,7 +385,6 @@ public class DLFSBrowser extends AbstractGUI {
 		driveCursor.set(DLFSNode.createDirectory(CVMLong.ZERO));
 
 		DLFSLocal driveFS = new DLFSLocal(DLFS.provider(), name, driveCursor);
-		driveFS.updateTimestamp();
 		drives.put(name, driveFS);
 
 		// Register in WebDAV if running
@@ -528,7 +516,7 @@ public class DLFSBrowser extends AbstractGUI {
 
 	private void startWebDAV() {
 		try {
-			webdavServer = DLFSServer.create(null);
+			webdavServer = DLFSServer.createEphemeral();
 			// Seed all existing lattice-backed drives
 			for (Map.Entry<String, DLFSLocal> entry : drives.entrySet()) {
 				webdavServer.getDriveManager().seedDrive(null, entry.getKey(), entry.getValue());
@@ -601,7 +589,6 @@ public class DLFSBrowser extends AbstractGUI {
 
 	static void populateDemoDrive(DLFileSystem drive) {
 		if (drive == null) return;
-		drive.updateTimestamp();
 		DLPath p = drive.getRoot();
 		try {
 			Files.createDirectory(p.resolve("training"));
@@ -626,7 +613,6 @@ public class DLFSBrowser extends AbstractGUI {
 	 */
 	public static DLFileSystem createDemoDrive() {
 		DLFileSystem drive = DLFS.createLocal();
-		drive.updateTimestamp();
 		DLPath p = drive.getRoot();
 		try {
 			Files.createDirectory(p.resolve("training"));

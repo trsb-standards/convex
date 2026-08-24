@@ -4,11 +4,14 @@ import static convex.test.Assertions.assertCVMEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -22,6 +25,9 @@ import convex.core.data.AHashMap;
 import convex.core.data.ASet;
 import convex.core.data.AString;
 import convex.core.data.AVector;
+import convex.core.data.Blob;
+import convex.core.data.Blobs;
+import convex.core.data.Cells;
 import convex.core.data.Index;
 import convex.core.data.Keyword;
 import convex.core.data.Maps;
@@ -30,9 +36,11 @@ import convex.core.data.SignedData;
 import convex.core.data.Strings;
 import convex.core.data.prim.AInteger;
 import convex.core.data.prim.CVMLong;
+import convex.core.store.MemoryStore;
 import convex.lattice.ALattice;
 import convex.lattice.Lattice;
 import convex.lattice.LatticeContext;
+import convex.lattice.generic.KeyedLattice;
 import convex.lattice.generic.MapLattice;
 import convex.lattice.generic.MaxLattice;
 import convex.lattice.generic.SetLattice;
@@ -44,6 +52,22 @@ import convex.lattice.kv.KVDatabase;
  * These tests serve as usage examples for the lattice cursor API.
  */
 public class LatticeCursorTest {
+
+	@Test
+	public void testDescendedCursorOwnsPathArray() {
+		KeyedLattice lattice=KeyedLattice.create(
+			Keywords.FOO,MaxLattice.INSTANCE,
+			Keywords.BAR,MaxLattice.INSTANCE);
+		RootLatticeCursor<Index<Keyword,ACell>> root=Cursors.createLattice(lattice);
+		ACell[] path={Keywords.FOO};
+		ALatticeCursor<AInteger> cursor=root.path(path);
+		path[0]=Keywords.BAR;
+
+		cursor.set(CVMLong.create(3));
+
+		assertEquals(CVMLong.create(3),root.get().get(Keywords.FOO));
+		assertNull(root.get().get(Keywords.BAR));
+	}
 
 	// ===== Standard cursor operation tests =====
 
@@ -60,6 +84,33 @@ public class LatticeCursorTest {
 		RootLatticeCursor<AInteger> root = Cursors.createLattice(lattice, null);
 		ALatticeCursor<AInteger> fork = root.fork();
 		doIntCursorTest(fork);
+	}
+
+	/**
+	 * A completed update on a long-lived fork must be visible when another thread
+	 * creates a fresh cursor on that same fork. The futures provide the
+	 * cross-thread hand-off without relying on timing.
+	 */
+	@Test
+	public void testForkPathReadAfterCommitAcrossThreads() throws Exception {
+		MapLattice<Keyword,ASet<CVMLong>> lattice = MapLattice.create(SetLattice.create());
+		RootLatticeCursor<AHashMap<Keyword,ASet<CVMLong>>> root =
+				Cursors.createLattice(lattice, Maps.empty());
+		ALatticeCursor<AHashMap<Keyword,ASet<CVMLong>>> fork = root.fork();
+
+		try (ExecutorService writer = Executors.newSingleThreadExecutor();
+				ExecutorService reader = Executors.newSingleThreadExecutor()) {
+			for (long i = 1; i <= 1_000; i++) {
+				CVMLong committed = CVMLong.create(i);
+				writer.submit(() -> fork.<ASet<CVMLong>>path(Keywords.FOO)
+						.updateAndGet(values -> values.include(committed))).get();
+
+				ASet<CVMLong> observed = reader.submit(() ->
+						fork.<ASet<CVMLong>>path(Keywords.FOO).get()).get();
+				assertTrue(observed.contains(committed),
+						() -> "Fresh cursor did not observe completed update " + committed);
+			}
+		}
 	}
 
 	/**
@@ -364,7 +415,7 @@ public class LatticeCursorTest {
 		ALatticeCursor<ASet<CVMLong>> configured = root.setContext(ctx);
 		assertEquals(ctx, configured.getContext());
 
-		// Fork snapshots context
+		// Fork captures the effective context policy
 		ALatticeCursor<ASet<CVMLong>> fork = configured.fork();
 		assertEquals(ctx, fork.getContext());
 	}
@@ -509,6 +560,64 @@ public class LatticeCursorTest {
 		assertTrue(secondSnapshot.get().contains(concurrentValue),
 			"Waiting sync caller must capture the root after the preceding sync completes");
 		assertTrue(root.get().contains(concurrentValue), "Concurrent root update must survive both syncs");
+	}
+
+	/**
+	 * A sync publishes one immutable snapshot. A write racing that publication belongs
+	 * to the next snapshot: it must survive in the cursor, but must not be included in
+	 * the store-backed value returned by this sync.
+	 */
+	@Test
+	public void testConcurrentRootWriteDoesNotChangePublishedSyncResult() {
+		SetLattice<CVMLong> lattice = SetLattice.create();
+		ASet<CVMLong> published = Sets.of(CVMLong.ONE);
+		ASet<CVMLong> concurrent = published.include(CVMLong.TWO);
+		RootLatticeCursor<ASet<CVMLong>> root = Cursors.createLattice(lattice, published);
+
+		root.onSync(snapshot -> {
+			assertSame(published, snapshot);
+			root.set(concurrent);
+			return snapshot;
+		});
+
+		ASet<CVMLong> result = root.sync();
+
+		assertSame(published, result,
+			"sync must return the exact snapshot completed by its publication callback");
+		assertSame(concurrent, root.get(),
+			"the concurrent local write must remain pending in the authoritative cursor");
+	}
+
+	/**
+	 * When publication returns an equivalent value backed by another store, a
+	 * concurrent local value remains the merge's own argument. This preserves its
+	 * exact object/ref identity instead of importing equivalent foreign refs.
+	 */
+	@Test
+	public void testConcurrentRootWriteRetainsOwnRefIdentity() throws Exception {
+		SetLattice<Blob> lattice = SetLattice.create();
+		Blob source = Blobs.createRandom(400);
+		try (MemoryStore localStore = new MemoryStore();
+				MemoryStore foreignStore = new MemoryStore()) {
+			ASet<Blob> local = Cells.announce(Sets.of(source), r -> {}, localStore);
+			Blob foreignBlob = foreignStore.decode(source.getEncoding());
+			ASet<Blob> foreign = Cells.announce(Sets.of(foreignBlob), r -> {}, foreignStore);
+
+			assertEquals(local, foreign);
+			assertNotSame(local, foreign);
+
+			RootLatticeCursor<ASet<Blob>> root = Cursors.createLattice(lattice, Sets.empty());
+			root.onSync(snapshot -> {
+				root.set(local);
+				return foreign;
+			});
+
+			ASet<Blob> result = root.sync();
+
+			assertSame(foreign, result, "sync returns the value actually published");
+			assertSame(local, root.get(),
+				"current local state must be own so an equivalent foreign value cannot replace its refs");
+		}
 	}
 
 	@Test

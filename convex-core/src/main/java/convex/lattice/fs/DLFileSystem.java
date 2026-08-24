@@ -1,8 +1,8 @@
 package convex.lattice.fs;
 
 import java.io.IOException;
-import java.nio.channels.SeekableByteChannel;
 import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.DirectoryStream.Filter;
 import java.nio.file.FileStore;
 import java.nio.file.FileSystem;
@@ -20,8 +20,6 @@ import convex.core.data.ACell;
 import convex.core.data.AVector;
 import convex.core.data.Cells;
 import convex.core.data.Hash;
-import convex.core.data.prim.CVMLong;
-import convex.core.util.Utils;
 import convex.lattice.fs.impl.DLDirectoryStream;
 import convex.lattice.fs.impl.DLFSFileAttributes;
 
@@ -35,12 +33,14 @@ import convex.lattice.fs.impl.DLFSFileAttributes;
  */
 public abstract class DLFileSystem extends FileSystem implements Cloneable {
 
+	/** Number of streamed bytes between opportunities to persist blob data. */
+	public static final int BLOB_PERSIST_INTERVAL = 16 * 1024 * 1024;
+
 	static final String SEP = "/";
 
 	private static final Set<String> SUPPORTED_FILE_ATTRIBUTE_SET = Collections.singleton("basic");
 
 	protected final DLFSProvider provider;
-	private CVMLong timestamp; 
 	private volatile boolean open = true;
 	
 	// Singleton root / empty paths
@@ -49,10 +49,9 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 
 	protected final String uriPath;
 	
-	protected DLFileSystem(DLFSProvider dlfsProvider, String uriPath, CVMLong timestamp) {
+	protected DLFileSystem(DLFSProvider dlfsProvider, String uriPath) {
 		this.provider=dlfsProvider;
 		this.uriPath=uriPath;
-		this.timestamp=timestamp;
 	}
 
 	@Override
@@ -65,49 +64,6 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 		open = false;
 	}
 	
-	/**
-	 * Gets the timestamp of this DLFS drive, used to mark new writes.
-	 * Subclasses may override to consult a cursor's {@link convex.lattice.LatticeContext}.
-	 *
-	 * @return Current timestamp as a CVM integer
-	 */
-	public CVMLong getTimestamp() {
-		return timestamp;
-	}
-	
-	/**
-	 * Sets the timestamp of this DLFS drive
-	 * @param newTimestamp New timestamp
-	 */
-	public final void setTimestamp(CVMLong newTimestamp) {
-		timestamp=newTimestamp;
-	}
-	
-	/**
-	 * Updates the timestamp of this DLFS drive to the maximum of the given timestamp or it's current time stamp
-	 * @param newTimestamp Potential new timestamp
-	 * @return The new timestamp value, or the original one if unchanged
-	 */
-	public synchronized CVMLong updateTimestamp(long newTimestamp) {
-		if (newTimestamp>timestamp.longValue()) {
-			timestamp=CVMLong.create(newTimestamp);
-		}
-		return timestamp;
-	}
-	
-	/**
-	 * Updates the timestamp of the drive to the current system timestamp
-	 */
-	public synchronized CVMLong updateTimestamp() {
-		long current=timestamp.longValue();
-		long now=Utils.getCurrentTimestamp();
-		// Wall-clock resolution is commonly one millisecond. Ensure successive local
-		// logical mutations never receive an accidental tie within the same tick.
-		long next=(now>current)?now:((current<Long.MAX_VALUE)?current+1:current);
-		timestamp=CVMLong.create(next);
-		return timestamp;
-	}
-
 	@Override
 	public boolean isOpen() {
 		return open;
@@ -217,9 +173,9 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 	 * Implementation for delegation by DLFSProvider
 	 * @return Directory stream
 	 */
-	protected abstract DLDirectoryStream newDirectoryStream(DLPath dir, Filter<? super Path> filter);
+	protected abstract DLDirectoryStream newDirectoryStream(DLPath dir, Filter<? super Path> filter) throws IOException;
 
-	DLFSFileAttributes getFileAttributes(DLPath path) throws java.nio.file.NoSuchFileException {
+	public DLFSFileAttributes getFileAttributes(DLPath path) throws IOException {
 		AVector<ACell> node=getNode(path);
 		if (node==null) {
 			throw new java.nio.file.NoSuchFileException(path.toString());
@@ -232,7 +188,7 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 	 * @param path Path for which to obtain DLFSNode
 	 * @return DLFS node, or null if does not exist
 	 */
-	public abstract AVector<ACell> getNode(DLPath path);
+	public abstract AVector<ACell> getNode(DLPath path) throws IOException;
 
 	/**
 	 * Implementation for delegation by DLFSProvider, create a directory
@@ -261,6 +217,20 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 	public abstract void copy(DLPath source, DLPath target, boolean recursive) throws IOException;
 
 	/**
+	 * Copies a node within this drive, optionally replacing an existing target.
+	 *
+	 * @param source source path
+	 * @param target target path
+	 * @param recursive true to copy a complete directory subtree
+	 * @param replaceExisting true to replace an existing target
+	 * @throws IOException if the copy cannot be completed
+	 */
+	public void copy(DLPath source, DLPath target, boolean recursive, boolean replaceExisting) throws IOException {
+		if (replaceExisting) throw new UnsupportedOperationException("Replacing an existing DLFS target is not supported");
+		copy(source,target,recursive);
+	}
+
+	/**
 	 * Moves a node within this drive.
 	 *
 	 * @param source source path
@@ -269,9 +239,22 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 	 */
 	public abstract void move(DLPath source, DLPath target) throws IOException;
 
+	/**
+	 * Moves a node within this drive, optionally replacing an existing target.
+	 *
+	 * @param source source path
+	 * @param target target path
+	 * @param replaceExisting true to replace an existing target
+	 * @throws IOException if the move cannot be completed
+	 */
+	public void move(DLPath source, DLPath target, boolean replaceExisting) throws IOException {
+		if (replaceExisting) throw new UnsupportedOperationException("Replacing an existing DLFS target is not supported");
+		move(source,target);
+	}
+
 	public abstract Hash getRootHash();
 
-	public Hash getNodeHash(DLPath p) {
+	public Hash getNodeHash(DLPath p) throws IOException {
 		AVector<ACell> node=getNode(p);
 		if (node==null) return null;
 		return Cells.getHash(node);
@@ -291,7 +274,7 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 	 * @param newNode NEw node to put in place
 	 * @return The new node
 	 */
-	public abstract AVector<ACell> updateNode(DLPath path, AVector<ACell> newNode);
+	public abstract AVector<ACell> updateNode(DLPath path, AVector<ACell> newNode) throws IOException;
 	
 
 	/**
@@ -300,7 +283,7 @@ public abstract class DLFileSystem extends FileSystem implements Cloneable {
 	 */
 	public abstract void merge(AVector<ACell> other);
 
-	public void replicate(DLFileSystem other) {
+	public void replicate(DLFileSystem other) throws IOException {
 		merge(other.getNode(other.getRoot()));
 	}
 

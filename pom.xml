@@ -4,7 +4,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>world.convex</groupId>
 	<artifactId>convex</artifactId>
-	<version>0.8.12-SNAPSHOT</version>
+	<version>0.8.16-SNAPSHOT</version>
 	<packaging>pom</packaging>
 
 	<name>Convex Parent</name>
@@ -35,15 +35,15 @@
 		     and JDK 25. This target is independent from the build and test JDK. -->
 		<maven.compiler.release>21</maven.compiler.release>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-		<logback.version>1.6.0</logback.version>
+		<logback.version>1.6.3</logback.version>
 		<jmh.version>1.37</jmh.version>
-		<junit.version>6.1.2</junit.version>
+		<junit.version>6.1.3</junit.version>
 		<slf4j.version>2.0.18</slf4j.version>
 		<hc.version>5.5</hc.version>
-		<netty.version>4.2.16.Final</netty.version>
+		<netty.version>4.2.17.Final</netty.version>
 		<convex.version>${project.version}</convex.version>
 		<!--Freeze this for reproducible builds. -->
-		<project.build.outputTimestamp>2026-08-10T12:20:31Z</project.build.outputTimestamp>
+		<project.build.outputTimestamp>2026-08-24T11:49:43Z</project.build.outputTimestamp>
 		<!-- slf4j.internal.verbosity=ERROR silences SLF4J's informational init-replay
 		     notice in test output (at the cost of hiding e.g. multiple-provider warnings). -->
 		<argLine>
@@ -102,6 +102,37 @@
 			</activation>
 			<build>
 				<plugins>
+					<!-- Maven Central requires source and Javadoc artifacts. Keep them
+					     out of ordinary local/CI builds and attach them for releases. -->
+					<plugin>
+						<artifactId>maven-source-plugin</artifactId>
+						<executions><execution><id>attach-sources</id></execution></executions>
+					</plugin>
+					<plugin>
+						<artifactId>maven-javadoc-plugin</artifactId>
+						<executions><execution><id>attach-javadocs</id></execution></executions>
+					</plugin>
+
+					<!-- Central publishing is a build extension, so merely declaring it
+					     in the normal build forces resolution on every Maven command. -->
+					<plugin>
+						<groupId>org.sonatype.central</groupId>
+						<artifactId>central-publishing-maven-plugin</artifactId>
+						<version>0.11.0</version>
+						<extensions>true</extensions>
+						<configuration>
+							<publishingServerId>central</publishingServerId>
+							<!-- convex-integration is reactor assembly/test plumbing. It builds
+							     convex.jar but is not a consumer-facing Maven component. -->
+							<excludeArtifacts>
+								<excludeArtifact>convex-integration</excludeArtifact>
+							</excludeArtifacts>
+							<checksums>all</checksums>
+							<autoPublish>true</autoPublish>
+							<waitUntil>published</waitUntil>
+						</configuration>
+					</plugin>
+
 					<!-- This adds GPG signing for all artifacts -->
 					<plugin>
 						<groupId>org.apache.maven.plugins</groupId>
@@ -148,41 +179,13 @@
 				</executions>
 			</plugin>
 			
-			<!-- Actually activate the spurce / javadoc plugins for every module -->
-		    <plugin>
-		      <artifactId>maven-source-plugin</artifactId>
-		      <executions><execution><id>attach-sources</id></execution></executions>
-		    </plugin>
-		    <plugin>
-		      <artifactId>maven-javadoc-plugin</artifactId>
-		      <executions><execution><id>attach-javadocs</id></execution></executions>
-		    </plugin>
-
-		    <plugin>
-  		        <groupId>org.sonatype.central</groupId>
-				<artifactId>central-publishing-maven-plugin</artifactId>
-				<version>0.11.0</version>
- 				<extensions>true</extensions>
-				<configuration>
-					<publishingServerId>central</publishingServerId>
-					<checksums>all</checksums>
-					<!-- <waitUntil>published</waitUntil> -->
-					<autoPublish>true</autoPublish> 
-				</configuration>
-			</plugin>
-
 			<plugin>
 				<groupId>org.cyclonedx</groupId>
 				<artifactId>cyclonedx-maven-plugin</artifactId>
-				<version>2.9.2</version>
-				<executions>
-					<execution>
-						<phase>deploy</phase>
-						<goals>
-							<goal>makeAggregateBom</goal>
-						</goals>
-					</execution>
-				</executions>
+				<version>2.9.3</version>
+				<!-- Invoked explicitly by the GitHub release workflow. Do not bind this
+				     to deploy: Central requires signatures for every attached artifact,
+				     while the aggregate SBOM is distributed with the GitHub release. -->
 				<configuration>
 					<projectType>library</projectType>
 					<schemaVersion>1.4</schemaVersion>
@@ -193,7 +196,10 @@
 					<includeSystemScope>true</includeSystemScope>
 					<includeTestScope>false</includeTestScope>
 					<includeLicenseText>false</includeLicenseText>
-					<outputReactorProjects>true</outputReactorProjects>
+					<!-- Publish one aggregate SBOM with the GitHub release. Per-module
+					     SBOM attachments add redundant Central artifacts and signatures. -->
+					<outputReactorProjects>false</outputReactorProjects>
+					<skipAttach>true</skipAttach>
 					<outputFormat>json</outputFormat>
 					<outputName>CycloneDX-Sbom</outputName>
 					<verbose>false</verbose>

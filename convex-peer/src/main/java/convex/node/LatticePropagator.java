@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 
 import convex.api.Convex;
 import convex.core.Result;
+import convex.core.cpos.CPoSConstants;
 import convex.core.data.AccountKey;
 import convex.core.data.ACell;
 import convex.core.data.AVector;
@@ -32,8 +33,14 @@ import convex.core.message.MessageTag;
 import convex.core.message.MessageType;
 import convex.core.store.AStore;
 import convex.core.util.LatestUpdateQueue;
+import convex.core.util.ThreadUtils;
 import convex.core.util.Utils;
 import convex.lattice.cursor.Root;
+import convex.lattice.ALattice;
+import convex.lattice.LatticeContext;
+import convex.lattice.cursor.Cursors;
+import convex.lattice.cursor.ALatticeCursor;
+import convex.lattice.cursor.RootLatticeCursor;
 
 /**
  * Self-contained component for propagating lattice values.
@@ -45,21 +52,22 @@ import convex.lattice.cursor.Root;
  *
  * <p>A LatticePropagator owns:
  * <ul>
- *   <li>An {@link AStore} — for delta tracking (announce/novelty detection),
- *       persistence (setRootData), and security boundary (DATA_REQUEST resolution).</li>
+	 *   <li>An {@link AStore} — for delta tracking (announce/novelty detection),
+	 *       persistence (setRootData), and scoped DATA_REQUEST resolution.</li>
  *   <li>A {@link LatticeConnectionManager} — outbound peer connections and broadcast.</li>
  *   <li>A background thread — event-driven processing loop with periodic root sync.</li>
  * </ul>
  *
- * <p>The propagator has no knowledge of cursors or lattices. Values are pushed in
- * via {@link #triggerBroadcast(ACell)}. For synchronous snapshots the caller owns
- * installation of the returned value. Pull operations only acquire store-backed
- * values; NodeServer owns merge and re-propagation through its root cursor.
+ * <p>Values are pushed in via {@link #triggerBroadcast(ACell)}. Each propagator owns
+ * its filter and lattice-aware working view, while NodeServer owns the authoritative
+ * root cursor. For synchronous primary snapshots the caller owns installation of the
+ * returned value. Pull operations only acquire store-backed values; NodeServer owns
+ * authoritative merge and re-propagation through its root cursor.
  *
- * <p>The store also serves as the <b>security boundary</b>: peer connections are configured
- * with the propagator's store, so DATA_REQUEST from peers can only resolve data that
- * exists in that store. A public propagator with a filtered input and a MemoryStore
- * cannot leak private data.
+	 * <p>The store also scopes peer capabilities: peer connections are configured with
+	 * the propagator's store, so DATA_REQUEST from peers can only resolve data that exists
+	 * there. The filter governs outbound publication; independently acquired inbound cells
+	 * may already exist in the store and remain an operator access-policy concern.
  *
  * <p>Designed so the peer {@code BeliefPropagator} can eventually compose or extend
  * this class. Belief is an ACell; belief broadcast uses the same delta encoding
@@ -70,11 +78,6 @@ public class LatticePropagator implements Closeable {
 	private static final Logger log = LoggerFactory.getLogger(LatticePropagator.class.getName());
 
 	/**
-	 * Minimum delay between successive broadcasts to avoid flooding (milliseconds)
-	 */
-	public static final long MIN_BROADCAST_DELAY = 50L;
-
-	/**
 	 * Interval between root-only sync broadcasts (milliseconds).
 	 * Provides a lightweight periodic sync mechanism for divergence detection.
 	 */
@@ -82,8 +85,8 @@ public class LatticePropagator implements Closeable {
 
 	/**
 	 * Store for delta tracking (novelty detection via announce), persistence
-	 * (setRootData), and security boundary for peer data resolution. Missing data requests 
-	 * vs announced value should be routed here.
+	 * (setRootData), and peer data resolution. Missing data requests for an announced
+	 * value should be routed here.
 	 */
 	private final AStore store;
 
@@ -91,6 +94,24 @@ public class LatticePropagator implements Closeable {
 	 * Connection manager for outbound peer connections and broadcast.
 	 */
 	private final LatticeConnectionManager connectionManager;
+
+	/** Lattice used to reconcile this propagator's own subset with new snapshots. */
+	private ALattice<ACell> lattice;
+
+	/** Merge context shared with the owning NodeServer. */
+	private LatticeContext mergeContext = LatticeContext.EMPTY;
+
+	/** Projection applied before any value crosses this propagator's store boundary. */
+	private LatticeFilter<ACell> filter = value -> value;
+
+	/**
+	 * This propagator's current logical view. It may contain accepted inbound values
+	 * which have not yet appeared in a later projection from the authoritative root.
+	 */
+	private RootLatticeCursor<ACell> workingCursor;
+
+	/** Primary publication replaces its view from the authoritative cursor. */
+	private boolean primary;
 
 	/**
 	 * Background propagation thread
@@ -113,6 +134,12 @@ public class LatticePropagator implements Closeable {
 	/** Whether snapshots publish the store root after announcement. */
 	private volatile boolean persistenceEnabled = true;
 
+	/** Maximum encoded body size for one outbound delta or DATA-ahead chunk. */
+	private volatile int maxDeltaMessageSize = NodeConfig.DEFAULT_MAX_MESSAGE_SIZE;
+
+	/** Maximum combined encoded bodies materialised for one eager delta broadcast. */
+	private volatile int maxDeltaBroadcastSize = NodeConfig.DEFAULT_MAX_DELTA_BROADCAST_SIZE;
+
 	/** Whether root publication has changed the persistent store since its last checkpoint. */
 	private boolean dirty;
 
@@ -127,17 +154,10 @@ public class LatticePropagator implements Closeable {
 	 * uses the same store.
 	 *
 	 * <p>Each propagator owns its own announced cursor. This keeps query and data
-	 * access scoped to one store. Automatic per-propagator filtering is not yet
-	 * integrated; callers must not expose an unfiltered store as a public view.
+	 * access scoped to one store. Filtering and working-view reconciliation complete
+	 * before this cursor advances.
 	 */
 	private final Root<ACell> announcedCursor = new Root<>();
-
-	/**
-	 * Last value that was triggered (used for periodic root sync). Volatile
-	 * because it may be written by the caller's thread (synchronous publication
-	 * path) and read by the background propagation thread.
-	 */
-	private volatile ACell lastTriggeredValue;
 
 	/**
 	 * Timestamp of last broadcast. Volatile for cross-thread visibility — the
@@ -198,6 +218,40 @@ public class LatticePropagator implements Closeable {
 		this(store, new LatticeConnectionManager(store));
 	}
 
+	/**
+	 * Creates a propagator which owns a lattice projection and reconciles later
+	 * snapshots with its current view using current/propagator state as {@code own}.
+	 */
+	@SuppressWarnings("unchecked")
+	public <V extends ACell> LatticePropagator(AStore store, ALattice<V> lattice,
+			LatticeFilter<V> filter) {
+		this(store, new LatticeConnectionManager(store), lattice, filter);
+	}
+
+	/** Creates a filtered propagator with an explicitly configured connection manager. */
+	@SuppressWarnings("unchecked")
+	public <V extends ACell> LatticePropagator(AStore store,
+			LatticeConnectionManager connectionManager, ALattice<V> lattice,
+			LatticeFilter<V> filter) {
+		this(store, connectionManager);
+		if (lattice == null) throw new IllegalArgumentException("Lattice must not be null");
+		if (filter == null) throw new IllegalArgumentException("Lattice filter must not be null");
+		this.lattice = (ALattice<ACell>) lattice;
+		this.filter = (LatticeFilter<ACell>) filter;
+	}
+
+	/** Configures the lattice semantics supplied by the owning node before launch. */
+	@SuppressWarnings("unchecked")
+	void configure(ALattice<?> lattice, LatticeContext context, boolean primary) {
+		synchronized (writeLock) {
+			if (running) throw new IllegalStateException("Cannot configure a running propagator");
+			this.lattice = (ALattice<ACell>) lattice;
+			this.mergeContext = (context != null) ? context : LatticeContext.EMPTY;
+			this.primary = primary;
+			if (workingCursor != null) workingCursor.setContext(this.mergeContext);
+		}
+	}
+
 	// ========== Configuration ==========
 
 	/**
@@ -208,6 +262,33 @@ public class LatticePropagator implements Closeable {
 	 */
 	public void setPersistenceEnabled(boolean enabled) {
 		this.persistenceEnabled = enabled;
+	}
+
+	/** Configures the encoded body limit for outbound delta chunks. */
+	public void setMaxDeltaMessageSize(int limit) {
+		if (limit<1 || limit>CPoSConstants.MAX_MESSAGE_LENGTH) {
+			throw new IllegalArgumentException("Delta message limit must be between 1 and "
+				+CPoSConstants.MAX_MESSAGE_LENGTH+": "+limit);
+		}
+		this.maxDeltaMessageSize=limit;
+		if (maxDeltaBroadcastSize<limit) maxDeltaBroadcastSize=limit;
+	}
+
+	public int getMaxDeltaMessageSize() {
+		return maxDeltaMessageSize;
+	}
+
+	/** Configures the total encoded working-set limit for one eager delta. */
+	public void setMaxDeltaBroadcastSize(int limit) {
+		if (limit<maxDeltaMessageSize || limit>CPoSConstants.MAX_MESSAGE_LENGTH) {
+			throw new IllegalArgumentException("Delta broadcast limit must be between "
+				+maxDeltaMessageSize+" and "+CPoSConstants.MAX_MESSAGE_LENGTH+": "+limit);
+		}
+		this.maxDeltaBroadcastSize=limit;
+	}
+
+	public int getMaxDeltaBroadcastSize() {
+		return maxDeltaBroadcastSize;
 	}
 
 	// ========== Accessors ==========
@@ -263,6 +344,8 @@ public class LatticePropagator implements Closeable {
 
 	/**
 	 * Restores the last persisted value from this propagator's store.
+	 * The restored value also becomes this propagator's working view, ready for
+	 * directional reconciliation with the next primary projection.
 	 *
 	 * @return The restored value, or null if no persisted value exists
 	 *         or the store is not persistent
@@ -270,7 +353,13 @@ public class LatticePropagator implements Closeable {
 	public ACell restore() {
 		if (!store.isPersistent()) return null;
 		try {
-			return store.getRootData();
+			ACell restored = store.getRootData();
+			if (restored != null) {
+				synchronized (writeLock) {
+					workingCursor = Cursors.createLattice(lattice, restored, mergeContext);
+				}
+			}
+			return restored;
 		} catch (IOException e) {
 			log.warn("Error restoring lattice value from store", e);
 			return null;
@@ -321,9 +410,6 @@ public class LatticePropagator implements Closeable {
 		}
 
 		running = true;
-		// Preserve a snapshot seeded by NodeServer launch (or retained across a
-		// restart) so query service is available as soon as the listener opens.
-		lastTriggeredValue = announcedCursor.get();
 		lastBroadcastTime = 0L;
 		lastRootSyncTime = 0L;
 		broadcastCount.set(0L);
@@ -407,8 +493,34 @@ public class LatticePropagator implements Closeable {
 	public void triggerBroadcast(ACell value) {
 		if (!running) return;
 		if (value == null) return;
-		lastTriggeredValue = value;
 		triggerQueue.offer(value);
+	}
+
+	/**
+	 * Stages an accepted inbound value in this propagator's own working view before
+	 * the authoritative root is fanned back out. Current view state is the
+	 * directional merge's {@code own} value. Inbound state remains complete here;
+	 * this propagator's filter applies only when the reconciled view is published.
+	 *
+	 * <p>No store publication occurs here. NodeServer publishes the authoritative
+	 * root synchronously, then its normal fan-out causes this propagator to reconcile
+	 * and announce the resulting subset.</p>
+	 */
+	ACell mergeInbound(ACell[] path, ACell value) {
+		synchronized (writeLock) {
+			if (lattice == null) return workingCursor == null ? null : workingCursor.get();
+			if (workingCursor == null) {
+				ACell zero = lattice.zero();
+				workingCursor = Cursors.createLattice(lattice, zero, mergeContext);
+			}
+
+			// Work on a fork so a rejecting lattice leaves the working view unchanged.
+			ALatticeCursor<ACell> staged = workingCursor.fork();
+			staged.path(path).merge(value);
+			ACell merged = staged.get();
+			workingCursor.set(merged);
+			return merged;
+		}
 	}
 
 	// ========== Propagation Loop ==========
@@ -438,7 +550,7 @@ public class LatticePropagator implements Closeable {
 
 				// Periodic root sync only while running
 				if (running) {
-					maybePerformRootSync(lastTriggeredValue, Utils.getCurrentTimestamp());
+					maybePerformRootSync(Utils.getCurrentTimestamp());
 				}
 
 			} catch (InterruptedException e) {
@@ -473,7 +585,7 @@ public class LatticePropagator implements Closeable {
 	 * <ol>
 	 *   <li>Announce to store — writes cells, collects novelty for delta encoding</li>
 	 *   <li>Publish root data — anchor for restore (if persist enabled)</li>
-	 *   <li>Broadcast delta to peers (if peers exist and delay elapsed)</li>
+	 *   <li>Broadcast delta to peers (if peers exist)</li>
 	 * </ol>
 	 *
 	 * <p>Announce always runs (for delta tracking and store-backed refs).
@@ -494,13 +606,27 @@ public class LatticePropagator implements Closeable {
 	public ACell processSnapshot(ACell value) throws IOException {
 		CompletableFuture<ACell> announceFuture;
 		synchronized (writeLock) {
-			// Track latest snapshot for periodic root sync (used by background thread)
-			lastTriggeredValue = value;
+			// Primary input is already authoritative. A secondary instead keeps its
+			// established view as own, preserving local refs and pending inbound values.
+			if ((workingCursor != null) && !primary && (lattice != null)) {
+				value = lattice.merge(mergeContext, workingCursor.get(), value);
+			}
+
+			// Filtering is outbound-only: pending inbound state participates in the
+			// reconciliation above, then projection precedes every outbound operation.
+			value = filter.filter(value);
+			if (value == null) throw new IllegalArgumentException("Lattice filter returned null");
 
 			// 1. Announce to store (writes cells, collects novelty for delta)
-			ArrayList<ACell> novelty = new ArrayList<>();
-			Consumer<Ref<ACell>> noveltyHandler = r -> novelty.add(r.getValue());
-			value = Cells.announce(value, noveltyHandler, store);
+			boolean hasPeers=!connectionManager.getPeers().isEmpty();
+			Cells.NoveltyCollector noveltyCollector=hasPeers
+				?new Cells.NoveltyCollector(maxDeltaBroadcastSize):null;
+			value = Cells.announce(value, noveltyCollector, store);
+			if (workingCursor == null) {
+				workingCursor = Cursors.createLattice(lattice, value, mergeContext);
+			} else {
+				workingCursor.set(value);
+			}
 
 			// 2. Set root data for restore (if persist enabled)
 			if (persistenceEnabled) {
@@ -508,20 +634,19 @@ public class LatticePropagator implements Closeable {
 				dirty = true;
 			}
 
-			// 3. Broadcast to peers (only if peers exist and delay elapsed)
-			long currentTime = Utils.getCurrentTimestamp();
-			if (!connectionManager.getPeers().isEmpty()
-					&& currentTime >= lastBroadcastTime + MIN_BROADCAST_DELAY) {
-				broadcastToPeers(value, novelty);
-				lastBroadcastTime = currentTime;
-				broadcastCount.incrementAndGet();
-			}
-
 			announcedCursor.set(value);
-
-			// Swap the announce future under the lock; complete it outside
 			announceFuture = nextAnnounceFuture;
 			nextAnnounceFuture = new CompletableFuture<>();
+
+			// 3. Broadcast to peers. Background triggers are already coalesced by
+			// LatestUpdateQueue; an explicitly processed snapshot must not be dropped.
+			if (hasPeers) {
+				try {
+					broadcastToPeers(value, noveltyCollector.getCells());
+				} catch (RuntimeException e) {
+					log.warn("Unable to encode or queue lattice delta; periodic root sync will retry",e);
+				}
+			}
 		}
 		announceFuture.complete(value);
 		return value;
@@ -536,17 +661,26 @@ public class LatticePropagator implements Closeable {
 	 * Sends a snapshot to every connected peer, honouring each peer's declared
 	 * broadcast scope (see {@link LatticeConnectionManager#getPeerScope}).
 	 *
-	 * <p>A peer with no declared scope receives the full root, richly inlined
-	 * as a delta — exactly the behaviour every peer got before per-peer
-	 * scoping existed, and still the default for any caller that never opts
-	 * a peer into scoping. A peer with one or more declared scope paths only
-	 * ever receives its own subtree(s), each as a small indirect-ref message
-	 * (see {@link #sendScopedUpdate}) — this is what stops an unrelated
-	 * region of the lattice growing large from ever being pushed to, or
-	 * acquired by, a peer that never asked for it (the root cause of #611:
-	 * an oversized, unrelated schema tripped every peer's inbound size limit
-	 * because the ambient broadcast path always targeted the full root,
-	 * regardless of what a given peer had actually pulled).
+	 * <p>A peer with no declared scope receives the full root, as one or more
+	 * size-bounded delta messages (see {@link #sendBoundedDelta}) — exactly
+	 * the behaviour every peer got before per-peer scoping existed, now also
+	 * chunked/bounded the same way upstream's own {@code broadcastDelta} is
+	 * (DATA-ahead chunks plus a trailing root announcement when a delta
+	 * exceeds {@link #maxDeltaMessageSize}), instead of the old single
+	 * unbounded {@code Format.encodeDelta} call. A peer with one or more
+	 * declared scope paths only ever receives its own subtree(s), each as a
+	 * small indirect-ref message (see {@link #sendScopedUpdate}) — this is
+	 * what stops an unrelated region of the lattice growing large from ever
+	 * being pushed to, or acquired by, a peer that never asked for it (the
+	 * root cause of #611: an oversized, unrelated schema tripped every
+	 * peer's inbound size limit because the ambient broadcast path always
+	 * targeted the full root, regardless of what a given peer had actually
+	 * pulled). Scoping itself has no upstream equivalent — upstream's own
+	 * {@code broadcastDelta} always targets every connection uniformly via
+	 * {@code AConnectionManager.broadcastSequence}, which can't express "send
+	 * different content to different peers"; {@link #sendBoundedDelta} below
+	 * replicates just enough of that method's per-connection send loop,
+	 * scoped to the subset of peers that actually need the full message.
 	 *
 	 * @param value Full current root snapshot (store-backed)
 	 * @param novelty Cells newly announced this call — consumed to build the
@@ -555,22 +689,14 @@ public class LatticePropagator implements Closeable {
 	private void broadcastToPeers(ACell value, ArrayList<ACell> novelty) {
 		Map<AccountKey, Convex> peers = connectionManager.getConnections();
 
-		boolean needsFullMessage = false;
-		for (AccountKey peerKey : peers.keySet()) {
-			if (connectionManager.getPeerScope(peerKey).isEmpty()) {
-				needsFullMessage = true;
-				break;
-			}
-		}
-		Message fullMessage = needsFullMessage ? buildFullDeltaMessage(value, novelty) : null;
-
+		List<Convex> unscoped = new ArrayList<>();
 		for (Map.Entry<AccountKey, Convex> entry : peers.entrySet()) {
 			Convex peerConnection = entry.getValue();
 			if (peerConnection == null || !peerConnection.isConnected()) continue;
 
 			List<ACell[]> scope = connectionManager.getPeerScope(entry.getKey());
 			if (scope.isEmpty()) {
-				peerConnection.trySend(fullMessage);
+				unscoped.add(peerConnection);
 			} else {
 				for (ACell[] path : scope) {
 					ACell subValue = RT.getIn(value, path);
@@ -578,30 +704,78 @@ public class LatticePropagator implements Closeable {
 				}
 			}
 		}
+		if (!unscoped.isEmpty()) {
+			sendBoundedDelta(unscoped, value, novelty);
+		}
 	}
 
 	/**
-	 * Builds the full, unscoped root delta message — byte-for-byte the same
-	 * construction every peer received before per-peer scoping existed.
+	 * Sends one bounded delta, or DATA-ahead chunks followed by a root
+	 * announcement, to exactly the given (already-connected, unscoped)
+	 * peers — adapted from upstream's own {@code broadcastDelta}, scoped to
+	 * a peer subset instead of every connection (see {@link
+	 * #broadcastToPeers}'s own doc for why this dbase-fork-only scoping
+	 * can't just call {@code AConnectionManager.broadcastSequence} directly).
+	 * The per-peer send loop below mirrors that method's own semantics
+	 * (each peer gets the full ordered sequence, or the trailing root
+	 * message as a fallback if the sequence doesn't fully enqueue).
 	 */
-	private Message buildFullDeltaMessage(ACell value, ArrayList<ACell> novelty) {
-		// Ensure the lattice root is available before the protocol envelope.
-		// Format.encodeDelta decodes its final list element as the message root,
-		// so the LATTICE_VALUE vector itself must be last. Encoding only the
-		// lattice value would lose the message tag and path on the wire.
-		// MemoryStore reports an embedded top-level value as novelty. Embedded
-		// cells are already inline in their parent and are invalid as trailing
-		// multi-cell children, so retain only independently addressable cells.
+	private void sendBoundedDelta(List<Convex> targets, ACell value, ArrayList<ACell> novelty) {
+		// Embedded cells already travel inside their nearest non-embedded parent and
+		// are invalid as trailing multi-cell children.
 		novelty.removeIf(ACell::isEmbedded);
 		if (!value.isEmbedded()
 				&& (novelty.isEmpty() || !novelty.get(novelty.size() - 1).equals(value))) {
 			novelty.add(value);
 		}
+
 		AVector<ACell> emptyPath = Vectors.empty();
-		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, emptyPath, value);
-		novelty.add(payload);
-		Blob deltaData = Format.encodeDelta(novelty);
-		return Message.create(MessageType.LATTICE_VALUE, payload, deltaData);
+		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, null, emptyPath, value);
+		Message rootMessage = Message.create(MessageType.LATTICE_VALUE, payload, payload.getEncoding());
+		if (rootMessage.getMessageData().count()>maxDeltaMessageSize) {
+			log.warn("Lattice root announcement exceeds delta message limit of {} bytes; root sync will recover",
+				maxDeltaMessageSize);
+			return;
+		}
+		ArrayList<ACell> delta = new ArrayList<>(novelty.size()+1);
+		delta.addAll(novelty);
+		delta.add(payload);
+
+		List<Message> messages;
+		if (Format.getDeltaEncodingLength(delta)<=maxDeltaMessageSize) {
+			Blob deltaData=Format.encodeDelta(delta,maxDeltaMessageSize);
+			messages=List.of(Message.create(MessageType.LATTICE_VALUE,payload,deltaData));
+		} else {
+			try {
+				long dataBudget=maxDeltaBroadcastSize-rootMessage.getMessageData().count();
+				messages=(dataBudget>0)
+					?new ArrayList<>(Message.createDataMessages(
+						novelty,maxDeltaMessageSize,dataBudget))
+					:new ArrayList<>();
+				messages.add(rootMessage);
+			} catch (IllegalArgumentException e) {
+				// A single non-embedded cell may exceed an application-selected chunk
+				// limit. Announce the root only and let the receiver pull that branch.
+				messages=List.of(rootMessage);
+			}
+		}
+
+		int dropped=0;
+		for (Convex peerConnection : targets) {
+			boolean sent=true;
+			for (Message message:messages) {
+				if (!peerConnection.trySend(message)) {
+					sent=false;
+					break;
+				}
+			}
+			if (!sent && !peerConnection.trySend(rootMessage)) dropped++;
+		}
+		if (dropped>0) {
+			log.debug("Dropped lattice delta for {} peer(s); root sync will recover",dropped);
+		}
+		lastBroadcastTime = Utils.getCurrentTimestamp();
+		broadcastCount.incrementAndGet();
 	}
 
 	/**
@@ -621,8 +795,13 @@ public class LatticePropagator implements Closeable {
 	 * @param subValue Value at that path (must not be null)
 	 */
 	private void sendScopedUpdate(Convex peerConnection, ACell[] path, ACell subValue) {
+		// 4-element payload (tag, reserved, path, value) -- matches the format
+		// every other LATTICE_VALUE sender in this class and NodeServer's own
+		// receiving-side validation now use post-merge (upstream's own
+		// senders always pass null for the reserved slot; NodeServer's
+		// processLatticeValue/acquireLatticeMessage never read it).
 		AVector<ACell> pathVector = (path.length == 0) ? Vectors.empty() : Vectors.of((Object[]) path);
-		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, pathVector, subValue);
+		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, null, pathVector, subValue);
 		Blob envelopeData = payload.getEncoding();
 		Message message = Message.create(MessageType.LATTICE_VALUE, payload, envelopeData);
 		peerConnection.trySend(message);
@@ -633,12 +812,18 @@ public class LatticePropagator implements Closeable {
 	/**
 	 * Performs periodic root-only sync broadcast for divergence detection,
 	 * honouring each peer's declared broadcast scope exactly as {@link
-	 * #broadcastToPeers} does for trigger-driven broadcasts.
+	 * #broadcastToPeers} does for trigger-driven broadcasts. Reads the last
+	 * announced value directly (rather than taking it as a parameter, as
+	 * this used to) to match {@link #createRootSyncMessage}'s own "use
+	 * whatever is currently store-backed" contract, which
+	 * {@code LatticePropagatorTest} exercises directly.
 	 */
-	private void maybePerformRootSync(ACell value, long currentTime) {
-		if (value == null) return;
+	private void maybePerformRootSync(long currentTime) {
 		if (currentTime < lastRootSyncTime + ROOT_SYNC_INTERVAL) return;
 		if (connectionManager.getPeers().isEmpty()) return;
+
+		ACell value = announcedCursor.get();
+		if (value == null) return;
 
 		try {
 			int sent = 0;
@@ -666,6 +851,21 @@ public class LatticePropagator implements Closeable {
 		} catch (Exception e) {
 			log.warn("Error during root sync broadcast", e);
 		}
+	}
+
+	/**
+	 * Creates a root sync for the last value successfully announced to this
+	 * propagator's serving store. A triggered value is deliberately not externally
+	 * visible until {@link Cells#announce(ACell, Consumer, AStore)} has completed.
+	 */
+	Message createRootSyncMessage() {
+		ACell value = announcedCursor.get();
+		if (value == null) return null;
+		AVector<ACell> emptyPath = Vectors.empty();
+		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, null, emptyPath, value);
+		// The value may be encoded as an indirect ref; DATA_REQUEST resolution is
+		// safe because announcedCursor advances only after the store is populated.
+		return Message.create(MessageType.LATTICE_VALUE, payload, payload.getEncoding());
 	}
 
 	// ========== Explicit Persistence ==========
@@ -726,6 +926,22 @@ public class LatticePropagator implements Closeable {
 	 * @return CompletableFuture that completes with the acquired value
 	 */
 	public CompletableFuture<ACell> pull(Convex peer) {
+		return pullPath(peer);
+	}
+
+	/**
+	 * Pulls one path of a peer's latest lattice value into this propagator's
+	 * store. Path selection scopes transfer and storage work; it is not an
+	 * access-control boundary.
+	 *
+	 * <p>The caller must not mutate {@code path} while the returned operation is
+	 * outstanding.</p>
+	 *
+	 * @param peer Convex connection to the peer node
+	 * @param path path within the peer's announced lattice value
+	 * @return future completing with the acquired value, or {@code null} when absent
+	 */
+	public CompletableFuture<ACell> pullPath(Convex peer, ACell... path) {
 		if (peer == null) {
 			return CompletableFuture.failedFuture(new IllegalArgumentException("Peer cannot be null"));
 		}
@@ -736,12 +952,11 @@ public class LatticePropagator implements Closeable {
 					throw new RuntimeException("Peer is not connected");
 				}
 
-				// 1. Query peer for their root lattice value
-				CVMLong queryId = CVMLong.create(System.currentTimeMillis());
-				AVector<?> queryPayload = Vectors.create(MessageTag.LATTICE_QUERY, queryId, Vectors.empty());
+				AVector<?> queryPayload = Vectors.create(
+						MessageTag.LATTICE_QUERY, null, Vectors.create(path));
 				Message queryMessage = Message.create(MessageType.LATTICE_QUERY, queryPayload);
 
-				CompletableFuture<Result> resultFuture = peer.message(queryMessage);
+				CompletableFuture<Result> resultFuture = peer.request(queryMessage);
 				Result result = resultFuture.get(10, TimeUnit.SECONDS);
 
 				if (result.isError()) {
@@ -763,14 +978,14 @@ public class LatticePropagator implements Closeable {
 					acquired = peer.acquire(rootHash, store).get(30, TimeUnit.SECONDS);
 				}
 
-				log.debug("Acquired pulled value from peer: {}", peer.getHostAddress());
+				log.debug("Acquired pulled lattice path from peer: {}", peer.getHostAddress());
 				return acquired;
 
 			} catch (Exception e) {
-				log.warn("Pull failed from peer: {}", peer.getHostAddress(), e);
-				throw new RuntimeException("Pull failed from peer", e);
+				log.warn("Lattice pull failed from peer: {}", peer.getHostAddress(), e);
+				throw new RuntimeException("Lattice pull failed from peer", e);
 			}
-		});
+		},ThreadUtils.getVirtualExecutor());
 	}
 
 	/**

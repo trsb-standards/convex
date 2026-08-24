@@ -21,14 +21,14 @@ The foundational library for the [Convex](https://convex.world) decentralised ne
 <dependency>
     <groupId>world.convex</groupId>
     <artifactId>convex-core</artifactId>
-    <version>0.8.11</version>
+    <version>0.8.15</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'world.convex:convex-core:0.8.11'
+implementation 'world.convex:convex-core:0.8.15'
 ```
 
 ## Usage
@@ -52,6 +52,7 @@ ACell result = ctx.getResult();  // Returns 6
 ## Documentation
 
 - [Javadoc API Reference](https://javadoc.io/doc/world.convex/convex-core)
+- [Lattice application and component patterns](docs/LATTICE_APPLICATIONS.md)
 - [Java Examples](https://github.com/Convex-Dev/convex/tree/develop/convex-core/src/test/java/convex/core/examples) (see `RawCVM.java` for running CVM code directly)
 - [Convex Lisp Examples](https://github.com/Convex-Dev/convex/tree/develop/convex-core/src/test/resources/examples)
 - [Convex Documentation](https://docs.convex.world)
@@ -61,14 +62,14 @@ ACell result = ctx.getResult();  // Returns 6
 ```bash
 git clone https://github.com/Convex-Dev/convex.git
 cd convex
-mvn install -pl convex-core -am
+./mvnw -B -T1C install -pl convex-core -am
 ```
 
 **Note:** ANTLR4 generates parser code during the build. If your IDE shows errors, add `target/generated-sources/antlr4` as a source directory.
 
 ## License
 
-Copyright 2018-2025 The Convex Foundation and Contributors
+Copyright 2018-2026 The Convex Foundation and Contributors
 
 Code in convex-core is provided under the [Convex Public License](../LICENSE.md).
 

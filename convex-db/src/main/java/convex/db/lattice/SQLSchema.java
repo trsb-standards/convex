@@ -93,11 +93,23 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	private final AString schemaName;
 
 	public SQLSchema(ALatticeCursor<Index<AString, AVector<ACell>>> cursor) {
-		this(cursor, anonymousSchemaName());
+		this(null, cursor, anonymousSchemaName());
 	}
 
 	public SQLSchema(ALatticeCursor<Index<AString, AVector<ACell>>> cursor, AString schemaName) {
-		super(cursor);
+		this(null, cursor, schemaName);
+	}
+
+	/**
+	 * Full constructor, threading through both upstream's new parent-component
+	 * link (unused within this class itself, but part of {@link
+	 * ALatticeComponent}'s own general contract now) and this fork's own
+	 * {@code schemaName} (needed for {@link TableVersionRegistry} lookups --
+	 * see that field's own javadoc).
+	 */
+	SQLSchema(ALatticeComponent<?> parent,
+			ALatticeCursor<Index<AString, AVector<ACell>>> cursor, AString schemaName) {
+		super(parent, cursor);
 		this.schemaName = schemaName;
 	}
 
@@ -142,7 +154,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	 * @return Forked SQLSchema instance
 	 */
 	public SQLSchema fork() {
-		return new SQLSchema(cursor.fork(), schemaName);
+		return new SQLSchema(parent(), cursor.fork(), schemaName);
 	}
 
 	// ========== Internal Helpers ==========
@@ -190,7 +202,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (TableVersionRegistry.isVersioned(schemaName, name)) {
 			return new VersionedSQLTable(tableCursor);
 		}
-		return new SQLTable(tableCursor);
+		return new SQLTable(this, tableCursor);
 	}
 
 	/** Convenience overload. */

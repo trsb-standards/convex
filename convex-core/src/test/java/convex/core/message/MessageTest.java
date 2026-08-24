@@ -11,6 +11,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 
 import org.junit.jupiter.api.Test;
@@ -37,6 +39,7 @@ import convex.core.data.prim.CVMLong;
 import convex.core.exceptions.BadFormatException;
 import convex.core.lang.RT;
 import convex.core.lang.Reader;
+import convex.core.store.MemoryStore;
 import convex.test.Samples;
 
 public class MessageTest {
@@ -142,6 +145,18 @@ public class MessageTest {
 		Message m=Message.createQuery(0, Symbols.STAR_BALANCE, Address.ZERO);
 		doMessageTest(m);
 	}
+
+	@Test public void testLatticeValueID() throws BadFormatException {
+		AVector<?> payload=Vectors.of(MessageTag.LATTICE_VALUE,12,Vectors.empty(),42);
+		Message m=Message.create(MessageType.LATTICE_VALUE,payload);
+		assertEquals(CVMLong.create(12),m.getRequestID());
+		assertEquals(CVMLong.create(13),m.withID(CVMLong.create(13)).getRequestID());
+		doMessageTest(m);
+
+		Message fireAndForget=Message.create(MessageType.LATTICE_VALUE,
+			Vectors.of(MessageTag.LATTICE_VALUE,null,Vectors.empty(),42));
+		assertNull(fireAndForget.getRequestID());
+	}
 	
 	@Test public void testTransact() throws BadFormatException {
 		ATransaction tx=Invoke.create(Address.create(134564), 124334, Symbols.STAR_BALANCE);
@@ -156,7 +171,7 @@ public class MessageTest {
 		assertThrows(BadFormatException.class, () -> MessageType.decode(-1));
 	}
 	
-	@Test 
+	@Test
 	public void testDataMessages() throws BadFormatException, IOException {
 		Blob b=Blob.createRandom(new Random(1256785), 1000);
 		Cells.persist(b, Samples.TEST_STORE);
@@ -174,6 +189,52 @@ public class MessageTest {
 		assertEquals(b,v.get(0));
 		doMessageTest(m);
 		doMessageTest(r);
+	}
+
+	@Test
+	public void testBoundedDataAheadMessages() throws Exception {
+		List<ACell> cells=List.of(
+			Blobs.createRandom(300), Blobs.createRandom(300), Blobs.createRandom(300),
+			Blobs.createRandom(300), Blobs.createRandom(300));
+		List<Message> messages=Message.createDataMessages(cells,800);
+		assertTrue(messages.size()>1);
+
+		ArrayList<Hash> received=new ArrayList<>();
+		try (MemoryStore store=new MemoryStore()) {
+			for (Message sent:messages) {
+				assertTrue(sent.getMessageData().count()<=800);
+				Message incoming=Message.create(sent.getMessageData());
+				assertEquals(MessageType.UNKNOWN,incoming.getType());
+				AVector<?> payload=incoming.getPayload(store);
+				assertEquals(MessageType.DATA,incoming.getType());
+				assertEquals(MessageTag.DATA,payload.get(0));
+				for (long i=1; i<payload.count(); i++) received.add(payload.get(i).getHash());
+			}
+		}
+		assertEquals(cells.stream().map(ACell::getHash).toList(),received);
+		assertThrows(IllegalArgumentException.class,
+			() -> Message.createDataMessages(cells,100));
+
+		List<Message> materialised=Message.createDataMessages(cells,800,800);
+		assertEquals(1,materialised.size());
+		assertTrue(materialised.stream().mapToLong(m -> m.getMessageData().count()).sum()<=800);
+	}
+
+	@Test
+	public void testNoveltyCollectorRetainsBoundedTail() {
+		Cells.NoveltyCollector collector=new Cells.NoveltyCollector(700,2);
+		Blob first=Blobs.createRandom(300);
+		Blob middle=Blobs.createRandom(300);
+		Blob last=Blobs.createRandom(300);
+		collector.accept(first.getRef());
+		collector.accept(middle.getRef());
+		collector.accept(last.getRef());
+
+		List<ACell> retained=collector.getCells();
+		assertTrue(retained.size()<=2);
+		assertSame(last,retained.get(retained.size()-1));
+		assertTrue(collector.getEstimatedBytes()<=700);
+		assertTrue(collector.getOmittedCount()>0);
 	}
 	
 	@Test
@@ -404,6 +465,31 @@ public class MessageTest {
 
 		conn.setTrustedKey(KP.getAccountKey());
 		assertTrue(conn.isTrusted());
+	}
+
+	@Test public void testChallengeWithID() {
+		Message challenge=Message.createChallenge(1,KP.signData(CVMLong.ONE));
+		Message retagged=challenge.withID(CVMLong.create(2));
+		assertNotNull(retagged);
+		assertEquals(CVMLong.create(2),retagged.getRequestID());
+	}
+
+	@Test public void testConnectionRequestIDsAreUniqueUnderConcurrency() {
+		LocalConnection conn = LocalConnection.create(m -> true);
+		int count=10_000;
+		java.util.Set<CVMLong> ids=java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+		java.util.stream.IntStream.range(0,count).parallel()
+				.forEach(i -> ids.add(conn.nextRequestID()));
+
+		assertEquals(count,ids.size());
+		for (long i=0;i<count;i++) {
+			assertTrue(ids.contains(CVMLong.create(i)));
+		}
+
+		LocalConnection independent=LocalConnection.create(m -> true);
+		assertEquals(CVMLong.ZERO,independent.nextRequestID(),
+				"Each originating connection has an independent ID space");
 	}
 
 	/**

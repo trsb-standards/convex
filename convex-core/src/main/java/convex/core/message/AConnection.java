@@ -1,8 +1,10 @@
 package convex.core.message;
 
 import java.net.InetSocketAddress;
+import java.util.concurrent.atomic.AtomicLong;
 
 import convex.core.data.AccountKey;
+import convex.core.data.prim.CVMLong;
 
 /**
  * Abstract base class for connections between Convex network participants.
@@ -32,6 +34,21 @@ import convex.core.data.AccountKey;
 public abstract class AConnection {
 
 	private AccountKey trustedKey=null;
+	private final AtomicLong requestCounter=new AtomicLong();
+
+	/**
+	 * Allocates the next request ID originating from this connection.
+	 *
+	 * <p>Request IDs are a transport correlation concern. Keeping the counter on
+	 * the originating connection prevents semantic protocol code from inventing
+	 * timestamp or process-wide IDs, and permits independent connections to use
+	 * independent ID spaces safely.</p>
+	 *
+	 * @return next connection-local request ID
+	 */
+	public final CVMLong nextRequestID() {
+		return CVMLong.create(requestCounter.getAndIncrement());
+	}
 
 	/**
 	 * Checks if this connection has been verified as a trusted peer.
@@ -113,6 +130,18 @@ public abstract class AConnection {
 	 * @return true if message queued successfully, false if it could not be sent without blocking
 	 */
 	public abstract boolean trySendMessage(Message msg);
+
+	/**
+	 * Sends a small, replaceable priority message without blocking. Queue-based
+	 * transports may coalesce an older unsent priority message so the latest
+	 * consensus/control root is not trapped behind bulk propagation data.
+	 *
+	 * @param msg small priority message
+	 * @return true if accepted for delivery
+	 */
+	public boolean trySendPriorityMessage(Message msg) {
+		return trySendMessage(msg);
+	}
 
 	/**
 	 * Returns the remote socket address associated with this connection, or null if

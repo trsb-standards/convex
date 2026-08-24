@@ -168,8 +168,6 @@ public class DLFSPanel {
 		ThreadUtils.runVirtual("dlfs-monitor", () -> {
 			try {
 				while (!closed && dlfs.isOpen() && dlfs == fileSystem) {
-					dlfs.updateTimestamp();
-
 					// Check if lattice state changed (e.g. via WebDAV)
 					Hash currentHash = dlfs.getRootHash();
 					if (currentHash != null && !currentHash.equals(lastRootHash)) {
@@ -220,12 +218,16 @@ public class DLFSPanel {
 	void exploreSelectedNode() {
 		DLPath p = getSelectedPath();
 		if (p == null) return;
-		AVector<ACell> node = fileSystem.getNode(p);
-		if (node != null) {
-			StateExplorer.explore(node);
-		} else {
-			AVector<ACell> root = fileSystem.getNode(fileSystem.getRoot());
-			if (root != null) StateExplorer.explore(root);
+		try {
+			AVector<ACell> node = fileSystem.getNode(p);
+			if (node != null) {
+				StateExplorer.explore(node);
+			} else {
+				AVector<ACell> root = fileSystem.getNode(fileSystem.getRoot());
+				if (root != null) StateExplorer.explore(root);
+			}
+		} catch (IOException ex) {
+			JOptionPane.showMessageDialog(null, "Error: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
 		}
 	}
 

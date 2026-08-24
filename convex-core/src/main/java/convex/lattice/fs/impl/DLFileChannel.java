@@ -16,6 +16,7 @@ import convex.core.data.ACell;
 import convex.core.data.AVector;
 import convex.core.data.Blob;
 import convex.core.data.Blobs;
+import convex.core.data.prim.CVMLong;
 import convex.lattice.fs.DLFSNode;
 import convex.lattice.fs.DLFileSystem;
 import convex.lattice.fs.DLPath;
@@ -25,15 +26,16 @@ public class DLFileChannel implements SeekableByteChannel {
 	private boolean isOpen=true;
 	private boolean readOnly=true;
 	private long position=0;
+	private int bytesUntilPersist=DLFileSystem.BLOB_PERSIST_INTERVAL;
 	private DLPath path;
-	private DLFileSystem fileSystem;
+	private DLFSLocal fileSystem;
 	
-	private DLFileChannel(DLFileSystem fs, DLPath path) {
+	private DLFileChannel(DLFSLocal fs, DLPath path) {
 		this.fileSystem=fs;
 		this.path=path;
 	}
 	
-	public static DLFileChannel create(DLFileSystem fs, Set<? extends OpenOption> options, DLPath path) throws IOException {
+	static DLFileChannel create(DLFSLocal fs, Set<? extends OpenOption> options, DLPath path) throws IOException {
 		AVector<ACell> node= fs.getNode(path);
 		
 		boolean append=false;
@@ -100,39 +102,52 @@ public class DLFileChannel implements SeekableByteChannel {
 		// Coordinate writes from distinct channels with filesystem-level mutations.
 		synchronized(fileSystem) {
 			checkOpen();
-			long pos=position;
-			AVector<ACell> node=getNode();
-			ABlob data = DLFSNode.getData(node);
-			if (data==null) throw new NoSuchFileException(path.toString());
-			
-			if (data.count()<pos) {
-				// extend file with zeros to start at new position
-				// Sparse zero blob uses structural sharing, so this is cheap
-				data=data.append(Blobs.createZero(pos-data.count()));
+			int written=src.remaining();
+			CVMLong operationTime=fileSystem.currentTimestamp();
+			while (src.hasRemaining()) {
+				int n=Math.min(src.remaining(),bytesUntilPersist);
+				ByteBuffer part=src.slice();
+				part.limit(n);
+				Blob blob=Blob.fromByteBuffer(part);
+
+				long pos=position;
+				AVector<ACell> node=getNode();
+				ABlob data=DLFSNode.getData(node);
+				if (data==null) throw new NoSuchFileException(path.toString());
+				if (data.count()<pos) {
+					// Sparse zero blob uses structural sharing, so this is cheap.
+					data=data.append(Blobs.createZero(pos-data.count()));
+				}
+
+				ABlob newData=data.replaceSlice(pos,blob);
+				boolean persist=(n==bytesUntilPersist);
+				if (persist) newData=fileSystem.checkpointBlob(newData);
+
+				if (newData!=data) {
+					AVector<ACell> newNode=node.assoc(DLFSNode.POS_DATA,newData)
+						.assoc(DLFSNode.POS_UTIME,operationTime);
+					updateNode(newNode,operationTime);
+				}
+
+				position=pos+n;
+				src.position(src.position()+n);
+				bytesUntilPersist=persist
+					? DLFileSystem.BLOB_PERSIST_INTERVAL
+					: bytesUntilPersist-n;
 			}
-			
-			Blob b=Blob.fromByteBuffer(src);
-			long n=b.count();
-			ABlob newData=data.replaceSlice(pos,b);
-			
-			// position after replaced slice
-			position=pos+n;
-			
-			if (newData!=data) {
-				AVector<ACell> newNode=node.assoc(DLFSNode.POS_DATA, newData)
-					.assoc(DLFSNode.POS_UTIME,fileSystem.getTimestamp());
-				updateNode(newNode);
-			}
-			
-			return (int)n;
+			return written;
 		}
 	}
 
 	protected AVector<ACell> updateNode(AVector<ACell> newNode) throws IOException {
+		return updateNode(newNode,fileSystem.currentTimestamp());
+	}
+
+	private AVector<ACell> updateNode(AVector<ACell> newNode, CVMLong operationTime) throws IOException {
 		if (readOnly) {
 			throw new NonWritableChannelException();
 		}
-		return fileSystem.updateNode(path, newNode);
+		return fileSystem.updateNode(path,newNode,operationTime);
 	}
 
 	@Override
@@ -169,7 +184,7 @@ public class DLFileChannel implements SeekableByteChannel {
 	 * @return
 	 * @throws NoSuchFileException
 	 */
-	private ABlob getData() throws NoSuchFileException {
+	private ABlob getData() throws IOException {
 		AVector<ACell> node=getNode();
 		return DLFSNode.getData(node);
 	}
@@ -179,7 +194,7 @@ public class DLFileChannel implements SeekableByteChannel {
 	 * @return
 	 * @throws NoSuchFileException
 	 */
-	private AVector<ACell> getNode() throws NoSuchFileException {
+	private AVector<ACell> getNode() throws IOException {
 		AVector<ACell> node= fileSystem.getNode(path);
 		if (node==null) throw new NoSuchFileException(path.toString());
 		return node;
@@ -197,9 +212,10 @@ public class DLFileChannel implements SeekableByteChannel {
 			long newSize=Math.min(size, data.count());
 			ABlob newData=data.slice(0, newSize);
 			if (newData!=data) {
+				CVMLong operationTime=fileSystem.currentTimestamp();
 				AVector<ACell> newNode=node.assoc(DLFSNode.POS_DATA, newData)
-					.assoc(DLFSNode.POS_UTIME,fileSystem.getTimestamp());
-				updateNode(newNode);
+					.assoc(DLFSNode.POS_UTIME,operationTime);
+				updateNode(newNode,operationTime);
 			}
 			position=0;
 		}

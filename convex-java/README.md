@@ -24,14 +24,14 @@ This module provides `ConvexJSON`, a lightweight client that talks to any Convex
 <dependency>
     <groupId>world.convex</groupId>
     <artifactId>convex-java</artifactId>
-    <version>0.8.11</version>
+    <version>0.8.15</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'world.convex:convex-java:0.8.11'
+implementation 'world.convex:convex-java:0.8.15'
 ```
 
 ## Quick Start
@@ -162,7 +162,7 @@ you specifically need the binary transport.
 ```bash
 git clone https://github.com/Convex-Dev/convex.git
 cd convex
-mvn install -pl convex-java -am
+./mvnw -B -T1C install -pl convex-java -am
 ```
 
 ## Resources

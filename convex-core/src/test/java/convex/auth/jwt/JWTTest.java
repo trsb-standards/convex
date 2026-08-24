@@ -12,12 +12,14 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
+import java.util.Arrays;
 import java.util.Base64;
 
 import org.junit.jupiter.api.Test;
 
 import convex.core.crypto.AKeyPair;
 import convex.core.crypto.ASignature;
+import convex.core.crypto.util.Multikey;
 import convex.core.cvm.Symbols;
 import convex.core.data.ACell;
 import convex.core.data.AMap;
@@ -119,6 +121,60 @@ public class JWTTest {
 
 		String decodedClaims = new String(JWT.decodeRaw(payloadB64));
 		assertEquals(JWT.claims(claims).toString(), decodedClaims);
+	}
+
+	@Test public void testSignPublicWithVerificationMethodDIDURL() {
+		AKeyPair kp=AKeyPair.createSeeded(12345L);
+		AString multikey=Multikey.encodePublicKey(kp.getAccountKey());
+		AString kid=Strings.create("did:web:venue.example:u:alice#").append(multikey);
+		AMap<AString,ACell> claims=Maps.of("sub","did:web:venue.example:u:alice");
+
+		AString token=JWT.signPublic(claims,kp,kid);
+		JWT parsed=JWT.parse(token);
+
+		assertNotNull(parsed);
+		assertEquals(kid.toString(),parsed.getKeyID());
+		assertNotNull(JWT.verifyPublic(token));
+		assertNotNull(JWT.verifyPublic(token,kp.getAccountKey()));
+		assertThrows(IllegalArgumentException.class,()->JWT.signPublic(claims,kp,null));
+	}
+
+	@Test public void testVerifyPublicAcceptsDidKeyForms() {
+		AKeyPair kp=AKeyPair.createSeeded(2468L);
+		AString multikey=Multikey.encodePublicKey(kp.getAccountKey());
+		AMap<AString,ACell> claims=Maps.of("sub","alice");
+		AString didKey=Strings.create("did:key:").append(multikey);
+		AString verificationMethod=didKey.append("#").append(multikey);
+
+		assertNotNull(JWT.verifyPublic(JWT.signPublic(claims,kp,didKey)));
+		assertNotNull(JWT.verifyPublic(JWT.signPublic(claims,kp,verificationMethod)));
+	}
+
+	@Test public void testExplicitKidDoesNotClaimIdentityBinding() {
+		AKeyPair signer=AKeyPair.createSeeded(1357L);
+		AKeyPair other=AKeyPair.createSeeded(9753L);
+		AMap<AString,ACell> claims=Maps.of("sub","did:web:venue.example:u:alice");
+
+		AString namedKid=Strings.create("did:web:venue.example:u:alice#key-1");
+		AString namedToken=JWT.signPublic(claims,signer,namedKid);
+		assertNull(JWT.verifyPublic(namedToken),"A named verification method requires DID resolution");
+		assertNotNull(JWT.verifyPublic(namedToken,signer.getAccountKey()),"Trusted-key verification ignores kid");
+
+		AString mismatchedKid=Strings.create("did:web:venue.example:u:alice#")
+			.append(Multikey.encodePublicKey(other.getAccountKey()));
+		AString mismatchedToken=JWT.signPublic(claims,signer,mismatchedKid);
+		assertNull(JWT.verifyPublic(mismatchedToken),"Sender-controlled kid must not bind the signer to a DID");
+		assertNotNull(JWT.verifyPublic(mismatchedToken,signer.getAccountKey()));
+	}
+
+	@Test public void testVerifyPublicRejectsMalformedKeyIDs() {
+		AKeyPair kp=AKeyPair.createSeeded(8642L);
+		AMap<AString,ACell> claims=Maps.of("sub","alice");
+
+		assertNull(JWT.verifyPublic(JWT.signPublic(claims,kp,Strings.create("did:key:"))));
+		assertNull(JWT.verifyPublic(JWT.signPublic(claims,kp,Strings.create("did:web:example.com#"))));
+		assertNull(JWT.verifyPublic(JWT.signPublic(claims,kp,Strings.create("did:web:example.com#not-a-multikey"))));
+		assertNull(JWT.verifyPublic(JWT.signPublic(claims,kp,Strings.create("did:web:example.com#one#two"))));
 	}
 
 	@Test public void testBuildAccessTokenClaims() {
@@ -284,6 +340,29 @@ public class JWTTest {
 
 		// Wrong secret should fail
 		assertFalse(parsed.verifyHS256("wrong-secret-key-long-enough".getBytes()));
+	}
+
+	@Test public void testTamperedHS256Signature() {
+		byte[] secret = "test-secret-key-long-enough".getBytes();
+		AString jwtString = JWT.signSymmetric(Maps.of("sub", "bob"), Blob.wrap(secret));
+		String signingInput = JWT.parse(jwtString).getSigningInput();
+		Base64.Encoder encoder = Base64.getUrlEncoder().withoutPadding();
+		byte[] sig = Base64.getUrlDecoder().decode(jwtString.toString().substring(signingInput.length() + 1));
+
+		// A tag differing in one bit must be rejected wherever the difference falls,
+		// including the final byte, which a comparison stopping at the first mismatch
+		// reaches only after examining all the rest
+		for (int i : new int[] { 0, sig.length / 2, sig.length - 1 }) {
+			byte[] tampered = sig.clone();
+			tampered[i] ^= 0x01;
+			JWT forged = JWT.parse(Strings.create(signingInput + "." + encoder.encodeToString(tampered)));
+			assertFalse(forged.verifyHS256(secret), "Tampered byte " + i + " should not verify");
+		}
+
+		// A truncated tag must be rejected rather than matching a prefix
+		JWT truncated = JWT.parse(Strings.create(
+				signingInput + "." + encoder.encodeToString(Arrays.copyOf(sig, sig.length - 1))));
+		assertFalse(truncated.verifyHS256(secret));
 	}
 
 	// ========== RS256 tests ==========

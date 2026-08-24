@@ -33,6 +33,7 @@ import convex.core.data.AString;
 import convex.core.data.Hash;
 import convex.core.data.Strings;
 import convex.core.data.prim.AInteger;
+import convex.core.data.prim.CVMLong;
 import convex.core.lang.RT;
 
 /**
@@ -441,6 +442,45 @@ public class Utils {
 		}
 		sb.append(s);
 		return sb.toString();
+	}
+
+	/**
+	 * Reads an unsigned little-endian byte array as a non-negative BigInteger.
+	 *
+	 * @param littleEndian Bytes in least-significant-first order
+	 * @return Non-negative BigInteger value
+	 */
+	public static BigInteger littleEndianToBigInteger(byte[] littleEndian) {
+		if (littleEndian.length == 0) return BigInteger.ZERO;
+		byte[] bigEndian = new byte[littleEndian.length];
+		for (int i = 0; i < littleEndian.length; i++) {
+			bigEndian[bigEndian.length - 1 - i] = littleEndian[i];
+		}
+		return new BigInteger(1, bigEndian);
+	}
+
+	/**
+	 * Writes a non-negative BigInteger as an unsigned, fixed-width
+	 * little-endian byte array.
+	 *
+	 * @param value Non-negative value to encode
+	 * @param length Required byte length
+	 * @return Fixed-width bytes in least-significant-first order
+	 * @throws IllegalArgumentException If the value is negative, the length is
+	 *                                  negative, or the value does not fit
+	 */
+	public static byte[] bigIntegerToLittleEndian(BigInteger value, int length) {
+		if (value.signum() < 0) throw new IllegalArgumentException("Value must not be negative");
+		if (length < 0) throw new IllegalArgumentException("Length must not be negative");
+		int byteLength = (value.bitLength() + 7) / 8;
+		if (byteLength > length) throw new IllegalArgumentException("Value does not fit in " + length + " bytes");
+
+		byte[] bigEndian = value.toByteArray();
+		byte[] littleEndian = new byte[length];
+		for (int i = 0; i < byteLength; i++) {
+			littleEndian[i] = bigEndian[bigEndian.length - 1 - i];
+		}
+		return littleEndian;
 	}
 
 	/**
@@ -1113,6 +1153,36 @@ public class Utils {
 	 */
 	public static long getCurrentTimestamp() {
 		return Instant.now().toEpochMilli();
+	}
+
+	/**
+	 * Most recently created current-timestamp cell. Read and written without
+	 * synchronisation: a race merely creates an equal cell, never a wrong one.
+	 *
+	 * <p>Deliberately left at its default {@code null} rather than a constant such as
+	 * {@code CVMLong.ZERO}. Initialising it would make {@code Utils} class
+	 * initialisation depend on {@code CVMLong}, and {@code CVMLong} initialisation
+	 * already reaches {@code Utils} via {@code Ref} and {@code Hash} — a cycle which
+	 * deadlocks whenever two threads enter the two ends at once.</p>
+	 */
+	private static volatile CVMLong currentTimestampCell;
+
+	/**
+	 * Gets the current system timestamp as a CVM value, reusing the previously
+	 * created cell while still within the same millisecond.
+	 *
+	 * <p>Callers commonly stamp many values per millisecond, so the cached cell
+	 * avoids repeatedly allocating and encoding an identical value.</p>
+	 *
+	 * @return Current timestamp as a CVM Long
+	 */
+	public static CVMLong getCurrentTimestampCell() {
+		long now=getCurrentTimestamp();
+		CVMLong cached=currentTimestampCell;
+		if (cached!=null && cached.longValue()==now) return cached;
+		CVMLong result=CVMLong.create(now);
+		currentTimestampCell=result;
+		return result;
 	}
 
 	private static final long startupTimestamp=getCurrentTimestamp();

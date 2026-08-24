@@ -40,14 +40,14 @@ is intentionally minimal and extensible — easy to layer applications and UI on
 <dependency>
     <groupId>world.convex</groupId>
     <artifactId>convex-social</artifactId>
-    <version>0.8.11</version>
+    <version>0.8.15</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'world.convex:convex-social:0.8.11'
+implementation 'world.convex:convex-social:0.8.15'
 ```
 
 ## Usage
@@ -105,12 +105,19 @@ For a node that also wants convex-core's application regions (`:data`, `:fs`, `:
 KeyedLattice root = Lattice.ROOT.addLattice(Social.KEY_SOCIAL, Social.SOCIAL_LATTICE);
 ```
 
-A `Social` instance is then connected to the node's root cursor so that writes propagate
-up for lattice push/pull:
+A `Social` region is normally connected beneath the node's application component.
+This preserves the component hierarchy and delegates persistence to the generic root
+host without making the social branch depend on `NodeServer`:
 
 ```java
-Social social = Social.connect(rootCursor, keyPair);
+P2PApplication application = node.getApplication();
+Social social = Social.connect(application);
+social.user(keyPair.getAccountKey()).feed().post("Hello");
+application.sync();
 ```
+
+`Social.connect(parent, keyPair)` is available when a child needs its own signing
+context. The raw-cursor overload remains a low-level standalone adapter.
 
 ## Design
 

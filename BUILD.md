@@ -4,17 +4,42 @@
 
 Convex main repository is structured as a multi-module Maven project.
 
+## Fast local iteration
+
+Use the Maven wrapper so local builds use the repository's pinned Maven
+version. Avoid `clean` while iterating: it deliberately discards every compiled
+class and generated source across all modules.
+
+Commands below use the Unix/Git Bash wrapper spelling. In Windows PowerShell,
+replace `./mvnw` with `.\mvnw.cmd` and keep the remaining arguments unchanged.
+
+```bash
+# Compile and test one changed module plus its dependencies
+./mvnw -B -T1C test -pl convex-peer -am
+
+# Incrementally compile and test the complete reactor
+./mvnw -B -T1C test
+```
+
+Reserve `./mvnw -B clean install` for final verification and releases. Ordinary
+builds do not generate source/Javadoc jars or load Maven Central publishing;
+`-Prelease` enables those release-only artifacts and services.
+
 ## CI Workflows
 
-Three GitHub Actions workflows handle continuous integration:
+Four GitHub Actions workflows handle continuous integration:
 
 ### Build (`build.yml`)
 
 Runs on every push to any branch, and on pull requests (including from forks). Builds the project and runs all tests. Superseded runs on the same branch/PR are cancelled automatically.
 
+### CodeQL (`codeql.yml`)
+
+Static security analysis for the Java codebase (tests run separately in `build.yml`). Runs on pushes and pull requests targeting `develop` and `master`, plus a weekly scheduled scan. Superseded analyses for the same ref are cancelled automatically.
+
 ### Release (`release.yml`)
 
-Triggered when a version tag is pushed (e.g. `0.8.3`). Builds, tests, and creates a GitHub Release with `convex.jar` attached. A follow-on `docker` job then builds and pushes `convexlive/convex:<version>` and `convexlive/convex:latest` to Docker Hub.
+Triggered when a version tag is pushed (e.g. `0.8.3`). Builds, tests, and creates a GitHub Release with `convex.jar` attached, together with its SHA-256 checksum, an SBOM and a signed build-provenance attestation (verifiable with `gh attestation verify convex.jar -R Convex-Dev/convex`). A follow-on `docker` job then builds and pushes `convexlive/convex:<version>` and `convexlive/convex:latest` to Docker Hub.
 
 (The Docker build must be a job inside this workflow: releases created with the workflow `GITHUB_TOKEN` do not fire `release: [published]` events, so a separate workflow triggered on release publication would never run.)
 
@@ -35,7 +60,7 @@ Requires two secrets configured in the GitHub repository:
 ### 1. Ensure clean build
 
 ```bash
-mvn -B clean install
+./mvnw -B clean install
 ```
 
 All tests must pass, including headless (no GUI) — the CI server runs on headless Linux.
@@ -66,11 +91,11 @@ The `pull --ff-only` on both branches ensures you're not merging a stale local d
 ### 4. Set version
 
 ```bash
-mvn versions:set -DnewVersion='0.8.4' -DgenerateBackupPoms=false
+./mvnw -B versions:set -DnewVersion='0.8.4' -DgenerateBackupPoms=false
 git add pom.xml '**/pom.xml' && git commit -m "Prepare for Release 0.8.4"
 ```
 
-`mvn versions:set` only rewrites `pom.xml` files — stage those explicitly rather than `git add -A`, which would sweep in any unrelated working-tree changes (stray `.env` files, editor scratch files, partial WIP).
+`./mvnw versions:set` only rewrites `pom.xml` files — stage those explicitly rather than `git add -A`, which would sweep in any unrelated working-tree changes (stray `.env` files, editor scratch files, partial WIP).
 
 As part of the same version-bump commit, also update:
 
@@ -98,7 +123,7 @@ As part of the same version-bump commit, also update:
 carries the snapshot version. Smoke-testing it would validate the wrong artifact:
 
 ```bash
-mvn -B clean install
+./mvnw -B clean install
 java -jar convex-integration/target/convex.jar --version
 ```
 
@@ -124,7 +149,8 @@ https://github.com/Convex-Dev/convex/releases
 
 Verify:
 - Release status is not draft/pre-release
-- `convex.jar` is attached as an asset
+- `convex.jar` is attached as an asset, along with its SHA-256 checksum (`convex.jar.sha256`) and the SBOM (`convex-<version>-sbom.json`)
+- Build provenance verifies against the downloaded jar: `gh attestation verify convex.jar -R Convex-Dev/convex`
 - Changelog content is correct (not the fallback "See CHANGELOG.md for details" — if that shows, the changelog section header didn't match the tag and the workflow should have failed; investigate).
 - Docker images pushed: `convexlive/convex:<version>` and a freshly-updated `latest` at https://hub.docker.com/r/convexlive/convex/tags
 
@@ -160,17 +186,22 @@ Only after confirming the GitHub Release is live:
 
 ```bash
 git checkout master
-mvn deploy -Prelease
+./mvnw deploy -Prelease
 ```
 
-This signs all artifacts with GPG and uploads to Maven Central via the Sonatype Central Publishing plugin. Requires GPG signing key and Maven Central credentials configured locally.
+This signs all artifacts with GPG and uploads to Maven Central via the Sonatype Central Publishing plugin. The command returns only after Central confirms publication. It requires a GPG signing key and Maven Central credentials configured locally.
+
+Run this local publishing command interactively: GPG needs to open pinentry for the
+signing-key passphrase. Do not add Maven's `-B` batch flag, which prevents that
+prompt. Unattended CI publishing must provide signing credentials through its
+secret environment rather than command-line properties.
 
 ### 9. Prepare next development version
 
 ```bash
 git checkout develop
 git merge master --no-ff
-mvn versions:set -DnewVersion='0.8.5-SNAPSHOT' -DgenerateBackupPoms=false
+./mvnw -B versions:set -DnewVersion='0.8.5-SNAPSHOT' -DgenerateBackupPoms=false
 git add pom.xml '**/pom.xml' && git commit -m "Prepare for next development cycle (0.8.5-SNAPSHOT)"
 ```
 

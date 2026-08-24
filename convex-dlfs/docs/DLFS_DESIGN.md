@@ -16,7 +16,7 @@ built on Convex immutable data structures with Java NIO compatibility.
 │          (Javalin HTTP + WebDAV protocol)                    │
 │  - URL routing: /dlfs/{drive}/{path}                         │
 │  - JWT authentication (Ed25519 bearer tokens)                │
-│  - DLFSDriveManager: per-identity drive registry             │
+│  - DLFSDriveManager: local identity-to-component routing     │
 │  - PropfindResponse: RFC 4918 XML responses                  │
 └──────────────────────┬───────────────────────────────────────┘
                        │  java.nio.file API
@@ -88,9 +88,15 @@ The cursor can be a `RootLatticeCursor` (standalone drive), a `DescendedCursor`
 | `DLFSLocal` | `convex-core/.../lattice/fs/impl/DLFSLocal.java` | Mutable filesystem (Java NIO) |
 | `DLFileSystem` | `convex-core/.../lattice/fs/DLFileSystem.java` | Abstract base with timestamp |
 | `DLFS` | `convex-core/.../lattice/fs/DLFS.java` | Factory methods |
+| `RootComponent` | `convex-core/.../lattice/RootComponent.java` | Generic store-backed application root and persistence policy |
+| `ALatticeApplication` | `convex-core/.../lattice/ALatticeApplication.java` | Root-level application composition and durability boundary |
+| `DLFSApplication` | `convex-dlfs/.../dlfs/DLFSApplication.java` | Application component composing DLFS at a configured path |
+| `DLFSRegion` | `convex-dlfs/.../dlfs/DLFSRegion.java` | Physical multi-owner DLFS region at an arbitrary lattice path |
+| `DLFSDrives` | `convex-dlfs/.../dlfs/DLFSDrives.java` | One owner's map of named drives |
+| `DLFSDrive` | `convex-dlfs/.../dlfs/DLFSDrive.java` | Per-drive component and hosted NIO adapter |
 | `DLFSServer` | `convex-dlfs/.../dlfs/DLFSServer.java` | Javalin HTTP server lifecycle |
 | `DLFSWebDAV` | `convex-dlfs/.../dlfs/DLFSWebDAV.java` | WebDAV route handlers |
-| `DLFSDriveManager` | `convex-dlfs/.../dlfs/DLFSDriveManager.java` | Per-identity drive registry |
+| `DLFSDriveManager` | `convex-dlfs/.../dlfs/DLFSDriveManager.java` | Local drive routing, mapping and service adapter |
 | `PropfindResponse` | `convex-dlfs/.../dlfs/PropfindResponse.java` | RFC 4918 XML response builder |
 
 ## WebDAV Layer
@@ -102,12 +108,14 @@ and any HTTP client.
 ### Server Stack
 
 ```
-DLFSServer
+DLFSServer (transport lifecycle only)
   ├── Javalin (HTTP framework, virtual threads via Jetty)
-  ├── AuthMiddleware (Ed25519 JWT bearer tokens)
-  └── DLFSWebDAV (route handlers)
-        └── DLFSDriveManager (per-identity drive registry)
-              └── DLFSLocal instances (one per identity + drive name)
+  ├── AuthMiddleware (optional Ed25519 JWT bearer tokens)
+  ├── DLFSWebDAV (route handlers)
+  └── DlfsMcpTools
+        └── DLFSDriveManager (local routing policy)
+              ├── identity → DLFSDrives component → DLFSDrive NIO view
+              └── explicit ephemeral fallback for tests/demos only
 ```
 
 `DLFSServer` owns the Javalin lifecycle. It binds to loopback by default, applies a
@@ -115,6 +123,27 @@ bounded request size, wires authentication middleware (optional), registers WebD
 routes, and configures Jetty with minimal platform threads (1 acceptor + 1 selector)
 since request handling uses virtual threads. Cross-origin access is not enabled by
 default.
+
+### Application Component Stack
+
+The developer-facing lattice application stack is independent of HTTP and of the
+particular host implementation:
+
+```
+RootComponent<V>                  store persistence, root publication, flush
+└── ALatticeApplication<V>        complete-root application composition
+    └── DLFSApplication<V>        configured DLFS region path
+        └── DLFSRegion            physical multi-owner lattice region
+            └── DLFSDrives        long-lived component for one owner
+                └── DLFSDrive     named drive plus local NIO view
+```
+
+A local bootstrap obtains the root with `RootComponent.open(...)` (usually through
+`DLFSApplication.open(...)`). A networked bootstrap obtains the same root abstraction
+from `NodeServer.getRootComponent()`. No application branch depends on `NodeServer`.
+`sync()` publishes logical state through the host policy; `flush()` is the separate
+store durability barrier. `DLFSDriveManager` is outside this ownership tree because
+it is service routing policy and may map identities across several regions or roots.
 
 ### URL Structure
 
@@ -151,22 +180,29 @@ MOVE/COPY currently returns 501 rather than performing a partial operation.
 
 ### Authentication
 
-Authentication is optional and controlled by the `AKeyPair` passed to
-`DLFSServer.create()`. When a key pair is provided:
+Authentication is optional and controlled by the `PeerAuth` passed to
+`DLFSServer.createAuthenticated()`. `createWithAudience()` derives the standard
+did:key audience policy from an `AKeyPair`. When authentication is configured:
 
 1. `AuthMiddleware` extracts Ed25519 JWT bearer tokens from the `Authorization` header
 2. The token's `sub` claim provides the user identity as a DID string (`did:key:...`)
 3. `DLFSWebDAV.getIdentity()` reads this from the request context
-4. `DLFSDriveManager` uses the identity to namespace drives per user
+4. `DLFSDriveManager` uses the identity to route to that user's drives
 
-When a key pair is supplied, `requireAuthForWrites` is enabled by default. Mutating operations (PUT,
+When authentication is configured, `requireAuthForWrites` is enabled by default. Mutating operations (PUT,
 DELETE, MKCOL, MOVE, COPY) return 401 if no valid token is present. Read operations
 (GET, HEAD, PROPFIND) are always allowed.
 
 ### Drive Management
 
-`DLFSDriveManager` maintains a `ConcurrentHashMap<String, FileSystem>` keyed by
-`"{identity}:{driveName}"` (anonymous identity uses `":{driveName}"`).
+`DLFSDriveManager` is the local routing and service layer. `createRouter()` fails
+closed for unmounted identities. `mount(identity, drives)` and
+`mountAnonymous(drives)` route requests to an owner's `DLFSDrives` component,
+whose lattice map is authoritative and whose cached `DLFSDrive` objects are local
+views only. One manager may therefore span owners, physical regions and hosted
+roots without changing the physical `DLFSRegion` model. `createEphemeral()` is the
+explicit test/demo mode; it maintains a process-local
+`ConcurrentHashMap<String, FileSystem>` keyed by `"{identity}:{driveName}"`.
 
 | Operation | Method | Semantics |
 |-----------|--------|-----------|
@@ -177,9 +213,9 @@ DELETE, MKCOL, MOVE, COPY) return 401 if no valid token is present. Read operati
 | Rename | `renameDrive(identity, old, new)` | Atomic under the manager lock |
 | Seed | `seedDrive(identity, name, fs)` | Unconditional `put` (for testing) |
 
-Currently drives are in-memory (`DLFS.createLocal()`). The drive manager is designed
-to be replaceable with a lattice cursor-backed implementation where each drive is a
-descended cursor into a `MapLattice<DLFSLattice>`.
+Standalone drives use `DLFS.createLocal()`. The hosted constructor accepts
+`DLFSDrives`; each drive is then a descended component and cursor into a
+`MapLattice<DLFSLattice>`.
 
 ### Request Flow
 
@@ -197,8 +233,9 @@ HTTP request
 
 File operations go through the NIO filesystem abstraction. Whole-file replacements
 use `DLFileSystem.writeAllBytes` so truncate and write form one filesystem-locked
-mutation. Each external mutation advances the local timestamp and calls `sync()`;
-PUT also supports ETag-based `If-Match` and `If-None-Match` preconditions.
+mutation. Each external transport mutation refreshes the caller-managed timestamp and
+calls `sync()`; PUT also supports ETag-based `If-Match` and `If-None-Match`
+preconditions. DLFS itself does not advance that timestamp.
 
 ### Content-Type Detection
 
@@ -234,10 +271,12 @@ deterministically as `max(getUTime(a), getUTime(b))` — no external timestamp n
   (deleted child name → deletion timestamp), held as an optional 5th node element that
   is present only when non-empty (the default node stays 4 elements). Live entries and
   tombstones are merged independently, then reconciled: a tombstone whose timestamp is
-  newer than (or equal to) a live child deletes it; a newer creation resurrects the name.
-- **Directional ties**: unequal files with equal timestamps prefer `a`. Merge is
+  newer than a live child deletes it; a newer creation resurrects the name.
+- **Directional ties**: equal-timestamp conflicts prefer `a`, the current local (`own`)
+  value. This includes unequal files and live-versus-tombstone conflicts. Merge is
   therefore intentionally not fully commutative; callers must preserve own/foreign
-  direction and avoid accidental timestamp ties.
+  direction. A local mutation replaces equal-timestamp local state and must remain
+  `own` when an older snapshot is merged back.
 - **Idempotency**: `merge(a, a) == a`.
 
 ### Metadata Contract
@@ -259,16 +298,21 @@ Applications that need field-level or custom metadata convergence should place a
 lattice value in the metadata slot and perform that merge at their application boundary;
 DLFS itself guarantees only whole-slot last-write-wins behaviour.
 
-### Two Timestamps
+### Mutation and Merge Timestamps
 
 | Timestamp | Source | Used For |
 |-----------|--------|----------|
-| **Drive timestamp** | `DLFileSystem.getTimestamp()` | Creating new files, directories, tombstones |
+| **Mutation timestamp** | `DLFSLocal.getCursor().getContext().currentTimestamp()` | Creating new files, directories, tombstones |
 | **Merge timestamp** | `max(getUTime(a), getUTime(b))` | Conflict resolution during merge |
 
-These are deliberately separate. The drive timestamp is set by the application
-(`setTimestamp()` or `updateTimestamp()`). The merge timestamp is always derived from
-the data being merged — never from the drive's current time.
+These are deliberately separate. The application supplies mutation time through the
+cursor's `LatticeContext`; neither `DLFileSystem` nor `DLFSLocal` stores or updates a
+separate clock. DLFS consumes the context timestamp exactly and never derives a later
+mutation time from stored nodes or tombstones. The application owns the clock and its
+refresh cadence. An empty context uses `LatticeContext.currentTimestamp()`'s standalone
+wall-clock fallback.
+The merge timestamp is always derived from the data being merged—never from the
+current application context.
 
 ## API
 
@@ -278,12 +322,15 @@ the data being merged — never from the drive's current time.
 // Standalone drive with its own lattice cursor
 DLFSLocal drive = DLFS.create();
 
-// Connected drive — path into a parent lattice cursor
+// Connected drive — path into a parent lattice cursor, heap-backed file data
 ALatticeCursor<?> parent = Cursors.createLattice(MapLattice.create(DLFSLattice.INSTANCE));
 DLFSLocal drive = DLFS.connect(parent, Strings.create("myDrive"));
 
-// Legacy (delegates to create())
-DLFileSystem drive = DLFS.createLocal();
+// Store-backed cursor drive — large NIO writes persist incrementally
+DLFSLocal storedDrive = DLFS.connect(parent, Strings.create("storedDrive"), store);
+
+// Alias for a standalone local drive
+DLFSLocal drive = DLFS.createLocal();
 ```
 
 ### Java NIO Filesystem
@@ -292,7 +339,8 @@ Standard Java NIO operations work transparently:
 
 ```java
 DLFSLocal drive = DLFS.create();
-drive.updateTimestamp();
+drive.getCursor().setContext(
+    drive.getCursor().getContext().withTimestamp(operationTimestamp));
 
 Path file = Files.createFile(drive.getPath("readme.txt"));
 Files.write(file, "hello".getBytes());
@@ -334,10 +382,12 @@ DLFSLocal driveA = DLFS.create();
 DLFSLocal driveB = DLFS.create();
 
 // Make changes to both
-driveA.updateTimestamp();
+driveA.getCursor().setContext(
+    driveA.getCursor().getContext().withTimestamp(timestampA));
 Files.createFile(driveA.getPath("fileA.txt"));
 
-driveB.updateTimestamp();
+driveB.getCursor().setContext(
+    driveB.getCursor().getContext().withTimestamp(timestampB));
 Files.createFile(driveB.getPath("fileB.txt"));
 
 // Merge B into A — both files present after merge
@@ -365,8 +415,9 @@ MapLattice<AString, AVector<ACell>> drivesLattice = MapLattice.create(DLFSLattic
 ALatticeCursor<AHashMap<AString, AVector<ACell>>> drivesRoot =
     Cursors.createLattice(drivesLattice);
 
-// Connect a named drive — initialises with zero value if absent
-DLFSLocal drive = DLFS.connect(drivesRoot, Strings.create("myDrive"));
+// Connect a named drive — initialises with zero value if absent and uses the
+// containing application's store for incremental blob persistence
+DLFSLocal drive = DLFS.connect(drivesRoot, Strings.create("myDrive"), store);
 
 // File operations automatically update the cursor, which propagates
 // up through the lattice hierarchy
@@ -379,18 +430,41 @@ See [WebDAV Layer](#webdav-layer) above for the full HTTP server architecture.
 Since WebDAV and the GUI share the same `DLFSLocal` instances (backed by the same
 cursors), operations through either path are automatically consistent.
 
-### Network Sync via NodeServer
+### Hosted Components and Network Sync
 
-A `NodeServer` can host the drives lattice and propagate changes to peers:
+`RootComponent` is the generic store-backed application boundary in `convex-core`.
+It may be created directly over a local `AStore`, or exposed by `NodeServer` for a
+networked application. A physical `DLFSRegion` can be connected at the root or at
+any nested lattice path without depending on NodeServer:
 
 ```java
-NodeServer<V> node = new NodeServer<>(drivesLattice, store, port);
+KeyedLattice lattice = KeyedLattice.create(
+    Keyword.intern("documents"), DLFSRegion.LATTICE);
+NodeServer<Index<Keyword, ACell>> node =
+    new NodeServer<>(lattice, store, NodeConfig.port(0));
 node.launch();
 
-// Drives backed by cursors into the NodeServer's lattice
-// Changes propagate to peers via LatticePropagator
-node.sync();
+DLFSApplication<Index<Keyword, ACell>> app = DLFSApplication.connect(
+    node.getRootComponent(), Keyword.intern("documents"));
+DLFSDrives drives = app.drives(ownerKey);
+DLFSDrive drive = drives.createDrive("home");
+Files.writeString(drive.fileSystem().getPath("/data.txt"), "value");
+app.sync();
 ```
+
+For a non-networked host, `DLFSApplication.open(store, keyPair)` restores the
+standard root and connects its DLFS region at `:fs`.
+
+`DLFSDriveManager.mount(identity, drives)` exposes owner components to WebDAV and
+MCP and remains the place for local mappings that span owners, physical regions
+or hosted roots. `DLFSServer` owns transport only and never owns the application,
+host or store lifecycle.
+The component hierarchy exposes its root `AStore` internally to each drive's
+`DLFSLocal` adapter, while `sync()` remains the explicit publication and replication
+boundary. Streamed blob writes install store-backed references every 16 MiB without
+moving the cursor or selecting retained GC roots. A region, drive collection or
+drive `fork()` is a temporary working component and only merges logical changes when
+explicitly synced.
 
 ## Production Readiness
 
@@ -409,7 +483,8 @@ node.sync();
 | DLFSBrowser GUI | ✅ Working (lifecycle managed) |
 | Standalone multi-drive management | ✅ Working in process (GUI + WebDAV) |
 | Cursor-backed drive registry | ✅ Atomic create/rename/delete with explicit sync |
-| DLFSBrowser with NodeServer | ⚠️ Etch-backed drive contents; persistent registry lifecycle incomplete |
+| Hosted DLFS components | ✅ Generic root parent, arbitrary region path, owner drive maps, temporary forks |
+| DLFSBrowser with NodeServer | ✅ Etch-backed drive contents and persistent registry |
 | Network replication via NodeServer | ⚠️ Basic (pull/push working, no signing) |
 
 ### DLFSBrowser
@@ -429,10 +504,16 @@ cursor-backed and registered in WebDAV automatically.
 
 ### Persistence
 
-Cursor-backed drive contents and registry operations persist through the NodeServer's
-`LatticePropagator` (EtchStore). `DLFSDriveManager.sync()` marks the explicit persistence
-boundary; ordinary in-memory mutations do not perform I/O. Cursor-backed manager mode
-currently represents one owner namespace. Standalone drives (via `DLFS.createLocal()`)
+Component-backed drives obtain the root component's `AStore`; cursor-level embedders
+get the same incremental blob persistence by passing that store to
+`DLFS.connect(parent, name, store)` or `DLFS.open(parent, name, store)`. Both paths
+therefore use `DLFSLocal` and `Cells.persist` rather than separate persistence
+adapters. `DLFSDriveManager.sync()` marks the explicit publication boundary.
+Persisting immutable blob structure before that boundary replaces direct references
+with soft references but does not select a GC root. The filesystem neither owns nor
+closes the supplied store.
+Mounted manager routes may adapt multiple owners' `DLFSDrives` components.
+Standalone drives (via `DLFS.createLocal()`) and the two-argument cursor factories
 remain entirely in-memory and need explicit persistence if required.
 
 ## CAD045 Conformance
@@ -444,7 +525,7 @@ DLFS follows the lattice application best practices defined in CAD045:
 | **Lattice layer** | `DLFSLattice` extends `ALattice<AVector<ACell>>` with recursive directory merge via `IndexLattice` |
 | **Pure functions** | `DLFSNode` — all merge/navigate/update operations are pure, deterministic, and side-effect-free |
 | **Cursor-backed mutability** | `DLFSLocal` wraps `ALatticeCursor<AVector<ACell>>`; all writes via `cursor.updateAndGet()` |
-| **Factory methods** | `DLFS.create()` (standalone), `DLFS.connect(parent, name)` (node-attached) |
+| **Factory methods** | `DLFS.create()` (standalone), `DLFS.connect(parent, name, store)` (store-backed cursor), component-backed `DLFSDrive.fileSystem()` |
 | **Fork/sync** | `DLFileSystem.fork()` → `ForkedLatticeCursor` for isolated batch operations; `sync()` merges back |
 | **Lattice merge** | `DLFSLocal.merge()` delegates to `rootCursor.merge()` using lattice semantics |
 | **Foreign validation** | `DLFSLattice.checkForeign()` validates node structure (vector length, timestamp type) |

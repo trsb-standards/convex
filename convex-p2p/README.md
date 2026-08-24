@@ -56,17 +56,25 @@ tests.
 ### Owner binding
 
 Both populated regions are `OwnerLattice`s keyed by `AccountKey`, so a user can only
-write their own slot. Two sharp edges are worth knowing, both pinned by tests:
+write their own slot. Three points are pinned by tests:
 
-**Owner checks run on merge, not on write — deliberately.** `LatticeContext.verifyOwner`
-is called from `OwnerLattice`'s context-aware merge, so it catches everything arriving
-from a peer. A *direct* local `cursor().set(..)` is not a merge and is not policed. An
-app that writes a slot it cannot properly sign has corrupted only its own subtree:
-owner-keying means it can wedge no slot but its own, peers discard the bad slot on
-merge, and a node that keeps sending them trips `NodeServer`'s per-connection
-circuit-breaker (`maxConsecutiveRejects`) and loses the connection. Guarding local
-writes would buy nothing at the boundary that matters, and would wrongly block a node
-that legitimately holds keys for more than one identity.
+**One authorisation rule, applied at both boundaries.** `LatticeContext.signAs` decides
+whether this node may author a value for an owner, and it is the same rule
+`LatticeContext.verifyOwner` applies to data arriving from a peer. An owner that is an
+`AccountKey` requires that key; an indirect owner (Address, DID) is resolved by the
+installed owner verifier, and stays lenient when there is none.
+
+**Owner paths request their signer on write.** A direct local write through a signed
+owner path asks the installed `LatticeContext` for a signer authorised for that owner.
+A key-store-backed policy can supply any accessible identity, whether or not it is the
+primary key; without one the write throws rather than storing a slot no peer would
+accept.
+
+**A merge never fails over an owner you cannot author.** Most merges select one of the
+two signed values and need no signature. When the inner lattice synthesises a genuinely
+new value, `SignedLattice` signs it as the owner if it can and otherwise keeps the own
+value — so merging a peer's data converges the owners this node holds keys for and
+leaves the others to their owners, instead of aborting the whole merge.
 
 **The two-argument merge skips the check entirely.** `merge(own, other)` does not verify
 the signer against the owner key — only the context-aware overload does. Every real path
@@ -144,14 +152,14 @@ up with the option to switch it off.
 <dependency>
     <groupId>world.convex</groupId>
     <artifactId>convex-p2p</artifactId>
-    <version>0.8.11</version>
+    <version>0.8.15</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'world.convex:convex-p2p:0.8.11'
+implementation 'world.convex:convex-p2p:0.8.15'
 ```
 
 ## Usage
@@ -169,35 +177,44 @@ try (P2PNode node = P2PNode.create(store, NodeConfig.port(18888), keyPair)) {
     node.serveAllInbound();   // intentionally public single-view node
     node.launch();
 
-    // Modify this user's P2P area through a cursor, then push it back
+    P2PApplication app = node.getApplication();
+
+    // Modify this user's identity component, then publish the application root
     P2PUser me = node.p2p(keyPair.getAccountKey());   // or node.p2p()
-    me.cursor().set(P2PLattice.createIdentity(Strings.create("alice"), null, null, ts));
-    me.sync();
+    me.identity().setIdentity(Strings.create("alice"), null, ts);
+    app.sync();
 }
 ```
 
+`P2PNode` is the network bootstrap and lifecycle owner. `P2PApplication` is the
+host-neutral lattice application component; it can also be connected directly to a
+standalone `RootComponent` for local use.
+
 ### The user area API
 
-`node.p2p(userID).cursor()` returns a cursor at that user's identity slot
-(`[:id <userKey> :value]`), already through the signing boundary — the application reads
-and writes plain values and never touches `SignedData`:
+One user has data in two independent regions. `P2PIdentity` represents
+`[:id <userKey> :value]`; `P2PNodeRecord` represents
+`[:p2p :nodes <userKey> :value]`. Both are path-specific components already through
+the signing boundary. `P2PUser` is a convenience facade that contains them rather
+than pretending the two paths are one component:
 
 ```java
 P2PUser me = node.p2p();              // own area, using the node's key pair
-me.cursor().set(identityMap);         // signed on write
-me.sync();                            // pushed to the lattice root
+me.identity().setIdentity(identityMap); // signed on write
+me.identity().sync();                 // merge this working path
 
-me.nodeCursor()                       // [:p2p :nodes <userKey> :value], same deal
+me.node().cursor()                    // independent node-record component
 
 P2PUser draft = me.fork();            // batch edits, isolated
 draft.cursor().set(...);
 draft.sync();                         // merged back under LWW
+node.getApplication().sync();         // publish the complete root
 ```
 
-The cursor is scoped to one user: no other user's data is reachable through it, and the
-component holds no handle to the wider lattice root. `node.p2p(someoneElse)` is a
-readable view of their published area; writing it is a mistake the lattice does not need
-to prevent (see [Owner binding](#owner-binding) above).
+Each component cursor is scoped to one user and one region; no other user's data is
+reachable through it. `node.p2p(someoneElse)` is a readable facade over their
+published components; writing it is a mistake the lattice does not need to prevent
+(see [Owner binding](#owner-binding) above).
 
 Or run a node standalone:
 

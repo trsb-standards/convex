@@ -1,6 +1,11 @@
 package convex.lattice.fs;
 
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Set;
 
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
@@ -48,16 +53,26 @@ public class DLFSNode {
 	 * side is kept unchanged; names present on both are merged recursively. No instrumentation —
 	 * a purely-live change can never be a tombstone conflict, so the live merge needs none.
 	 */
-	private static final MergeFunction<AVector<ACell>> CHILD_MERGE = new MergeFunction<AVector<ACell>>() {
+	private static final class ChildMerge implements MergeFunction<AVector<ACell>> {
+		private final long maximumTimestamp;
+
+		private ChildMerge(long maximumTimestamp) {
+			this.maximumTimestamp=maximumTimestamp;
+		}
+
 		@Override
 		public AVector<ACell> merge(AVector<ACell> ca, AVector<ACell> cb) {
 			if (cb==null) return ca;
-			if (!isValidNodeShallow(cb)) throw new IllegalArgumentException("Malformed foreign DLFS child");
+			if (!isValidNodeShallow(cb) || getUTime(cb).longValue()>maximumTimestamp) {
+				throw new IllegalArgumentException("Malformed or future-dated foreign DLFS child");
+			}
 			if (ca==null) return cb;
 			if (!isValidNodeShallow(ca)) throw new IllegalArgumentException("Malformed own DLFS child");
-			return DLFSNode.merge(ca,cb);
+			return DLFSNode.merge(ca,cb,this);
 		}
-	};
+	}
+
+	private static final ChildMerge UNBOUNDED_CHILD_MERGE=new ChildMerge(Long.MAX_VALUE);
 
 
 	
@@ -90,6 +105,157 @@ public class DLFSNode {
 			if (!directory || !(tombs instanceof Index<?, ?> index) || index.isEmpty()) return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Validates a complete DLFS subtree without recursive Java calls.
+	 *
+	 * <p>This is intended for novel foreign subtrees, not the ordinary filesystem
+	 * access fast path. It validates child and tombstone entry types as well as
+	 * every node shape.</p>
+	 *
+	 * @param root root of the subtree
+	 * @return true if the complete subtree is valid
+	 */
+	public static boolean isValidTree(AVector<ACell> root) {
+		if (!isValidNodeShallow(root)) return false;
+		ACell rootContents=root.get(POS_DIR);
+		if (!(rootContents instanceof Index<?,?> rootEntries)) return true; // regular file
+		if (rootEntries.isEmpty() && root.count()==NODE_LENGTH) return true; // common empty directory
+		Deque<AVector<ACell>> pending=new ArrayDeque<>();
+		Set<AVector<ACell>> seen=Collections.newSetFromMap(new IdentityHashMap<>());
+		pending.push(root);
+		while (!pending.isEmpty()) {
+			AVector<ACell> node=pending.pop();
+			if (!seen.add(node)) continue;
+			if (!isValidNodeShallow(node)) return false;
+			ACell contents=node.get(POS_DIR);
+			if (contents instanceof Index<?,?> entries) {
+				long n=entries.count();
+				for (long i=0;i<n;i++) {
+					MapEntry<?,?> entry=entries.entryAt(i);
+					if (!(entry.getKey() instanceof AString)) return false;
+					if (!(entry.getValue() instanceof AVector<?> child)) return false;
+					@SuppressWarnings("unchecked")
+					AVector<ACell> childNode=(AVector<ACell>)child;
+					pending.push(childNode);
+				}
+			}
+			if (node.count()>POS_TOMBS) {
+				Index<?,?> tombs=(Index<?,?>)node.get(POS_TOMBS);
+				long n=tombs.count();
+				for (long i=0;i<n;i++) {
+					MapEntry<?,?> entry=tombs.entryAt(i);
+					if (!(entry.getKey() instanceof AString) || !(entry.getValue() instanceof CVMLong)) return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Resolves a path while using any readable directory indexes encountered.
+	 * The returned value is deliberately raw so that operations such as delete
+	 * can remove a malformed final entry. A malformed ancestor only fails when
+	 * its directory index cannot be read.
+	 *
+	 * @param rootNode filesystem root
+	 * @param path path to resolve
+	 * @return raw stored value, or null for genuine absence
+	 * @throws DLFSCorruptionException if navigation is blocked by malformed state
+	 */
+	public static ACell resolveRaw(ACell rootNode, DLPath path) throws DLFSCorruptionException {
+		if (path==null || rootNode==null) return null;
+		ACell current=rootNode;
+		int n=path.getNameCount();
+		for (int i=0;i<n;i++) {
+			if (!(current instanceof AVector<?> vector)) {
+				throw corruption(path,"Non-node value blocks path at component "+i);
+			}
+			@SuppressWarnings("unchecked")
+			AVector<ACell> node=(AVector<ACell>)vector;
+			ACell contents=(node.count()>POS_DIR)?node.get(POS_DIR):null;
+			if (!(contents instanceof Index<?,?> rawEntries)) {
+				if (isValidNodeShallow(node)) return null; // a regular file has no descendants
+				throw corruption(path,"Unreadable directory blocks path at component "+i);
+			}
+			@SuppressWarnings("unchecked")
+			Index<AString,ACell> entries=(Index<AString,ACell>)rawEntries;
+			current=entries.get(path.getCVMName(i));
+			if (current==null) return null;
+		}
+		return current;
+	}
+
+	/**
+	 * Resolves a valid final node, allowing navigation through an otherwise
+	 * malformed ancestor when its directory index is still readable.
+	 *
+	 * @return valid node, or null for genuine absence
+	 */
+	public static AVector<ACell> resolveNode(ACell rootNode, DLPath path) throws DLFSCorruptionException {
+		ACell value=resolveRaw(rootNode,path);
+		if (value==null) return null;
+		if (!(value instanceof AVector<?> vector)) throw corruption(path,"Stored value is not a DLFS node");
+		@SuppressWarnings("unchecked")
+		AVector<ACell> node=(AVector<ACell>)vector;
+		if (!isValidNodeShallow(node)) throw corruption(path,"Malformed DLFS node");
+		return node;
+	}
+
+	/**
+	 * Resolves the readable live-entry index for a directory operation. Other
+	 * damaged fields do not prevent listing when the directory contents remain
+	 * readable.
+	 *
+	 * @return raw directory Index, or null if the path is absent or a valid file
+	 */
+	public static Index<?,?> resolveDirectoryEntries(ACell rootNode, DLPath path) throws DLFSCorruptionException {
+		ACell value=resolveRaw(rootNode,path);
+		if (value==null) return null;
+		if (!(value instanceof AVector<?> vector)) throw corruption(path,"Stored value is not a DLFS node");
+		if (vector.count()>POS_DIR) {
+			ACell contents=vector.get(POS_DIR);
+			if (contents instanceof Index<?,?> entries) return entries;
+		}
+		@SuppressWarnings("unchecked")
+		AVector<ACell> node=(AVector<ACell>)vector;
+		if (isValidNodeShallow(node)) return null;
+		throw corruption(path,"Directory contents are unreadable");
+	}
+
+	/**
+	 * Resolves a path for mutation. Every node on the path must be valid because
+	 * rebuilding a malformed ancestor could silently discard corrupt state.
+	 *
+	 * @return valid node, or null for genuine absence
+	 */
+	public static AVector<ACell> resolveValidPath(ACell rootNode, DLPath path) throws DLFSCorruptionException {
+		if (path==null || rootNode==null) return null;
+		ACell current=rootNode;
+		int n=path.getNameCount();
+		for (int i=0;i<=n;i++) {
+			if (!(current instanceof AVector<?> vector)) throw corruption(path,"Stored value is not a DLFS node");
+			@SuppressWarnings("unchecked")
+			AVector<ACell> node=(AVector<ACell>)vector;
+			if (!isValidNodeShallow(node)) throw corruption(path,"Malformed node on mutation path at position "+i);
+			if (i==n) return node;
+			Index<AString,AVector<ACell>> entries=getDirectoryEntries(node);
+			if (entries==null) return null;
+			current=getRawEntry(entries,path.getCVMName(i));
+			if (current==null) return null;
+		}
+		throw new AssertionError();
+	}
+
+	/** Returns a raw directory entry without trusting the Index value type. */
+	@SuppressWarnings("unchecked")
+	public static ACell getRawEntry(Index<?,?> entries, AString name) {
+		return ((Index<AString,ACell>)entries).get(name);
+	}
+
+	private static DLFSCorruptionException corruption(DLPath path, String reason) {
+		return new DLFSCorruptionException(path.toString(),reason);
 	}
 
 	/**
@@ -340,9 +506,29 @@ public class DLFSNode {
 	 * @return Merged node
 	 */
 	public static AVector<ACell> merge(AVector<ACell> a, AVector<ACell> b) {
+		return merge(a,b,Long.MAX_VALUE);
+	}
+
+	/**
+	 * Merges two nodes while refusing incoming updates beyond a host-supplied
+	 * timestamp bound. Validation is deliberately limited to the merge frontier;
+	 * conforming DLFS writers maintain descendant timestamps no later than their
+	 * ancestors.
+	 */
+	public static AVector<ACell> merge(AVector<ACell> a, AVector<ACell> b, long maximumTimestamp) {
+		ChildMerge childMerge=(maximumTimestamp==Long.MAX_VALUE)
+			?UNBOUNDED_CHILD_MERGE:new ChildMerge(maximumTimestamp);
+		return merge(a,b,childMerge);
+	}
+
+	private static AVector<ACell> merge(AVector<ACell> a, AVector<ACell> b, ChildMerge childMerge) {
+		long maximumTimestamp=childMerge.maximumTimestamp;
 		if (a.equals(b)) return a;
 		CVMLong timeA=getUTime(a);
 		CVMLong timeB=getUTime(b);
+		if (timeB.longValue()>maximumTimestamp) {
+			throw new IllegalArgumentException("Future-dated foreign DLFS node");
+		}
 
 		// Deterministic merge time: max of input node timestamps
 		CVMLong mergeTime = timeA.longValue() >= timeB.longValue() ? timeA : timeB;
@@ -361,7 +547,7 @@ public class DLFSNode {
 			}
 
 			// Live-entry merge needs no instrumentation: a purely-live change is never a conflict.
-			Index<AString, AVector<ACell>> mergedDir = contA.mergeDifferences(contB, CHILD_MERGE);
+			Index<AString, AVector<ACell>> mergedDir = contA.mergeDifferences(contB, childMerge);
 
 			// Common case: no deletions anywhere, so no live-vs-dead conflict is possible.
 			if (tombA.isEmpty() && tombB.isEmpty()) {
@@ -377,6 +563,9 @@ public class DLFSNode {
 			Index<AString, CVMLong> mergedTomb = tombA.mergeDifferences(tombB, new MergeFunction<CVMLong>() {
 				@Override
 				public CVMLong merge(CVMLong ta, CVMLong tb) {
+					if (tb!=null && tb.longValue()>maximumTimestamp) {
+						throw new IllegalArgumentException("Future-dated foreign DLFS tombstone");
+					}
 					if (ta==null) return tb;
 					if (tb==null) return ta;
 					return ta.longValue()>=tb.longValue()?ta:tb;
@@ -388,16 +577,22 @@ public class DLFSNode {
 				}
 			});
 
-			// Reconcile: a name both live and tombstoned resolves by timestamp.
+			// Reconcile: a name both live and tombstoned resolves by timestamp. On a
+			// tie, preserve the first (own/current) operand, consistently with other
+			// DLFS node conflicts. This is load-bearing for a local update merged with
+			// an equal-timestamp stale snapshot.
 			for (AString name : tombTouched) {
 				AVector<ACell> live = mergedDir.get(name);
 				if (live==null) continue;
 				CVMLong death = mergedTomb.get(name);
 				if (death==null) continue;
-				if (death.longValue() >= getUTime(live).longValue()) {
-					mergedDir = mergedDir.dissoc(name);   // deletion wins (tombstone preferred on tie)
+				long deathTime=death.longValue();
+				long liveTime=getUTime(live).longValue();
+				boolean ownDeleted=tombA.get(name)!=null;
+				if ((deathTime>liveTime)||((deathTime==liveTime)&&ownDeleted)) {
+					mergedDir = mergedDir.dissoc(name);   // newer deletion, or own deletion on tie
 				} else {
-					mergedTomb = mergedTomb.dissoc(name);  // newer create/modify wins
+					mergedTomb = mergedTomb.dissoc(name);  // newer live value, or own live value on tie
 				}
 			}
 

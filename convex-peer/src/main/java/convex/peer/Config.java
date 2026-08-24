@@ -4,8 +4,10 @@ import java.io.File;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Function;
 
 import convex.core.crypto.AKeyPair;
 import convex.core.crypto.PFXTools;
@@ -13,6 +15,7 @@ import convex.core.cvm.Keywords;
 import convex.core.cvm.Migrations;
 import convex.core.cvm.State;
 import convex.core.data.AString;
+import convex.core.data.AccountKey;
 import convex.core.data.Keyword;
 import convex.core.data.prim.CVMLong;
 import convex.core.lang.RT;
@@ -21,12 +24,20 @@ import convex.core.store.MemoryStore;
 import convex.core.util.FileUtils;
 import convex.core.util.Utils;
 import convex.etch.EtchConfig;
+import convex.etch.EtchKeyDerivation;
 import convex.etch.EtchStore;
 
 /**
  * Static tools and utilities for Peer configuration
  */
 public class Config {
+
+	/**
+	 * Runtime-only launch option for resolving an Etch master key from the
+	 * public-key hint in a v3 header. This is deliberately separate from the
+	 * serialisable {@code peer.etch} creation policy.
+	 */
+	public static final Keyword ETCH_KEY_RESOLVER=Keyword.intern("etch-key-resolver");
 	
 	/**
 	 * Size of default server socket receive buffer
@@ -97,20 +108,42 @@ public class Config {
 	public static final int QUERY_QUEUE_SIZE = 10000;
 	
 	/**
-	 * Default timeout in milliseconds for client transactions
+	 * Default timeout in milliseconds for client transactions.
+	 *
+	 * <p>This bounds how long a client waits for a transaction result, so it must
+	 * accommodate the slowest machine the client runs on, not the fastest. It is not
+	 * a latency target: a transaction normally confirms in tens of milliseconds, and
+	 * a value near that would turn ordinary scheduling delay into a spurious
+	 * {@code :TIMEOUT} result.</p>
 	 */
-	public static final long DEFAULT_CLIENT_TIMEOUT = 8000;
+	public static final long DEFAULT_CLIENT_TIMEOUT = 20000;
+
+	/**
+	 * Default timeout in milliseconds for internal waits: establishing a connection,
+	 * and offering to a bounded queue before shedding load.
+	 *
+	 * <p>Deliberately separate from {@link #DEFAULT_CLIENT_TIMEOUT}. These bound
+	 * backpressure rather than a user-visible result, so they should stay short even
+	 * when clients are given longer to wait.</p>
+	 */
+	public static final long DEFAULT_INTERNAL_TIMEOUT = 8000;
 
 	/**
 	 * Size of incoming Belief queue
 	 */
 	public static final int BELIEF_QUEUE_SIZE = 200;
 
+	/** Maximum encoded bytes retained by the trusted Belief/DATA queue. */
+	public static final int BELIEF_QUEUE_BYTE_LIMIT = 16 * 1024 * 1024;
+
 	/**
 	 * Size of bounded queue for Beliefs from unverified inbound connections.
 	 * Small — best-effort buffering during the brief verification round-trip.
 	 */
 	public static final int UNTRUSTED_BELIEF_QUEUE_SIZE = 10;
+
+	/** Maximum encoded bytes retained while an inbound Peer is unverified. */
+	public static final int UNTRUSTED_BELIEF_QUEUE_BYTE_LIMIT = 4 * 1024 * 1024;
 
 	/**
 	 * Maximum number of inbound client connections accepted by the server.
@@ -125,6 +158,54 @@ public class Config {
 	 */
 	public static final int OUTBOUND_QUEUE_SIZE = 128;
 
+	/** Maximum ordinary encoded bytes queued per outbound Peer connection. */
+	public static final int OUTBOUND_QUEUE_BYTE_LIMIT = 16 * 1024 * 1024;
+
+	/** A coalesced priority message must remain a small consensus/control root. */
+	public static final int PRIORITY_OUTBOUND_MESSAGE_LIMIT = 64 * 1024;
+
+	/** Peer configuration key for the maximum encoded belief delta chunk size. */
+	public static final Keyword MAX_BELIEF_DELTA_MESSAGE_SIZE = Keyword.intern("max-belief-delta-message-size");
+
+	/** Default belief delta chunk size. Large beliefs are sent as DATA-ahead batches. */
+	public static final int DEFAULT_MAX_BELIEF_DELTA_MESSAGE_SIZE = 4 * 1024 * 1024;
+
+	/** Peer configuration key for total eager Belief delta materialisation. */
+	public static final Keyword MAX_BELIEF_DELTA_BROADCAST_SIZE =
+		Keyword.intern("max-belief-delta-broadcast-size");
+
+	/** Default eager Belief delta working set. */
+	public static final int DEFAULT_MAX_BELIEF_DELTA_BROADCAST_SIZE = 16 * 1024 * 1024;
+
+	/** Gets and validates the application-specific belief delta chunk limit. */
+	public static int getBeliefDeltaMessageSize(Map<Keyword, Object> config) {
+		Object configured=config.get(MAX_BELIEF_DELTA_MESSAGE_SIZE);
+		int value=(configured==null)
+			? DEFAULT_MAX_BELIEF_DELTA_MESSAGE_SIZE
+			: Utils.toInt(configured);
+		if (value<1 || value>convex.core.cpos.CPoSConstants.MAX_MESSAGE_LENGTH) {
+			throw new IllegalArgumentException(MAX_BELIEF_DELTA_MESSAGE_SIZE
+				+" must be between 1 and "+convex.core.cpos.CPoSConstants.MAX_MESSAGE_LENGTH
+				+": "+value);
+		}
+		return value;
+	}
+
+	/** Gets and validates the total encoded-byte budget for one Belief broadcast. */
+	public static int getBeliefDeltaBroadcastSize(Map<Keyword, Object> config) {
+		int messageLimit=getBeliefDeltaMessageSize(config);
+		Object configured=config.get(MAX_BELIEF_DELTA_BROADCAST_SIZE);
+		int defaultValue=Math.max(messageLimit,DEFAULT_MAX_BELIEF_DELTA_BROADCAST_SIZE);
+		defaultValue=(int)Math.min(defaultValue,convex.core.cpos.CPoSConstants.MAX_MESSAGE_LENGTH);
+		int value=(configured==null)?defaultValue:Utils.toInt(configured);
+		if (value<messageLimit || value>convex.core.cpos.CPoSConstants.MAX_MESSAGE_LENGTH) {
+			throw new IllegalArgumentException(MAX_BELIEF_DELTA_BROADCAST_SIZE
+				+" must be between "+messageLimit+" and "
+				+convex.core.cpos.CPoSConstants.MAX_MESSAGE_LENGTH+": "+value);
+		}
+		return value;
+	}
+
 	/**
 	 * Checks if the config specifies a valid store
 	 * @param config Configuration map for peer
@@ -133,35 +214,107 @@ public class Config {
 	 */
 	@SuppressWarnings("unchecked")
 	public static <T extends AStore> T checkStore(Map<Keyword, Object> config) throws IOException {
-		EtchConfig etchConfig=checkEtchConfig(config);
+		EtchConfig requested=checkConfiguredEtchConfig(config);
 		Object o=config.get(Keywords.STORE);
 		if (o instanceof AStore) return (T)o;
 		
 		if ((o instanceof String)||(o instanceof AString)) {
 			String fname=o.toString();
 			if ("memory".equals(fname)) {
-				if (etchConfig!=null) {
+				if (requested!=null) {
 					throw new IOException(Keywords.ETCH_CONFIG+" cannot configure an in-memory store");
 				}
 				return (T) new MemoryStore();
 			}
+			EtchConfig etchConfig=getEtchConfig(config);
 			if ("temp".equals(fname)) {
 				return (T) ((etchConfig==null)?EtchStore.createTemp():EtchStore.createTemp(etchConfig));
 			}
 			File f=FileUtils.getFile(fname);
-			if (f.exists()) {
-				return (T) ((etchConfig==null)?EtchStore.create(f):EtchStore.create(f,etchConfig));
-			}
+			return (T) ((etchConfig==null)?EtchStore.create(f):EtchStore.create(f,etchConfig));
 		}
 		
 		return null;
 	}
 
-	private static EtchConfig checkEtchConfig(Map<Keyword,Object> config) throws IOException {
+	private static EtchConfig checkConfiguredEtchConfig(Map<Keyword,Object> config) throws IOException {
 		Object value=config.get(Keywords.ETCH_CONFIG);
 		if (value==null) return null;
 		if (value instanceof EtchConfig etchConfig) return etchConfig;
 		throw new IOException("Unexpected type for "+Keywords.ETCH_CONFIG+": "+Utils.getClassName(value));
+	}
+
+	/**
+	 * Gets the effective Etch configuration for a peer or lattice-node store.
+	 * Explicit runtime resolution wins; otherwise a configured peer key supplies
+	 * the natural resolver. With neither, the configured creation policy is
+	 * returned unchanged.
+	 *
+	 * @param config runtime launch configuration
+	 * @return effective Etch configuration, or {@code null} for ordinary defaults
+	 * @throws IOException if a configured value has an invalid type
+	 */
+	@SuppressWarnings("unchecked")
+	public static EtchConfig getEtchConfig(Map<Keyword,Object> config) throws IOException {
+		EtchConfig etchConfig=checkConfiguredEtchConfig(config);
+		Object keyValue=config.get(Keywords.KEYPAIR);
+		AKeyPair keyPair=(keyValue instanceof AKeyPair kp)?kp:null;
+		Object resolverValue=config.get(ETCH_KEY_RESOLVER);
+		Function<AccountKey,byte[]> resolver=null;
+		if (resolverValue!=null) {
+			if (!(resolverValue instanceof Function<?,?>)) {
+				throw new IOException("Unexpected type for "+ETCH_KEY_RESOLVER+": "
+						+Utils.getClassName(resolverValue));
+			}
+			resolver=(Function<AccountKey,byte[]>)resolverValue;
+		} else if ((etchConfig!=null)&&etchConfig.hasKeyFunction()) {
+			resolver=etchConfig.getKeyFunction();
+		} else if (keyPair!=null) {
+			resolver=etchKeyResolver(keyPair);
+		}
+		if ((keyPair!=null)&&(etchConfig!=null)
+				&&(etchConfig.getCipherMode()!=EtchConfig.CipherMode.NONE)
+				&&(etchConfig.getPublicKeyHint()==null)) {
+			etchConfig=etchConfig.withPublicKeyHint(keyPair.getAccountKey());
+		}
+		if (resolver==null) return etchConfig;
+		if (etchConfig==null) etchConfig=EtchConfig.create();
+		return etchConfig.withKeyFunction(resolver);
+	}
+
+	/**
+	 * Creates the standard resolver backed by one Ed25519 key pair. A non-null
+	 * hint must identify that key; the private seed is copied only long enough to
+	 * derive the Etch master key and is then wiped.
+	 *
+	 * @param keyPair peer or lattice-node identity key
+	 * @return Etch master-key resolver
+	 */
+	public static Function<AccountKey,byte[]> etchKeyResolver(AKeyPair keyPair) {
+		AccountKey publicKey=keyPair.getAccountKey();
+		return hint -> {
+			if ((hint!=null)&&!hint.equals(publicKey)) {
+				throw new IllegalArgumentException("Etch publicKeyHint "+hint
+						+" does not match configured key "+publicKey);
+			}
+			return deriveEtchMasterKey(keyPair);
+		};
+	}
+
+	/**
+	 * Derives the standard Etch master key from an Ed25519 key pair without
+	 * retaining its private-seed copy.
+	 *
+	 * @param keyPair source identity key
+	 * @return newly allocated 32-byte Etch master key
+	 */
+	public static byte[] deriveEtchMasterKey(AKeyPair keyPair) {
+		byte[] seed=keyPair.getSeed().getBytes();
+		try {
+			return EtchKeyDerivation.deriveMasterKey(seed);
+		} finally {
+			Arrays.fill(seed,(byte)0);
+		}
 	}
 	
 	/**
@@ -227,10 +380,11 @@ public class Config {
 		T store;
 		try {
 			store=checkStore(config);
-			if (store!=null) return store;
-			EtchConfig etchConfig=checkEtchConfig(config);
-			store=(T) ((etchConfig==null)?EtchStore.createTemp("tempPeerStore")
-					:EtchStore.createTemp("tempPeerStore",etchConfig));
+			if (store==null) {
+				EtchConfig etchConfig=getEtchConfig(config);
+				store=(T) ((etchConfig==null)?EtchStore.createTemp("tempPeerStore")
+						:EtchStore.createTemp("tempPeerStore",etchConfig));
+			}
 		} catch (IOException e) {
 			throw new ConfigException("Unable to configure store due to IO error",e);
 		}

@@ -138,10 +138,6 @@ public class DlfsMcpTools {
 		return fs.getPath("/" + canonical);
 	}
 
-	private static void prepareMutation(FileSystem fs) {
-		if (fs instanceof convex.lattice.fs.DLFileSystem dlfs) dlfs.updateTimestamp();
-	}
-
 	private static void sync(FileSystem fs) {
 		if (fs instanceof convex.lattice.fs.DLFileSystem dlfs) dlfs.sync();
 	}
@@ -328,9 +324,10 @@ public class DlfsMcpTools {
 			if (!DLFSPathValidator.isValidDriveName(nameCell.toString())) {
 				return McpProtocol.toolError("Invalid drive name");
 			}
-			boolean created = driveManager.createDrive(getIdentity(), nameCell.toString());
+			String identity=getIdentity();
+			boolean created = driveManager.createDrive(identity, nameCell.toString());
 			if (!created) return McpProtocol.toolError("Drive already exists: " + nameCell);
-			driveManager.sync();
+			driveManager.sync(identity);
 
 			return McpProtocol.toolSuccess(Maps.of("created", CVMBool.TRUE, FIELD_NAME, nameCell));
 		}
@@ -349,9 +346,10 @@ public class DlfsMcpTools {
 			if (nameCell == null) return McpProtocol.toolError("'name' is required");
 
 			// Drive deletion only for own drives — no UCAN delegation
-			boolean deleted = driveManager.deleteDrive(getIdentity(), nameCell.toString());
+			String identity=getIdentity();
+			boolean deleted = driveManager.deleteDrive(identity, nameCell.toString());
 			if (!deleted) return McpProtocol.toolError("Drive not found: " + nameCell);
-			driveManager.sync();
+			driveManager.sync(identity);
 
 			return McpProtocol.toolSuccess(Maps.of("deleted", CVMBool.TRUE));
 		}
@@ -490,7 +488,6 @@ public class DlfsMcpTools {
 					return McpProtocol.toolError("Content is too large for MCP write");
 				}
 				boolean isNew = !Files.exists(path);
-				prepareMutation(access.fs());
 				if (access.fs() instanceof convex.lattice.fs.DLFileSystem dlfs) {
 					dlfs.writeAllBytes((convex.lattice.fs.DLPath) path, bytes);
 				} else {
@@ -528,7 +525,6 @@ public class DlfsMcpTools {
 
 			Path path = resolvePath(access.fs(), pathCell.toString());
 			try {
-				prepareMutation(access.fs());
 				Files.createDirectory(path);
 				sync(access.fs());
 				return McpProtocol.toolSuccess(Maps.of("created", CVMBool.TRUE));
@@ -558,7 +554,6 @@ public class DlfsMcpTools {
 
 			Path path = resolvePath(access.fs(), pathCell.toString());
 			try {
-				prepareMutation(access.fs());
 				Files.delete(path);
 				sync(access.fs());
 				return McpProtocol.toolSuccess(Maps.of("deleted", CVMBool.TRUE));

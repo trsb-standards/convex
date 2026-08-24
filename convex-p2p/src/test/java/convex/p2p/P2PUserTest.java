@@ -88,6 +88,16 @@ public class P2PUserTest {
 			P2PLattice.getIdentity(region, KEY).get(P2PLattice.ID_NAME));
 	}
 
+	@Test
+	public void testUserPersistenceDelegatesThroughApplication() throws Exception {
+		P2PUser me=node.p2p(KEY);
+		me.setIdentity(Strings.create("persisted"),null,1000L);
+
+		ACell persisted=me.persist();
+
+		assertEquals(me.cursor().get(),persisted);
+	}
+
 	@SuppressWarnings("unchecked")
 	private static AHashMap<ACell, SignedData<ACell>> ownerMap(ACell value) {
 		return (AHashMap<ACell, SignedData<ACell>>) value;
@@ -152,23 +162,17 @@ public class P2PUserTest {
 		assertEquals(Strings.create("bob"), them.getIdentity().get(P2PLattice.ID_NAME));
 	}
 
-	/**
-	 * P2PUser deliberately does not police writes to another user's area — enforcement
-	 * belongs at the merge boundary, and a badly-signed slot only corrupts the writer's
-	 * own tree. Pinned here as an API decision; the merge-side rejection that makes it
-	 * safe is core's ({@code GenericLatticeTest.testOwnerVerificationBlobKeyMismatch}).
-	 */
+	/** An owner path requires its corresponding key from the context signing policy. */
 	@Test
-	public void testForeignAreaWriteIsNotPoliced() {
+	public void testForeignAreaWriteRequiresSigner() {
 		AccountKey otherKey = AKeyPair.generate().getAccountKey();
 
 		P2PUser them = node.p2p(otherKey);
-		them.cursor().set(P2PLattice.createIdentity(Strings.create("mallory"), null, null, 9000L));
-		them.sync();
+		assertThrows(IllegalStateException.class,()->them.cursor().set(
+			P2PLattice.createIdentity(Strings.create("mallory"),null,null,9000L)));
 
 		SignedData<ACell> slot = rawIdentitySlot(otherKey);
-		assertNotNull(slot, "A direct local write is not owner-checked");
-		assertEquals(KEY, slot.getAccountKey(), "Signed by this node, not the claimed owner");
+		assertNull(slot,"No value is written without the requested owner's signer");
 	}
 
 	// ===== Node record area =====

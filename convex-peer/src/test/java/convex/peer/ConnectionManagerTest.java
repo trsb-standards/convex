@@ -3,10 +3,16 @@ package convex.peer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -20,11 +26,17 @@ import convex.core.crypto.AKeyPair;
 import convex.core.data.ACell;
 import convex.core.data.AVector;
 import convex.core.data.AccountKey;
+import convex.core.data.Blob;
+import convex.core.data.Hash;
+import convex.core.data.SignedData;
 import convex.core.data.prim.CVMLong;
+import convex.core.cvm.Address;
+import convex.core.cvm.transactions.ATransaction;
 import convex.core.lang.RT;
 import convex.core.message.Message;
 import convex.core.message.MessageTag;
 import convex.core.message.MessageType;
+import convex.core.store.AStore;
 
 /**
  * Regression tests for ConnectionManager and AConnectionManager.
@@ -171,6 +183,24 @@ public class ConnectionManagerTest {
 		assertTrue(r.getValue() instanceof CVMLong, "Result value should be a CVMLong timestamp");
 	}
 
+	@Test
+	public void testConnectionAllocatesRequestIDs() throws Exception {
+		ConvexLocal convex = network.CONVEX;
+		Message template=Message.createPing((CVMLong)null);
+
+		CompletableFuture<Result> first=convex.request(template);
+		CompletableFuture<Result> second=convex.request(template);
+		Result r1=first.get(5,TimeUnit.SECONDS);
+		Result r2=second.get(5,TimeUnit.SECONDS);
+
+		assertFalse(r1.isError());
+		assertFalse(r2.isError());
+		assertNotNull(r1.getID());
+		assertNotNull(r2.getID());
+		assertNotEquals(r1.getID(),r2.getID());
+		assertNull(template.getRequestID(),"Request template must remain unstamped");
+	}
+
 	// ===== PING round-trip tests =====
 
 	@Test
@@ -241,5 +271,91 @@ public class ConnectionManagerTest {
 		var conns2 = cm.getConnections();
 		assertEquals(conns1, conns2);
 		assertFalse(conns1 == conns2, "getConnections should return defensive copies");
+	}
+
+	@Test
+	public void testSequenceBackpressureIsIsolatedPerPeer() {
+		TestConnectionManager manager=new TestConnectionManager();
+		SequencedConvex good=new SequencedConvex(-1);
+		SequencedConvex slow=new SequencedConvex(2);
+		manager.add(AKeyPair.generate().getAccountKey(),good);
+		manager.add(AKeyPair.generate().getAccountKey(),slow);
+		List<Message> sequence=List.of(Message.createPing(1),Message.createPing(2),Message.createPing(3));
+		Message fallback=Message.createPing(99);
+
+		AConnectionManager.BroadcastResult result=manager.broadcastSequence(sequence,fallback);
+
+		assertEquals(2,result.peers());
+		assertEquals(1,result.complete());
+		assertEquals(1,result.fallback());
+		assertEquals(sequence,good.sent);
+		assertEquals(List.of(sequence.get(0),fallback),slow.sent);
+		for (int i=0; i<sequence.size(); i++) assertSame(sequence.get(i),good.sent.get(i));
+	}
+
+	@Test
+	public void testPriorityBroadcastReusesOneMessageForEveryPeer() {
+		TestConnectionManager manager=new TestConnectionManager();
+		SequencedConvex first=new SequencedConvex(-1);
+		SequencedConvex second=new SequencedConvex(-1);
+		manager.add(AKeyPair.generate().getAccountKey(),first);
+		manager.add(AKeyPair.generate().getAccountKey(),second);
+		Message priority=Message.createPing(101);
+
+		assertEquals(2,manager.broadcastPriority(priority));
+		assertSame(priority,first.priority);
+		assertSame(priority,second.priority);
+	}
+
+	private static final class TestConnectionManager extends AConnectionManager {
+		void add(AccountKey key,Convex connection) { connections.put(key,connection); }
+		@Override public void close() { closeAllConnections(); }
+	}
+
+	private static final class SequencedConvex extends Convex {
+		final ArrayList<Message> sent=new ArrayList<>();
+		final int failAt;
+		int attempts;
+		boolean connected=true;
+		Message priority;
+
+		SequencedConvex(int failAt) { super(null,null); this.failAt=failAt; }
+
+		@Override public boolean trySend(Message message) {
+			attempts++;
+			if (attempts==failAt) return false;
+			sent.add(message);
+			return true;
+		}
+		@Override public boolean trySendPriority(Message message) {
+			priority=message;
+			return true;
+		}
+		@Override public boolean isConnected() { return connected; }
+		@Override public CompletableFuture<Result> transact(SignedData<ATransaction> tx) {
+			return CompletableFuture.completedFuture(Result.SENT_MESSAGE);
+		}
+		@Override public CompletableFuture<Result> messageRaw(Blob message) {
+			return CompletableFuture.completedFuture(Result.SENT_MESSAGE);
+		}
+		@Override public CompletableFuture<Result> message(Message message) {
+			return CompletableFuture.completedFuture(Result.SENT_MESSAGE);
+		}
+		@Override public <T extends ACell> CompletableFuture<T> acquire(Hash hash,AStore store) {
+			return new CompletableFuture<>();
+		}
+		@Override public CompletableFuture<Result> requestStatus() {
+			return CompletableFuture.completedFuture(Result.SENT_MESSAGE);
+		}
+		@Override protected CompletableFuture<Result> sendChallenge(SignedData<ACell> data) {
+			return CompletableFuture.completedFuture(Result.SENT_MESSAGE);
+		}
+		@Override public CompletableFuture<Result> query(ACell query,Address address) {
+			return CompletableFuture.completedFuture(Result.SENT_MESSAGE);
+		}
+		@Override public void close() { connected=false; }
+		@Override public InetSocketAddress getHostAddress() { return null; }
+		@Override public void reconnect() { connected=true; }
+		@Override public String toString() { return "Sequenced test connection"; }
 	}
 }
