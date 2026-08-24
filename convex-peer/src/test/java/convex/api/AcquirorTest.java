@@ -73,7 +73,7 @@ public class AcquirorTest {
 	}
 
 	@Test
-	public void testNullResponseFailsWithoutRetryPolicy() throws Exception {
+	public void testNullResponseRetriesThenFailsAfterExhaustingRetryBudget() throws Exception {
 		Blob expected = Blobs.createRandom(400);
 		AtomicInteger requests = new AtomicInteger();
 		try (MemoryStore store = new MemoryStore();
@@ -86,7 +86,18 @@ public class AcquirorTest {
 				ExecutionException.class, () -> acquiror.getFuture().get(5, TimeUnit.SECONDS));
 			MissingDataException missing = assertInstanceOf(MissingDataException.class, error.getCause());
 			assertEquals(expected.getHash(), missing.getMissingHash());
-			assertEquals(1, requests.get(), "retry policy belongs to the acquisition caller");
+			// This fork's own deliberate, live-validated fix (see Acquiror's
+			// MAX_NULL_RESPONSE_RETRIES javadoc): a single null/not-yet-
+			// available response is NOT immediately fatal -- it's retried up
+			// to MAX_NULL_RESPONSE_RETRIES times (1 initial + 10 retries = 11
+			// total) before genuinely failing. Treating the first null as
+			// terminal (this test's original upstream form) reintroduces the
+			// exact bug that fix was built for: a single transient hiccup
+			// during periodic root-sync/delta broadcast turning into a
+			// permanent, silent delivery failure -- observed live causing
+			// "dev"/"meta" dbase nodes to drift apart indefinitely.
+			assertEquals(11, requests.get(),
+				"a persistently null response retries up to MAX_NULL_RESPONSE_RETRIES times before failing");
 		}
 	}
 

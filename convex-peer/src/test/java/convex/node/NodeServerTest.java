@@ -630,7 +630,14 @@ public class NodeServerTest {
 		NodeServer<?> serverB = new NodeServer<>(testLattice, storeB, tightB);
 		try {
 			AKeyPair keyA = AKeyPair.generate();
+			// A real, distinct keypair for B -- addPeer's identity-verification
+			// handshake needs B to be able to sign its own challenge response
+			// (upstream's own new admission model, post-merge); using A's own
+			// key as B's "expected" identity (the original form of this test)
+			// can never verify, since B has nothing of A's to sign with.
+			AKeyPair keyB = AKeyPair.generate();
 			serverA.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyA));
+			serverB.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyB));
 
 			allowPrimaryInbound(serverB);
 			serverA.launch();
@@ -638,7 +645,7 @@ public class NodeServerTest {
 
 			ConvexRemote peerB = ConvexRemote.connect(serverB.getHostAddress());
 			try {
-				AccountKey bKey = keyA.getAccountKey();
+				AccountKey bKey = keyB.getAccountKey();
 				serverA.getPropagator().addPeer(bKey, peerB);
 				// B only ever asked for "keep" -- never "big".
 				serverA.getPropagator().getConnectionManager().addPeerScope(bKey, keepRegion);
@@ -702,7 +709,11 @@ public class NodeServerTest {
 		NodeServer<?> serverB = new NodeServer<>(testLattice, storeB, NodeConfig.port(0));
 		try {
 			AKeyPair keyA = AKeyPair.generate();
+			// See the sibling scoped test's own comment: B needs its own
+			// keypair to complete addPeer's identity-verification handshake.
+			AKeyPair keyB = AKeyPair.generate();
 			serverA.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyA));
+			serverB.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyB));
 
 			allowPrimaryInbound(serverB);
 			serverA.launch();
@@ -711,7 +722,7 @@ public class NodeServerTest {
 			ConvexRemote peerB = ConvexRemote.connect(serverB.getHostAddress());
 			try {
 				// No addPeerScope call -- B stays unscoped, the pre-existing default.
-				serverA.getPropagator().addPeer(keyA.getAccountKey(), peerB);
+				serverA.getPropagator().addPeer(keyB.getAccountKey(), peerB);
 
 				serverA.getCursor().path(regionA).merge(CVMLong.create(111));
 				serverA.getCursor().path(regionB).merge(CVMLong.create(222));
@@ -873,7 +884,11 @@ public class NodeServerTest {
 		NodeServer<?> serverB = new NodeServer<>(testLattice, storeB, NodeConfig.port(0));
 		try {
 			AKeyPair keyA = AKeyPair.generate();
+			// See the sibling scoped test's own comment: B needs its own
+			// keypair to complete addPeer's identity-verification handshake.
+			AKeyPair keyB = AKeyPair.generate();
 			serverA.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyA));
+			serverB.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyB));
 
 			allowPrimaryInbound(serverB);
 			serverA.launch();
@@ -881,7 +896,7 @@ public class NodeServerTest {
 
 			ConvexRemote peerB = ConvexRemote.connect(serverB.getHostAddress());
 			try {
-				serverA.getPropagator().addPeer(keyA.getAccountKey(), peerB);
+				serverA.getPropagator().addPeer(keyB.getAccountKey(), peerB);
 
 				// The whole root value here is just one entry (region ->
 				// bigValue) — small enough that the top-level Index wrapping

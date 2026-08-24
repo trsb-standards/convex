@@ -317,11 +317,26 @@ public class LatticePropagator implements Closeable {
 	 * Adds an outbound peer connection with known identity. The peer's store
 	 * is set to this propagator's store, establishing the security boundary.
 	 *
+	 * <p>Blocks (briefly) until the connection is actually admitted into
+	 * {@code connectionManager}'s live connection set, or logs a warning and
+	 * returns on failure/timeout — this method's own signature promises a
+	 * void, best-effort "the peer is now usable" contract, but {@link
+	 * LatticeConnectionManager#addPeer(AccountKey, Convex)} now performs a
+	 * genuine identity-verification handshake (challenge/response, when this
+	 * propagator has a keypair configured) before a connection is actually
+	 * admitted — a caller that fires this and immediately calls {@code
+	 * cursor.sync()}, expecting the peer to already be broadcast-eligible,
+	 * would otherwise race the handshake and silently broadcast to nobody.
+	 *
 	 * @param peerKey AccountKey identifying the remote peer
 	 * @param peer Convex connection to the peer node
 	 */
 	public void addPeer(AccountKey peerKey, Convex peer) {
-		connectionManager.addPeer(peerKey, peer);
+		try {
+			connectionManager.addPeer(peerKey, peer).get(10, TimeUnit.SECONDS);
+		} catch (Exception e) {
+			log.warn("Peer admission did not complete for {}: {}", peerKey, e.getMessage());
+		}
 	}
 
 	/**
@@ -1047,47 +1062,4 @@ public class LatticePropagator implements Closeable {
 	 * @param path Path within the peer's lattice to fetch
 	 * @return CompletableFuture completing with the value at that path (or null if absent there)
 	 */
-	public CompletableFuture<ACell> pullPath(Convex peer, ACell... path) {
-		if (peer == null) {
-			return CompletableFuture.failedFuture(new IllegalArgumentException("Peer cannot be null"));
-		}
-
-		return CompletableFuture.supplyAsync(() -> {
-			try {
-				if (!peer.isConnected()) {
-					throw new RuntimeException("Peer is not connected");
-				}
-
-				CVMLong queryId = CVMLong.create(System.currentTimeMillis());
-				AVector<ACell> pathVector = Vectors.of((Object[]) path);
-				AVector<?> queryPayload = Vectors.create(MessageTag.LATTICE_QUERY, queryId, pathVector);
-				Message queryMessage = Message.create(MessageType.LATTICE_QUERY, queryPayload);
-
-				CompletableFuture<Result> resultFuture = peer.message(queryMessage);
-				Result result = resultFuture.get(10, TimeUnit.SECONDS);
-
-				if (result.isError()) {
-					throw new RuntimeException("Path pull query failed: " + result);
-				}
-
-				ACell receivedValue = result.getValue();
-				if (receivedValue == null) return null;
-
-				ACell acquired;
-				try {
-					acquired = Cells.announce(receivedValue, r -> {}, store);
-				} catch (MissingDataException mde) {
-					Hash rootHash = Hash.get(receivedValue);
-					acquired = peer.acquire(rootHash, store).get(30, TimeUnit.SECONDS);
-				}
-
-				log.debug("Acquired pulled path value from peer: {}", peer.getHostAddress());
-				return acquired;
-
-			} catch (Exception e) {
-				log.warn("Path pull failed from peer: {}", peer.getHostAddress(), e);
-				throw new RuntimeException("Path pull failed from peer", e);
-			}
-		});
-	}
 }

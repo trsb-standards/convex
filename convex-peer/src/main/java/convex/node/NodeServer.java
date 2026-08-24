@@ -1752,12 +1752,27 @@ public class NodeServer<V extends ACell> implements Closeable {
 	}
 
 	/**
-	 * Pulls one path from a peer and merges it at the same local cursor path.
-	 * Path selection reduces transfer and storage work; it does not grant or
-	 * enforce visibility independently of the selected propagator.
+	 * Pulls just a sub-path of a peer's lattice value (e.g. one entry of a
+	 * keyed map) rather than its entire root, and merges it locally at the
+	 * matching cursor path — for callers that only want (and are only
+	 * entitled to) one region of a peer's lattice, without transitively
+	 * pulling in everything else that peer happens to also host.
 	 *
-	 * <p>The caller must not mutate {@code path} while the returned operation is
-	 * outstanding.</p>
+	 * <p>Unlike {@link #pull(Convex)}, which merges the acquired value into
+	 * the root via this lattice's own top-level merge, this merges directly
+	 * via {@code cursor.path(path)}'s own sub-lattice semantics — the same
+	 * mechanism {@link #processLatticeValue} uses for incoming broadcasts
+	 * (see {@link #mergeIncoming}). A rejected merge (wrong type, or the
+	 * sub-lattice's own validation) leaves the cursor unchanged, same as an
+	 * untrusted incoming value.
+	 *
+	 * <p>Always checkpoints the root via {@code cursor.sync()} afterward,
+	 * even if the merge was rejected, absent, or a no-op — any local writes
+	 * not yet checkpointed must not be skipped just because this particular
+	 * pull didn't change anything.
+	 *
+	 * <p>The caller must not mutate {@code path} while the returned operation
+	 * is outstanding.
 	 *
 	 * @param convex Convex connection to the peer node
 	 * @param path path within both peer and local lattice roots
@@ -1824,44 +1839,6 @@ public class NodeServer<V extends ACell> implements Closeable {
 	private void mergePulledValue(ACell acquired) {
 		if (acquired == null) return;
 		cursor.updateAndGet(current -> lattice.merge(mergeContext, current, (V) acquired));
-	}
-
-	/**
-	 * Pulls just a sub-path of a peer's lattice value (e.g. one entry of a
-	 * keyed map) rather than its entire root, and merges it locally at the
-	 * matching cursor path — for callers that only want (and are only
-	 * entitled to) one region of a peer's lattice, without transitively
-	 * pulling in everything else that peer happens to also host.
-	 *
-	 * <p>Unlike {@link #pull(Convex)}, which merges the acquired value into
-	 * the root via this lattice's own top-level merge, this merges directly
-	 * via {@code cursor.path(path)}'s own sub-lattice semantics — the same
-	 * mechanism {@link #processLatticeValue} uses for incoming broadcasts
-	 * (see {@link #mergeIncoming}). A rejected merge (wrong type, or the
-	 * sub-lattice's own validation) leaves the cursor unchanged, same as an
-	 * untrusted incoming value.
-	 *
-	 * <p>Always checkpoints the root via {@code cursor.sync()} afterward,
-	 * even if the merge was rejected or a no-op — same reasoning as {@link
-	 * #pull(Convex)}: any local writes not yet checkpointed must not be
-	 * skipped just because this particular pull didn't change anything.
-	 *
-	 * @param convex Convex connection to the peer node
-	 * @param path Path within the peer's lattice to pull
-	 * @return CompletableFuture completing with the local value at that path after merge (or null if the peer had nothing there, or the merge was rejected)
-	 */
-	public CompletableFuture<ACell> pullPath(Convex convex, ACell... path) {
-		if (propagators.isEmpty()) {
-			return CompletableFuture.failedFuture(new IllegalStateException("No propagators configured"));
-		}
-		return propagators.get(0).pullPath(convex, path).thenApply(acquired -> {
-			if (acquired != null) {
-				ALatticeCursor<ACell> target = cursor.path(path);
-				mergeIncoming(target, acquired);
-			}
-			cursor.sync();
-			return cursor.path(path).get();
-		});
 	}
 
 	/**
