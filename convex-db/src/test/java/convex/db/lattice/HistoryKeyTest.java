@@ -12,7 +12,7 @@ import convex.core.data.Blob;
 import convex.core.data.prim.CVMLong;
 
 /**
- * Unit tests for HistoryKey encoding, prefix matching and nanotime extraction.
+ * Unit tests for HistoryKey encoding, prefix matching and writeSeq extraction.
  */
 public class HistoryKeyTest {
 
@@ -27,30 +27,30 @@ public class HistoryKeyTest {
 	void testKeyLength() {
 		ABlob pk = pkBlob(1L);
 		ABlob key = HistoryKey.of(pk, 12345L);
-		// 1 byte length + pkLen bytes + 8 bytes nanotime
+		// 1 byte length + pkLen bytes + 8 bytes writeSeq
 		assertEquals(1 + pk.count() + 8, key.count());
 	}
 
 	@Test
-	void testExtractNanotime() {
+	void testExtractWriteSeq() {
 		ABlob pk = pkBlob(42L);
-		long nanotime = 0xDEADBEEFCAFEL;
-		ABlob key = HistoryKey.of(pk, nanotime);
-		assertEquals(nanotime, HistoryKey.extractNanotime(key));
+		long writeSeq = 0xDEADBEEFCAFEL;
+		ABlob key = HistoryKey.of(pk, writeSeq);
+		assertEquals(writeSeq, HistoryKey.extractWriteSeq(key));
 	}
 
 	@Test
-	void testNanotimeZero() {
+	void testWriteSeqZero() {
 		ABlob pk = pkBlob(1L);
 		ABlob key = HistoryKey.of(pk, 0L);
-		assertEquals(0L, HistoryKey.extractNanotime(key));
+		assertEquals(0L, HistoryKey.extractWriteSeq(key));
 	}
 
 	@Test
-	void testNanotimeMaxLong() {
+	void testWriteSeqMaxLong() {
 		ABlob pk = pkBlob(1L);
 		ABlob key = HistoryKey.of(pk, Long.MAX_VALUE);
-		assertEquals(Long.MAX_VALUE, HistoryKey.extractNanotime(key));
+		assertEquals(Long.MAX_VALUE, HistoryKey.extractWriteSeq(key));
 	}
 
 	@Test
@@ -61,7 +61,7 @@ public class HistoryKeyTest {
 	}
 
 	@Test
-	void testSamePkDifferentNanotimeDifferentKeys() {
+	void testSamePkDifferentWriteSeqDifferentKeys() {
 		ABlob pk = pkBlob(1L);
 		ABlob key1 = HistoryKey.of(pk, 100L);
 		ABlob key2 = HistoryKey.of(pk, 200L);
@@ -69,7 +69,7 @@ public class HistoryKeyTest {
 	}
 
 	@Test
-	void testSamePkSameNanotimeSameKey() {
+	void testSamePkSameWriteSeqSameKey() {
 		ABlob pk = pkBlob(5L);
 		ABlob key1 = HistoryKey.of(pk, 999L);
 		ABlob key2 = HistoryKey.of(pk, 999L);
@@ -80,7 +80,7 @@ public class HistoryKeyTest {
 
 	@Test
 	void testChronologicalOrdering() {
-		// Big-endian nanotime means lexicographic order == time order for same pk
+		// Big-endian writeSeq means lexicographic order == time order for same pk
 		ABlob pk = pkBlob(1L);
 		ABlob early = HistoryKey.of(pk, 1000L);
 		ABlob late  = HistoryKey.of(pk, 2000L);
@@ -136,6 +136,6 @@ public class HistoryKeyTest {
 		ABlob pk = Blob.wrap(maxPk);
 		ABlob key = HistoryKey.of(pk, 42L);
 		assertEquals(1 + 255 + 8, key.count());
-		assertEquals(42L, HistoryKey.extractNanotime(key));
+		assertEquals(42L, HistoryKey.extractWriteSeq(key));
 	}
 }

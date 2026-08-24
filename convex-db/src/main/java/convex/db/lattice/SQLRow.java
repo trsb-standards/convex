@@ -1,6 +1,8 @@
 package convex.db.lattice;
 
 import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
 
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
@@ -9,6 +11,7 @@ import convex.core.data.AVector;
 import convex.core.data.Blob;
 import convex.core.data.CAD3Encoder;
 import convex.core.data.Cells;
+import convex.core.data.Hash;
 import convex.core.data.Strings;
 import convex.core.data.Vectors;
 import convex.core.data.prim.CVMLong;
@@ -110,9 +113,13 @@ public class SQLRow {
 	 * encoding each cell independently, so no cross-cell Ref is ever produced.
 	 */
 	static Blob encodeValues(AVector<ACell> values) {
-		BlobCAS cas = BlobCAS.instance();
-		if (cas != null) values = substituteLargeBlobs(values, cas);
-		return encodeFlat(values);
+		try {
+			BlobCAS cas = BlobCAS.instance();
+			if (cas != null) values = substituteLargeBlobs(values, cas);
+			return encodeFlat(values);
+		} catch (IOException e) {
+			throw new IllegalStateException("Compact row encode failed", e);
+		}
 	}
 
 	/**
@@ -122,20 +129,67 @@ public class SQLRow {
 	 * data written before this format existed.
 	 *
 	 * <p>If {@link BlobCAS#instance()} is active, any CAS reference cells in
-	 * the decoded vector are resolved back to their original blob/string.
+	 * the decoded vector are resolved back to their original blob/string. A
+	 * reference that can't be resolved (genuinely missing from the store —
+	 * e.g. not yet replicated from a peer) is a loud failure here, not a
+	 * silently-substituted placeholder — see {@code resolveCasRefs}.
 	 */
 	@SuppressWarnings("unchecked")
 	static AVector<ACell> decodeValues(Blob blob) {
 		try {
-			AVector<ACell> values = (blob.count() > 0 && blob.byteAt(0) == FLAT_MARKER)
-					? decodeFlat(blob)
-					: (AVector<ACell>) CAD3Encoder.INSTANCE.decode(blob); // legacy v3
+			AVector<ACell> values = decodeRawValues(blob);
 			BlobCAS cas = BlobCAS.instance();
 			if (cas != null) values = resolveCasRefs(values, cas);
 			return values;
+		} catch (BadFormatException | IOException e) {
+			throw new IllegalStateException("Compact row decode failed", e);
+		}
+	}
+
+	/**
+	 * Decodes column values without resolving CAS references — cells backed
+	 * by {@link BlobCAS} still come back as their raw 35-byte tagged
+	 * reference blob, not the real content. Used by {@link #findCasReferenceHashes}
+	 * to discover which hashes a just-pulled row depends on, before those
+	 * hashes are necessarily fetchable — {@link #decodeValues}'s normal
+	 * resolve-or-throw behavior would be the wrong tool here, since the whole
+	 * point is inspecting a reference that may not resolve yet.
+	 */
+	@SuppressWarnings("unchecked")
+	private static AVector<ACell> decodeRawValues(Blob blob) throws BadFormatException {
+		return (blob.count() > 0 && blob.byteAt(0) == FLAT_MARKER)
+				? decodeFlat(blob)
+				: (AVector<ACell>) CAD3Encoder.INSTANCE.decode(blob); // legacy v3
+	}
+
+	/**
+	 * Scans a row's encoded values for {@link BlobCAS} reference cells,
+	 * returning the set of hashes they point to — used by replication (after
+	 * a schema/db pull lands the row data itself, but before any large
+	 * values it references are necessarily present locally) to know which
+	 * hashes still need an explicit fetch from the source peer. See {@code
+	 * DbaseServer.replicateOneSchema}/{@code replicateOneDatabase}'s own
+	 * class docs for why this step exists: a CAS reference is an ordinary
+	 * opaque blob value, not a genuine Convex {@code Ref}, so it is invisible
+	 * to {@code pullPath}'s normal Ref-graph acquisition — nothing else would
+	 * ever fetch the value it points to.
+	 */
+	static Set<Hash> findCasReferenceHashes(Blob blob) {
+		Set<Hash> hashes = new HashSet<>();
+		AVector<ACell> values;
+		try {
+			values = decodeRawValues(blob);
 		} catch (BadFormatException e) {
 			throw new IllegalStateException("Compact row decode failed", e);
 		}
+		int n = (int) values.count();
+		for (int i = 0; i < n; i++) {
+			ACell cell = values.get(i);
+			if (cell instanceof Blob ref && BlobCAS.isCasRef(ref)) {
+				hashes.add(BlobCAS.extractHash(ref));
+			}
+		}
+		return hashes;
 	}
 
 	/**
@@ -202,7 +256,7 @@ public class SQLRow {
 	 * reference blobs. The reference is tagged so {@link #resolveCasRefs}
 	 * can reconstruct the correct CVM type.
 	 */
-	private static AVector<ACell> substituteLargeBlobs(AVector<ACell> values, BlobCAS cas) {
+	private static AVector<ACell> substituteLargeBlobs(AVector<ACell> values, BlobCAS cas) throws IOException {
 		int n = (int) values.count();
 		ACell[] cells = null; // allocated lazily only if we actually substitute
 		for (int i = 0; i < n; i++) {
@@ -212,21 +266,13 @@ public class SQLRow {
 					cells = new ACell[n];
 					for (int j = 0; j < i; j++) cells[j] = values.get(j);
 				}
-				try {
-					cells[i] = cas.storeAndRef(blob.getBytes());
-				} catch (IOException e) {
-					cells[i] = cell; // fall back to inline on CAS write error
-				}
+				cells[i] = cas.storeAndRef(blob.getBytes());
 			} else if (cell instanceof AString str && str.count() > BlobCAS.THRESHOLD) {
 				if (cells == null) {
 					cells = new ACell[n];
 					for (int j = 0; j < i; j++) cells[j] = values.get(j);
 				}
-				try {
-					cells[i] = cas.storeAndRefForString(str.getBytes());
-				} catch (IOException e) {
-					cells[i] = cell; // fall back to inline on CAS write error
-				}
+				cells[i] = cas.storeAndRefForString(str.getBytes());
 			} else if (cells != null) {
 				cells[i] = cell;
 			}
@@ -235,7 +281,7 @@ public class SQLRow {
 	}
 
 	/** Resolves CAS reference blobs back to their original ABlob bytes or AString. */
-	private static AVector<ACell> resolveCasRefs(AVector<ACell> values, BlobCAS cas) {
+	private static AVector<ACell> resolveCasRefs(AVector<ACell> values, BlobCAS cas) throws IOException {
 		int n = (int) values.count();
 		ACell[] cells = null; // allocated lazily
 		for (int i = 0; i < n; i++) {
@@ -245,21 +291,13 @@ public class SQLRow {
 					cells = new ACell[n];
 					for (int j = 0; j < i; j++) cells[j] = values.get(j);
 				}
-				try {
-					cells[i] = Blob.wrap(cas.retrieve(ref));
-				} catch (IOException e) {
-					cells[i] = cell; // return CAS ref as-is on retrieval error
-				}
+				cells[i] = Blob.wrap(cas.retrieve(ref));
 			} else if (cell instanceof Blob ref && BlobCAS.isStringRef(ref)) {
 				if (cells == null) {
 					cells = new ACell[n];
 					for (int j = 0; j < i; j++) cells[j] = values.get(j);
 				}
-				try {
-					cells[i] = Strings.create(Blob.wrap(cas.retrieve(ref)));
-				} catch (IOException e) {
-					cells[i] = cell; // return CAS ref as-is on retrieval error
-				}
+				cells[i] = Strings.create(Blob.wrap(cas.retrieve(ref)));
 			} else if (cells != null) {
 				cells[i] = cell;
 			}

@@ -567,6 +567,150 @@ public class NodeServerTest {
 	}
 
 	/**
+	 * #611: the ambient broadcast path (as opposed to the initial {@link
+	 * NodeServer#pullPath}, covered above) used to always target the full
+	 * root at an empty path, regardless of what a given peer actually
+	 * needed — so a peer scoped to one region could still be sent, and would
+	 * then attempt to acquire, an unrelated sibling region purely because it
+	 * happened to grow large on the sending side. This is exactly what
+	 * tripped dbase's fleet-wide inbound size limit in production: a
+	 * benchmark schema unrelated to two other nodes grew large enough that
+	 * every ordinary write anywhere on the source triggered an oversized
+	 * rejection on peers that had never asked for that schema at all.
+	 *
+	 * <p>Verifies both halves of the fix: (1) a peer scoped to one region
+	 * never receives — and therefore never attempts to acquire — a sibling
+	 * region, even when that sibling grows past the peer's own configured
+	 * inbound size limit; (2) the same scoped peer still receives genuine
+	 * ambient updates for the region it IS scoped to, proving the fix
+	 * narrows what's sent rather than breaking ambient propagation outright.
+	 */
+	@Test
+	public void testAmbientBroadcastScopedToPeerPathNeverLeaksAnOversizedSiblingRegion() throws Exception {
+		Keyword keepRegion = Keyword.create("keep");
+		Keyword bigRegion = Keyword.create("big");
+		KeyedLattice testLattice = KeyedLattice.create(
+			keepRegion, LWWLattice.create(v -> 0L),
+			bigRegion, LWWLattice.create(v -> 0L));
+
+		AStore storeA = new MemoryStore();
+		// B has a tight inbound size limit -- the sibling region below is
+		// deliberately built to exceed it, so if it ever reached B this test
+		// would fail exactly the way the live incident did.
+		NodeConfig tightB = NodeConfig.create(Maps.of(NodeConfig.MAX_INBOUND_VALUE_SIZE, CVMLong.create(2000)));
+		AStore storeB = new MemoryStore();
+
+		NodeServer<?> serverA = new NodeServer<>(testLattice, storeA, NodeConfig.port(0));
+		NodeServer<?> serverB = new NodeServer<>(testLattice, storeB, tightB);
+		try {
+			AKeyPair keyA = AKeyPair.generate();
+			serverA.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyA));
+
+			allowPrimaryInbound(serverB);
+			serverA.launch();
+			serverB.launch();
+
+			ConvexRemote peerB = ConvexRemote.connect(serverB.getHostAddress());
+			try {
+				AccountKey bKey = keyA.getAccountKey();
+				serverA.getPropagator().addPeer(bKey, peerB);
+				// B only ever asked for "keep" -- never "big".
+				serverA.getPropagator().getConnectionManager().addPeerScope(bKey, keepRegion);
+
+				AString bigValue = Strings.create("x".repeat(4000));
+				assertTrue(bigValue.getMemorySize() > 2000,
+					"test assumes bigValue exceeds B's configured inbound limit");
+				assertFalse(serverB.withinInboundSizeLimit(bigValue),
+					"sanity: B really would reject this value if it ever arrived");
+
+				serverA.getCursor().path(bigRegion).merge(bigValue);
+				serverA.getCursor().sync(); // real ambient broadcast path
+
+				// Give the (correctly-scoped) broadcast time to have arrived if
+				// the fix were absent -- then assert it never did.
+				Thread.sleep(500);
+				assertNull(serverB.getCursor().get(bigRegion),
+					"B must never receive -- let alone attempt to acquire -- a region it was never scoped to");
+
+				// B's connection must still be healthy: a genuine update to the
+				// region B IS scoped to must still arrive ambiently.
+				CVMLong keepValue = CVMLong.create(777);
+				serverA.getCursor().path(keepRegion).merge(keepValue);
+				serverA.getCursor().sync();
+
+				long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+				ACell receivedOnB = null;
+				while (System.nanoTime() < deadlineNanos) {
+					receivedOnB = serverB.getCursor().get(keepRegion);
+					if (receivedOnB != null) break;
+				}
+				assertEquals(keepValue, receivedOnB,
+					"B should still receive ambient updates for its own scoped region");
+			} finally {
+				peerB.close();
+			}
+		} finally {
+			serverA.close();
+			serverB.close();
+			storeA.close();
+			storeB.close();
+		}
+	}
+
+	/**
+	 * Companion to the scoped test above: a peer with NO declared scope must
+	 * keep receiving every region, unchanged from before per-peer scoping
+	 * existed -- scoping is strictly opt-in.
+	 */
+	@Test
+	public void testAmbientBroadcastToAnUnscopedPeerStillCoversEveryRegion() throws Exception {
+		Keyword regionA = Keyword.create("regiona");
+		Keyword regionB = Keyword.create("regionb");
+		KeyedLattice testLattice = KeyedLattice.create(
+			regionA, LWWLattice.create(v -> 0L),
+			regionB, LWWLattice.create(v -> 0L));
+
+		AStore storeA = new MemoryStore();
+		AStore storeB = new MemoryStore();
+		NodeServer<?> serverA = new NodeServer<>(testLattice, storeA, NodeConfig.port(0));
+		NodeServer<?> serverB = new NodeServer<>(testLattice, storeB, NodeConfig.port(0));
+		try {
+			AKeyPair keyA = AKeyPair.generate();
+			serverA.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyA));
+
+			allowPrimaryInbound(serverB);
+			serverA.launch();
+			serverB.launch();
+
+			ConvexRemote peerB = ConvexRemote.connect(serverB.getHostAddress());
+			try {
+				// No addPeerScope call -- B stays unscoped, the pre-existing default.
+				serverA.getPropagator().addPeer(keyA.getAccountKey(), peerB);
+
+				serverA.getCursor().path(regionA).merge(CVMLong.create(111));
+				serverA.getCursor().path(regionB).merge(CVMLong.create(222));
+				serverA.getCursor().sync();
+
+				long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+				while (System.nanoTime() < deadlineNanos) {
+					if (serverB.getCursor().get(regionA) != null && serverB.getCursor().get(regionB) != null) break;
+				}
+				assertEquals(CVMLong.create(111), serverB.getCursor().get(regionA),
+					"unscoped peer should still receive every region");
+				assertEquals(CVMLong.create(222), serverB.getCursor().get(regionB),
+					"unscoped peer should still receive every region");
+			} finally {
+				peerB.close();
+			}
+		} finally {
+			serverA.close();
+			serverB.close();
+			storeA.close();
+			storeB.close();
+		}
+	}
+
+	/**
 	 * Correctness test (NOT a timing reproduction — see below) for a GC race
 	 * found live 2026-08-05 (see dbase's CLAUDE.md "RefSoft/GC race"
 	 * writeup): {@code processLatticeValue} used to merge an incoming

@@ -220,6 +220,22 @@ public class ConvexExpressionEvaluator {
 			}
 			case NOT -> CVMBool.create(!RT.bool(args[0]));
 
+			// IS TRUE / IS FALSE family — synthesized by Calcite's own
+			// SqlToRelConverter when it lifts a CASE WHEN out of an
+			// aggregate argument (e.g. MAX(CASE WHEN cond THEN expr END)
+			// becomes an IS_TRUE(cond) guard elsewhere in the plan), so
+			// these show up even though no query text ever spells "IS
+			// TRUE" directly. RT.bool already treats null/FALSE as false
+			// and only CVMBool.TRUE as true, i.e. exactly SQL IS TRUE
+			// semantics, so IS_TRUE/IS_NOT_TRUE reuse it directly like
+			// AND/OR/NOT do above. IS_FALSE/IS_NOT_FALSE are NOT simply
+			// the negation of that — NULL IS FALSE must be FALSE, not
+			// TRUE, so they check for CVMBool.FALSE explicitly instead.
+			case IS_TRUE -> CVMBool.create(RT.bool(args[0]));
+			case IS_NOT_TRUE -> CVMBool.create(!RT.bool(args[0]));
+			case IS_FALSE -> CVMBool.create(args[0] == CVMBool.FALSE);
+			case IS_NOT_FALSE -> CVMBool.create(args[0] != CVMBool.FALSE);
+
 			// Arithmetic operators - use RT functions
 			case PLUS -> cellAdd(args[0], args[1]);
 			case MINUS -> RT.minus(args);
@@ -343,6 +359,7 @@ public class ConvexExpressionEvaluator {
 			case "EXP" -> RT.exp(args[0]);
 			case "POWER", "POW" -> RT.pow(args);
 			case "SIGN", "SIGNUM" -> RT.signum(args[0]);
+			case "ROUND" -> cellRound(args, call.getType());
 
 			// String functions (using Java String methods since no CVM equivalents)
 			case "UPPER" -> cellUpper(args[0]);
@@ -362,6 +379,39 @@ public class ConvexExpressionEvaluator {
 
 			default -> throw new UnsupportedOperationException("Function not supported: " + funcName);
 		};
+	}
+
+	/**
+	 * ROUND(x) rounds to the nearest integer; ROUND(x, n) rounds to n
+	 * decimal places (n may be negative, per SQL, to round to the nearest
+	 * 10/100/etc).
+	 *
+	 * <p>Return type must match Calcite's own declared type for this call
+	 * (same convention as {@code ConvexAggregate.computeAvg}), not always
+	 * CVMDouble — found live: {@code ROUND(AVG(amount), 2)} over an
+	 * INTEGER column throws a ClassCastException at the JDBC layer
+	 * (Avatica picks a LongAccessor from the column's declared BIGINT
+	 * type, since ROUND's return-type inference here follows AVG's; a
+	 * runtime CVMDouble value doesn't fit that accessor). A bare
+	 * ROUND(x, n) on a genuinely fractional expression is unaffected —
+	 * Calcite declares that a DOUBLE/DECIMAL column, so this still returns
+	 * CVMDouble for it.
+	 */
+	private static ACell cellRound(ACell[] args, RelDataType returnType) {
+		CVMDouble value = RT.ensureDouble(args[0]);
+		if (value == null) return null;
+		int scale = 0;
+		if (args.length > 1 && args[1] != null) {
+			CVMDouble scaleArg = RT.ensureDouble(args[1]);
+			if (scaleArg == null) return null;
+			scale = (int) scaleArg.doubleValue();
+		}
+		BigDecimal rounded = BigDecimal.valueOf(value.doubleValue()).setScale(scale, java.math.RoundingMode.HALF_UP);
+		if (returnType != null && (returnType.getSqlTypeName() == SqlTypeName.BIGINT
+				|| returnType.getSqlTypeName() == SqlTypeName.INTEGER)) {
+			return CVMLong.create(rounded.longValue());
+		}
+		return CVMDouble.create(rounded.doubleValue());
 	}
 
 	// ========== String Functions ==========

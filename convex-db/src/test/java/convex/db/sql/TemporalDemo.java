@@ -88,16 +88,20 @@ public class TemporalDemo {
 
 	// ── Helpers ───────────────────────────────────────────────────────────────
 
+	// Returns the actual writeSeq recorded for the write just performed, not
+	// an external clock capture -- writeSeq is HLC-style (see
+	// VersionedSQLTable.nextHistorySeq's own doc), not comparable to a raw
+	// System.nanoTime() snapshot.
 	static long insert(VersionedSQLSchema schema, long id, Object... rest) {
-		long ts = System.nanoTime();
 		schema.insert(TABLE, buildRow(id, rest));
-		return ts;
+		List<AVector<ACell>> history = schema.getHistory(TABLE, CVMLong.create(id));
+		return VersionedSQLTable.getHistoryWriteSeq(history.get(history.size() - 1));
 	}
 
 	static long delete(VersionedSQLSchema schema, long id) {
-		long ts = System.nanoTime();
 		schema.deleteByKey(TABLE, CVMLong.create(id));
-		return ts;
+		List<AVector<ACell>> history = schema.getHistory(TABLE, CVMLong.create(id));
+		return VersionedSQLTable.getHistoryWriteSeq(history.get(history.size() - 1));
 	}
 
 	@SuppressWarnings("unchecked")
@@ -116,7 +120,7 @@ public class TemporalDemo {
 	static void printHistory(VersionedSQLSchema schema, long id) {
 		List<AVector<ACell>> versions = schema.getHistory(TABLE, CVMLong.create(id));
 		if (versions.isEmpty()) { System.out.println("  (no history)"); return; }
-		System.out.printf("  %-8s  %-22s  %s%n", "Type", "Nanotime", "Values");
+		System.out.printf("  %-8s  %-22s  %s%n", "Type", "WriteSeq", "Values");
 		for (AVector<ACell> entry : versions) {
 			long ts   = ((CVMLong) entry.get(1)).longValue();
 			long ct   = ((CVMLong) entry.get(2)).longValue();
@@ -125,8 +129,8 @@ public class TemporalDemo {
 		}
 	}
 
-	static void printAsOf(VersionedSQLSchema schema, long id, long nanotime) {
-		AVector<ACell> entry = schema.getAsOf(TABLE, CVMLong.create(id), nanotime);
+	static void printAsOf(VersionedSQLSchema schema, long id, long writeSeq) {
+		AVector<ACell> entry = schema.getAsOf(TABLE, CVMLong.create(id), writeSeq);
 		if (entry == null) { System.out.println("  (no record at this time)\n"); return; }
 		long ct    = ((CVMLong) entry.get(2)).longValue();
 		AVector<ACell> vals = VersionedSQLTable.getHistoryValues(entry);

@@ -1,14 +1,17 @@
 package convex.db.lattice;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
 import convex.core.data.AString;
 import convex.core.data.AVector;
 import convex.core.data.Blob;
+import convex.core.data.Hash;
 import convex.core.data.Index;
 import convex.core.data.Strings;
 import convex.core.data.Vectors;
@@ -359,6 +362,29 @@ public class SQLTable extends ALatticeComponent<AVector<ACell>> {
 	}
 
 	/**
+	 * Scans every row in this table for {@link BlobCAS} reference cells,
+	 * returning the set of hashes they point to — without resolving them, so
+	 * this never throws even if some referenced hash isn't locally fetchable
+	 * yet (the whole point is finding out what to fetch before assuming it's
+	 * there). Used by replication (see {@code DbaseServer.replicateOneSchema}/
+	 * {@code replicateOneDatabase}'s own class docs) to discover which
+	 * hashes a just-pulled table's data depends on — a CAS reference is an
+	 * ordinary opaque blob value, not a genuine Convex {@code Ref}, so
+	 * nothing else would ever notice it needs fetching.
+	 */
+	public Set<Hash> findCasReferenceHashes() {
+		Set<Hash> hashes = new HashSet<>();
+		Index<ABlob, ACell> rows = getRows();
+		if (rows == null) return hashes;
+		rows.forEach((bk, block) -> {
+			if (RowBlock.isBlock(block)) {
+				RowBlock.forEach(block, (pk, row) -> hashes.addAll(SQLRow.findCasReferenceHashes((Blob) row.get(0))));
+			}
+		});
+		return hashes;
+	}
+
+	/**
 	 * Gets the rows index from this table.
 	 *
 	 * @return Row block index (ABlob prefix → RowBlock), or null if tombstone
@@ -650,6 +676,52 @@ public class SQLTable extends ALatticeComponent<AVector<ACell>> {
 			return withIndices(state, null, CVMLong.create(liveCount), indices, rows, timestamp);
 		});
 		return result[0];
+	}
+
+	/**
+	 * Inserts a row only if no live row currently occupies {@code pk} —
+	 * atomically, within the same lattice {@code updateAndGet} as the
+	 * check, unlike a separate exists-check followed by a later {@link
+	 * #insertRow} call (which would leave a race window between the two:
+	 * something else could claim the key in between, and {@code insertRow}
+	 * would then silently overwrite it — it always upserts unconditionally).
+	 *
+	 * <p>Used by auto-increment value generation ({@code
+	 * AutoIncrementCounters}), where a generated candidate must never
+	 * silently clobber a row that's already there (e.g. from a concurrent
+	 * write on another node not yet observed locally) — the caller is
+	 * expected to retry with the next candidate when this returns false,
+	 * not treat it as a fatal error.
+	 *
+	 * @return true if the row was inserted (the slot was genuinely free),
+	 *         false if a live row already occupied {@code pk} (nothing written)
+	 */
+	@SuppressWarnings("unchecked")
+	public boolean insertRowIfAbsent(ABlob pk, AVector<ACell> values, CVMLong timestamp) {
+		boolean[] inserted = new boolean[1];
+		cursor.updateAndGet(state -> {
+			if (state == null || state.get(POS_SCHEMA) == null) return state;
+			Index<ABlob, ACell> rows = (Index<ABlob, ACell>) state.get(POS_ROWS);
+			if (rows == null) rows = BlockTableLattice.INSTANCE.zero();
+			ABlob bk = RowBlock.blockKey(pk);
+			ACell block = rows.get(bk);
+			AVector<ACell> existing = RowBlock.get(block, pk);
+			if (existing != null && SQLRow.isLive(existing)) {
+				inserted[0] = false;
+				return state; // slot occupied -- no-op, don't touch state
+			}
+			ACell newBlock = RowBlock.put(block, pk, SQLRow.create(values, timestamp));
+			rows = rows.assoc(bk, newBlock);
+			long liveCount = getLiveCount(state) + 1;
+			inserted[0] = true;
+
+			AVector<AVector<ACell>> schema = (AVector<AVector<ACell>>) state.get(POS_SCHEMA);
+			Index<AString, Index<ABlob, AVector<ABlob>>> indices =
+				indexAddRow(getIndicesFromState(state), schema, pk, null, values);
+
+			return withIndices(state, null, CVMLong.create(liveCount), indices, rows, timestamp);
+		});
+		return inserted[0];
 	}
 
 	/**

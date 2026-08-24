@@ -81,8 +81,33 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	 */
 	private static final AtomicLong WRITE_SEQ = new AtomicLong(System.currentTimeMillis());
 
+	/**
+	 * This schema's own name, used as the {@code TableVersionRegistry} lookup
+	 * key for every table this instance touches — table names are unique
+	 * within a schema, not across a whole node, so registry lookups need both.
+	 * A bare {@link #SQLSchema(ALatticeCursor)} (no name given) gets a unique
+	 * generated placeholder, safe because such an instance is never sharing a
+	 * registry namespace with anything else (it's its own isolated cursor
+	 * tree) — {@link SQLDatabase#tables()} passes the real schema name.
+	 */
+	private final AString schemaName;
+
 	public SQLSchema(ALatticeCursor<Index<AString, AVector<ACell>>> cursor) {
+		this(cursor, anonymousSchemaName());
+	}
+
+	public SQLSchema(ALatticeCursor<Index<AString, AVector<ACell>>> cursor, AString schemaName) {
 		super(cursor);
+		this.schemaName = schemaName;
+	}
+
+	static AString anonymousSchemaName() {
+		return Strings.create("anon-" + java.util.UUID.randomUUID());
+	}
+
+	/** This schema's own name (see {@link #schemaName}'s javadoc for what it's used for). */
+	public AString getSchemaName() {
+		return schemaName;
 	}
 
 	/**
@@ -91,19 +116,24 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	 * @return New SQLSchema instance
 	 */
 	public static SQLSchema create() {
+		AString name = anonymousSchemaName();
 		ALatticeCursor<Index<AString, AVector<ACell>>> cursor =
-			Cursors.createLattice(TableStoreLattice.INSTANCE);
-		return new SQLSchema(cursor);
+			Cursors.createLattice(new HybridTableStoreLattice(name));
+		return new SQLSchema(cursor, name);
 	}
 
 	/**
 	 * Connects to an existing cursor for cursor chain integration.
 	 *
+	 * <p>No current caller passes a name-bearing cursor chain here — prefer
+	 * {@link SQLDatabase#tables()} for a schema that needs correct per-table
+	 * versioned dispatch tied to a real, stable schema name.
+	 *
 	 * @param cursor Lattice cursor (e.g. from a SignedCursor path)
 	 * @return New SQLSchema instance connected to the cursor
 	 */
 	public static SQLSchema connect(ALatticeCursor<Index<AString, AVector<ACell>>> cursor) {
-		return new SQLSchema(cursor);
+		return new SQLSchema(cursor, anonymousSchemaName());
 	}
 
 	/**
@@ -112,7 +142,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	 * @return Forked SQLSchema instance
 	 */
 	public SQLSchema fork() {
-		return new SQLSchema(cursor.fork());
+		return new SQLSchema(cursor.fork(), schemaName);
 	}
 
 	// ========== Internal Helpers ==========
@@ -138,11 +168,28 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	}
 
 	/**
-	 * Gets a cursor-backed table by name, returning null if not found.
+	 * Plain {@code System.currentTimeMillis()}, deliberately not {@link #now()}'s
+	 * tie-broken monotonic sequence — preserves {@code VersionedSQLSchema}'s
+	 * existing behavior for versioned-table timestamps exactly, since {@link
+	 * VersionedSQLTable}'s own LWW/merge comparisons were only ever exercised
+	 * against this simpler form.
+	 */
+	private static CVMLong millis() {
+		return CVMLong.create(System.currentTimeMillis());
+	}
+
+	/**
+	 * Gets a cursor-backed table by name, returning null if not found —
+	 * returns a {@link VersionedSQLTable} if {@code name} is marked versioned
+	 * in {@link TableVersionRegistry}, a plain {@link SQLTable} otherwise, so
+	 * a single schema can hold both kinds side by side.
 	 */
 	public SQLTable getTable(AString name) {
 		ALatticeCursor<AVector<ACell>> tableCursor = cursor.path(name);
 		if (tableCursor.get() == null) return null;
+		if (TableVersionRegistry.isVersioned(schemaName, name)) {
+			return new VersionedSQLTable(tableCursor);
+		}
 		return new SQLTable(tableCursor);
 	}
 
@@ -258,6 +305,15 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		return createTable(Strings.create(name), columns, types, pkCount);
 	}
 
+	/** Creates a new table with ANY-typed columns, optionally versioned (row-history-tracked). */
+	public boolean createTable(String name, String[] columns, boolean versioned) {
+		ConvexColumnType[] types = new ConvexColumnType[columns.length];
+		for (int i = 0; i < types.length; i++) {
+			types[i] = ConvexColumnType.of(ConvexType.ANY);
+		}
+		return createTable(Strings.create(name), columns, types, 1, versioned);
+	}
+
 	public boolean createTable(AString name, String[] columns) {
 		ConvexColumnType[] types = new ConvexColumnType[columns.length];
 		for (int i = 0; i < types.length; i++) {
@@ -282,10 +338,55 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		return createTable(name, columns, types, 1);
 	}
 
-	@SuppressWarnings({"unchecked", "rawtypes"})
 	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types, int pkCount) {
+		return createTable(name, columns, types, pkCount, false);
+	}
+
+	/** Creates a new table, plain or versioned, with no auto-increment — see the 6-arg overload for the real terminus. */
+	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types, int pkCount, boolean versioned) {
+		return createTable(name, columns, types, pkCount, versioned, false);
+	}
+
+	/**
+	 * Creates a new table, plain/versioned/auto-increment per the flags. The
+	 * real terminus — every other {@code createTable} overload funnels down
+	 * to this one.
+	 *
+	 * <p>Versioned tables don't support composite primary keys yet — {@link
+	 * VersionedSQLTable}'s history model treats the pk as an opaque single
+	 * blob (see {@link HistoryKey}) — so {@code versioned=true} with {@code
+	 * pkCount != 1} rejects outright rather than silently building a table
+	 * that can't be queried by its individual key components.
+	 *
+	 * <p>Auto-increment tables are likewise restricted to a single-column PK
+	 * (an auto-generating composite key has no sensible definition in any
+	 * SQL database), and that column must be {@link ConvexType#INTEGER} —
+	 * {@code AutoIncrementCounters} generates plain 64-bit sequential
+	 * values, not arbitrary-precision or string keys. Combining {@code
+	 * versioned} and {@code autoIncrement} on the same table is out of
+	 * scope for now (not needed by anything using this yet) — not rejected
+	 * outright, but untested; callers wanting both should treat it as
+	 * unsupported.
+	 */
+	@SuppressWarnings({"unchecked", "rawtypes"})
+	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types, int pkCount,
+			boolean versioned, boolean autoIncrement) {
 		if (columns.length != types.length) {
 			throw new IllegalArgumentException("Columns and types must have same length");
+		}
+		if (versioned && pkCount != 1) {
+			throw new UnsupportedOperationException(
+				"Versioned tables don't support composite primary keys (pkCount=" + pkCount + ")");
+		}
+		if (autoIncrement) {
+			if (pkCount != 1) {
+				throw new UnsupportedOperationException(
+					"Auto-increment tables don't support composite primary keys (pkCount=" + pkCount + ")");
+			}
+			if (types[0].getBaseType() != ConvexType.INTEGER) {
+				throw new UnsupportedOperationException(
+					"Auto-increment primary key must be INTEGER, not " + types[0].getBaseType());
+			}
 		}
 
 		// Build full desired schema: [[name, typeName, precision, scale], ...]
@@ -302,7 +403,15 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (existing == null) {
 			// Table does not exist yet: create fresh
 			ALatticeCursor<AVector<ACell>> tableCursor = cursor.path(name);
-			tableCursor.set(SQLTable.createState((AVector<AVector<ACell>>) newSchema, now(), pkCount));
+			if (versioned) {
+				tableCursor.set(VersionedSQLTable.createState((AVector<AVector<ACell>>) newSchema, millis()));
+				TableVersionRegistry.markVersioned(schemaName, name);
+			} else {
+				tableCursor.set(SQLTable.createState((AVector<AVector<ACell>>) newSchema, now(), pkCount));
+			}
+			if (autoIncrement) {
+				AutoIncrementRegistry.markAutoIncrement(schemaName, name);
+			}
 			return true;
 		}
 
@@ -311,6 +420,8 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		// everything past the existing count" would corrupt the schema (e.g.
 		// duplicate a column) if a new column is inserted in the middle of
 		// the desired column list rather than strictly appended at the end.
+		// Same logic regardless of versioned-ness -- POS_SCHEMA (slot 0) is
+		// identical between SQLTable and VersionedSQLTable state shapes.
 		AVector<AVector<ACell>> existingSchema = existing.getSchema();
 		long existingCount = existingSchema != null ? existingSchema.count() : 0;
 
@@ -445,8 +556,52 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	public boolean insert(AString tableName, AVector<ACell> row) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
+		if (!(table instanceof VersionedSQLTable) && AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
+			return insertAutoIncrement(table, tableName, row);
+		}
+		if (table instanceof VersionedSQLTable vt) {
+			// Versioned tables are always single-column PK (enforced at
+			// createTable time), so a plain toKey suffices -- no composite
+			// key support needed here.
+			ABlob pk = toKey(row.get(0));
+			return vt.insertRowVersioned(pk, row, millis());
+		}
 		int pkCount = SQLTable.getPkCount(table.getState());
 		ABlob pk = toCompositeKey(row, pkCount);
+		return table.insertRow(pk, row, now());
+	}
+
+	/**
+	 * Handles insert into an auto-increment table (always single-column PK,
+	 * enforced at {@code CREATE TABLE}/{@code ALTER TABLE} time — see
+	 * {@link #createTable}/{@link #convertToAutoIncrement}). If the PK
+	 * (column 0) is omitted/{@code NULL}, generates a value and atomically
+	 * claims it via {@link SQLTable#insertRowIfAbsent}, retrying with the
+	 * next candidate on the rare cross-node collision that method can
+	 * report (see {@link AutoIncrementCounters}'s own doc for why this is
+	 * safe against clobbering — the value returned to the caller is always
+	 * the one that was actually, atomically written, never just checked
+	 * ahead of a separate later write). If the caller supplied an explicit
+	 * value instead, records it so future generated values skip past it,
+	 * mirroring MySQL's own auto_increment behaviour, then inserts normally
+	 * (an explicit value collision is a genuine caller error, not something
+	 * to silently retry past).
+	 */
+	private boolean insertAutoIncrement(SQLTable table, AString tableName, AVector<ACell> row) {
+		if (row.get(0) == null) {
+			while (true) {
+				long candidate = AutoIncrementCounters.nextCandidate(this, tableName);
+				AVector<ACell> candidateRow = row.assoc(0, CVMLong.create(candidate));
+				ABlob pk = toKey(CVMLong.create(candidate));
+				if (table.insertRowIfAbsent(pk, candidateRow, now())) return true;
+				// Slot claimed by something else (e.g. a peer's write merged
+				// in since we last observed this table) -- retry with a fresh candidate.
+			}
+		}
+		if (row.get(0) instanceof CVMLong explicit) {
+			AutoIncrementCounters.recordValue(this, tableName, explicit.longValue());
+		}
+		ABlob pk = toKey(row.get(0));
 		return table.insertRow(pk, row, now());
 	}
 
@@ -474,6 +629,27 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (rows == null || rows.isEmpty()) return 0;
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return 0;
+		if (!(table instanceof VersionedSQLTable) && AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
+			// Auto-increment generation needs per-row atomic claim-and-retry
+			// (see insertAutoIncrement's own doc) -- doesn't fit this
+			// method's single-batch-write optimization, so an auto-increment
+			// table falls back to plain per-row inserts instead. Correct,
+			// just without the block-grouping speedup for this specific case.
+			int count = 0;
+			for (AVector<ACell> row : rows) {
+				if (insertAutoIncrement(table, tableName, row)) count++;
+			}
+			return count;
+		}
+		if (table instanceof VersionedSQLTable vt) {
+			CVMLong ts = millis();
+			List<Map.Entry<ABlob, AVector<ACell>>> sorted = new ArrayList<>(rows.size());
+			for (AVector<ACell> row : rows) {
+				sorted.add(Map.entry(toKey(row.get(0)), row));
+			}
+			sorted.sort(Map.Entry.comparingByKey());
+			return vt.insertRowsVersioned(sorted, ts);
+		}
 		int pkCount = SQLTable.getPkCount(table.getState());
 		CVMLong ts = now();
 		List<Map.Entry<ABlob, AVector<ACell>>> sorted = new ArrayList<>(rows.size());
@@ -536,8 +712,139 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	public boolean deleteByKey(AString tableName, List<ACell> keyParts) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
+		if (table instanceof VersionedSQLTable vt) {
+			// Versioned tables are always single-column PK (enforced at
+			// createTable time) -- keyParts.get(0) is the whole key.
+			ABlob key = toKey(keyParts.get(0));
+			return vt.deleteRowVersioned(key, millis());
+		}
 		ABlob key = toCompositeKey(Vectors.create(keyParts), keyParts.size());
 		return table.deleteRow(key, now());
+	}
+
+	// ========== Versioned Table Operations ==========
+	// These only do something meaningful for a table currently marked
+	// versioned in TableVersionRegistry -- graceful empty/null/no-op
+	// otherwise, since a plain SQLSchema instance may hold a mix of both
+	// kinds of table side by side.
+
+	/**
+	 * Returns all recorded change events for a primary key, oldest first --
+	 * empty if the table isn't versioned or doesn't exist. Each entry is
+	 * {@code [values|null, CVMLong(writeSeq), CVMLong(changeType)]} — see
+	 * {@link VersionedSQLTable#getHistoryWriteSeq}.
+	 */
+	public List<AVector<ACell>> getHistory(String tableName, ACell primaryKey) {
+		return getHistory(Strings.create(tableName), primaryKey);
+	}
+
+	public List<AVector<ACell>> getHistory(AString tableName, ACell primaryKey) {
+		SQLTable table = getLiveTable(tableName);
+		if (!(table instanceof VersionedSQLTable vt)) return List.of();
+		return vt.getHistory(toKey(primaryKey));
+	}
+
+	/**
+	 * Returns the row as it existed at or before the given writeSeq
+	 * (equivalent to {@code SELECT ... AS OF SYSTEM TIME}) — null if the
+	 * table isn't versioned or doesn't exist.
+	 *
+	 * @param writeSeq Upper-bound value, comparable to {@code
+	 *                 System.currentTimeMillis()} (see {@link
+	 *                 VersionedSQLTable#nextHistorySeq()})
+	 */
+	public AVector<ACell> getAsOf(String tableName, ACell primaryKey, long writeSeq) {
+		return getAsOf(Strings.create(tableName), primaryKey, writeSeq);
+	}
+
+	public AVector<ACell> getAsOf(AString tableName, ACell primaryKey, long writeSeq) {
+		SQLTable table = getLiveTable(tableName);
+		if (!(table instanceof VersionedSQLTable vt)) return null;
+		return vt.getAsOf(toKey(primaryKey), writeSeq);
+	}
+
+	/**
+	 * Converts an existing plain table to versioned (row-history-tracked) in
+	 * place. Prospective-only: existing live rows are preserved unchanged,
+	 * but no history is backfilled for writes that happened before this call
+	 * — only writes from this point onward are tracked.
+	 *
+	 * @return true if converted (or already versioned); false if the table doesn't exist
+	 */
+	public boolean convertToVersioned(String tableName) {
+		return convertToVersioned(Strings.create(tableName));
+	}
+
+	public boolean convertToVersioned(AString tableName) {
+		SQLTable table = getLiveTable(tableName);
+		if (table == null) return false;
+		if (table instanceof VersionedSQLTable) return true; // already versioned, no-op
+
+		int pkCount = SQLTable.getPkCount(table.getState());
+		if (pkCount != 1) {
+			throw new UnsupportedOperationException(
+				"Cannot convert a composite-PK table to versioned (pkCount=" + pkCount + ")");
+		}
+
+		// Positions 0-3 (schema, rows, utime, liveCount) are identical
+		// between SQLTable and VersionedSQLTable -- carry them over
+		// directly, so existing live rows survive the conversion unchanged.
+		// Position 4 differs (blockVec for plain, history for versioned) --
+		// start it empty, per the locked-in prospective-only semantics.
+		AVector<ACell> state = table.getState();
+		AVector<ACell> versionedState = Vectors.of(
+			state.get(SQLTable.POS_SCHEMA),
+			state.get(SQLTable.POS_ROWS),
+			state.get(SQLTable.POS_UTIME),
+			state.get(SQLTable.POS_LIVE_COUNT),
+			Index.EMPTY);
+
+		ALatticeCursor<AVector<ACell>> tableCursor = cursor.path(tableName);
+		tableCursor.set(versionedState);
+		TableVersionRegistry.markVersioned(schemaName, tableName);
+		return true;
+	}
+
+	/**
+	 * Marks an existing plain table's (single-column) primary key as
+	 * auto-incrementing, in place. Unlike {@link #convertToVersioned}, this
+	 * doesn't change the table's underlying state shape at all — it's a
+	 * pure {@link AutoIncrementRegistry} marker; the table stays an
+	 * ordinary {@link SQLTable}, with existing live rows completely
+	 * untouched. The counter that generates future values (see {@code
+	 * AutoIncrementCounters}) seeds itself from this table's own current
+	 * {@code MAX(pk)} the first time it's needed, so already-present rows
+	 * (e.g. migrated historical data) are never collided with.
+	 *
+	 * @return true if converted (or already auto-increment); false if the table doesn't exist
+	 */
+	public boolean convertToAutoIncrement(String tableName) {
+		return convertToAutoIncrement(Strings.create(tableName));
+	}
+
+	public boolean convertToAutoIncrement(AString tableName) {
+		SQLTable table = getLiveTable(tableName);
+		if (table == null) return false;
+		if (table instanceof VersionedSQLTable) {
+			throw new UnsupportedOperationException(
+				"Cannot make a versioned table auto-increment — not supported together in this pass");
+		}
+		if (AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) return true; // already, no-op
+
+		int pkCount = SQLTable.getPkCount(table.getState());
+		if (pkCount != 1) {
+			throw new UnsupportedOperationException(
+				"Cannot convert a composite-PK table to auto-increment (pkCount=" + pkCount + ")");
+		}
+		AVector<AVector<ACell>> schema = table.getSchema();
+		ACell pkTypeName = (schema != null && schema.count() > 0) ? schema.get(0).get(1) : null;
+		if (pkTypeName == null || !"INTEGER".equals(pkTypeName.toString())) {
+			throw new UnsupportedOperationException(
+				"Auto-increment primary key must be INTEGER, not " + (pkTypeName == null ? "ANY" : pkTypeName));
+		}
+
+		AutoIncrementRegistry.markAutoIncrement(schemaName, tableName);
+		return true;
 	}
 
 	/** Returns all live rows in a table. */

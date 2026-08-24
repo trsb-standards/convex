@@ -219,6 +219,29 @@ public class PgServerTest {
 		}
 	}
 
+	/**
+	 * The timing {@code NoticeResponse} footer exists for a human reading a
+	 * terminal ({@link #testInsertTimingNotice} above, the simple-query
+	 * path) -- a bound {@code PreparedStatement} is always a program, never
+	 * a person at psql, so it should never receive one. pgjdbc surfaces a
+	 * received {@code NoticeResponse} as a {@code SQLWarning} on the
+	 * statement, so its absence is directly assertable via {@code
+	 * getWarnings()} without needing to hand-decode the wire protocol.
+	 */
+	@Test
+	public void testExtendedProtocolInsertSendsNoTimingNotice() throws Exception {
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		try (Connection conn = DriverManager.getConnection(url);
+			 java.sql.PreparedStatement ps = conn.prepareStatement(
+				 "INSERT INTO users (id, name, email) VALUES (?, ?, ?)")) {
+			ps.setInt(1, 4);
+			ps.setString(2, "Dan");
+			ps.setString(3, "dan@example.com");
+			ps.executeUpdate();
+			assertNull(ps.getWarnings(), "extended-protocol INSERT should not receive a timing NoticeResponse");
+		}
+	}
+
 	@Test
 	public void testPasswordAuthentication() throws Exception {
 		// Stop the trust-auth server
@@ -376,6 +399,102 @@ public class PgServerTest {
 	}
 
 	/**
+	 * {@code BEGIN}/{@code COMMIT} arrive as literal wire-text SQL (PostgreSQL's
+	 * wire protocol has no dedicated transaction-control message — pgjdbc's
+	 * {@code setAutoCommit(false)}/{@code commit()} just send these two
+	 * strings via the ordinary simple-query path). Confirms {@link
+	 * PgProtocolHandler#handleQuery} intercepts them and drives the backing
+	 * connection's real {@code setAutoCommit}/{@code commit} (which {@code
+	 * ConvexMeta} already implements via its fork/sync transaction model) —
+	 * a second, unrelated connection must see the committed row.
+	 */
+	@Test
+	public void testExplicitTransactionCommitPersistsAcrossConnections() throws Exception {
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		try (Connection conn = DriverManager.getConnection(url)) {
+			conn.setAutoCommit(false);
+			try (Statement stmt = conn.createStatement()) {
+				stmt.execute("INSERT INTO users (id, name, email) VALUES (10, 'Dave', 'dave@example.com')");
+			}
+			conn.commit();
+		}
+
+		try (Connection conn = DriverManager.getConnection(url);
+			 Statement stmt = conn.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT name FROM users WHERE id = 10")) {
+			assertTrue(rs.next());
+			assertEquals("Dave", rs.getString("name"));
+		}
+	}
+
+	/**
+	 * Same wire-text interception as {@link
+	 * #testExplicitTransactionCommitPersistsAcrossConnections}, but for
+	 * {@code ROLLBACK} — the inserted row must never become visible.
+	 */
+	@Test
+	public void testExplicitTransactionRollbackDiscardsTheWrite() throws Exception {
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		try (Connection conn = DriverManager.getConnection(url)) {
+			conn.setAutoCommit(false);
+			try (Statement stmt = conn.createStatement()) {
+				stmt.execute("INSERT INTO users (id, name, email) VALUES (11, 'Erin', 'erin@example.com')");
+			}
+			conn.rollback();
+		}
+
+		try (Connection conn = DriverManager.getConnection(url);
+			 Statement stmt = conn.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT name FROM users WHERE id = 11")) {
+			assertFalse(rs.next());
+		}
+	}
+
+	/**
+	 * A single client-side {@code PreparedStatement}, executed repeatedly
+	 * with different bound values, reuses one server-side Parse (same
+	 * statement name) across many Bind+Execute cycles — exactly the
+	 * scenario {@code PgProtocolHandler}'s {@code preparedStatementCache}
+	 * exists for (see its own doc: {@code executeWithParameters} used to
+	 * re-{@code prepareStatement} from scratch on every single execute,
+	 * throwing the real statement away right after). This doesn't assert on
+	 * timing (too flaky for CI) — it asserts every row lands with its own
+	 * correct, distinct values, which a caching bug (e.g. stale bound
+	 * parameters leaking from a reused-but-not-cleared statement) would
+	 * corrupt.
+	 */
+	@Test
+	public void testPreparedStatementReusedAcrossManyExecutionsWithDifferentValues() throws Exception {
+		ConvexColumnType[] types = {
+			ConvexColumnType.of(ConvexType.INTEGER), // id
+			ConvexColumnType.varchar(50),            // name
+		};
+		db.tables().createTable("reused", new String[]{"id", "name"}, types);
+
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		int rowCount = 50;
+		try (Connection conn = DriverManager.getConnection(url);
+			 java.sql.PreparedStatement ps = conn.prepareStatement("INSERT INTO reused (id, name) VALUES (?, ?)")) {
+			for (int i = 0; i < rowCount; i++) {
+				ps.setInt(1, i);
+				ps.setString(2, "row-" + i);
+				assertEquals(1, ps.executeUpdate());
+			}
+		}
+
+		try (Connection conn = DriverManager.getConnection(url);
+			 Statement stmt = conn.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT id, name FROM reused ORDER BY id")) {
+			for (int i = 0; i < rowCount; i++) {
+				assertTrue(rs.next());
+				assertEquals(i, rs.getInt("id"));
+				assertEquals("row-" + i, rs.getString("name"));
+			}
+			assertFalse(rs.next());
+		}
+	}
+
+	/**
 	 * Tests aggregation via PostgreSQL JDBC driver.
 	 * Disabled: Requires extended query protocol support (Parse/Bind/Execute).
 	 */
@@ -389,6 +508,72 @@ public class PgServerTest {
 
 			assertTrue(rs.next());
 			assertEquals(2, rs.getInt("cnt"));
+		}
+	}
+
+	/**
+	 * A bound null parameter for a non-VARCHAR column (e.g. INTEGER) must
+	 * bind using that column's real SQL type, not the generic
+	 * java.sql.Types.NULL PgProtocolHandler.executeWithParameters used to
+	 * pass unconditionally — that generic-null path decodes as an Avatica
+	 * ByteString downstream, which then fails to cast to Number once the
+	 * INSERT actually executes against an INTEGER column.
+	 */
+	@Test
+	public void testPreparedStatementBindsNullForNonVarcharColumn() throws Exception {
+		ConvexColumnType[] types = {
+			ConvexColumnType.of(ConvexType.INTEGER), // id
+			ConvexColumnType.of(ConvexType.INTEGER), // score -- nullable
+		};
+		db.tables().createTable("scores", new String[]{"id", "score"}, types);
+
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		try (Connection conn = DriverManager.getConnection(url);
+			 java.sql.PreparedStatement ps = conn.prepareStatement("INSERT INTO scores (id, score) VALUES (?, ?)")) {
+			ps.setInt(1, 1);
+			ps.setNull(2, java.sql.Types.INTEGER);
+			ps.executeUpdate();
+		}
+
+		try (Connection conn = DriverManager.getConnection(url);
+			 Statement stmt = conn.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT id, score FROM scores WHERE id = 1")) {
+			assertTrue(rs.next());
+			assertEquals(1, rs.getInt("id"));
+			rs.getInt("score");
+			assertTrue(rs.wasNull(), "score should have round-tripped as SQL NULL");
+		}
+	}
+
+	/**
+	 * The more consequential half of the same bug: text-format wire values
+	 * were always bound via setString() regardless of target column type, so
+	 * a genuinely non-null INTEGER parameter over pgwire failed too (String
+	 * cannot be cast to Number in ConvexTable.executeInsert) — not just the
+	 * null case above.
+	 */
+	@Test
+	public void testPreparedStatementBindsNonNullIntegerValueForIntegerColumn() throws Exception {
+		ConvexColumnType[] types = {
+			ConvexColumnType.of(ConvexType.INTEGER), // id
+			ConvexColumnType.of(ConvexType.INTEGER), // score
+		};
+		db.tables().createTable("scores2", new String[]{"id", "score"}, types);
+
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		try (Connection conn = DriverManager.getConnection(url);
+			 java.sql.PreparedStatement ps = conn.prepareStatement("INSERT INTO scores2 (id, score) VALUES (?, ?)")) {
+			ps.setInt(1, 1);
+			ps.setInt(2, 42);
+			ps.executeUpdate();
+		}
+
+		try (Connection conn = DriverManager.getConnection(url);
+			 Statement stmt = conn.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT id, score FROM scores2 WHERE id = 1")) {
+			assertTrue(rs.next());
+			assertEquals(1, rs.getInt("id"));
+			assertEquals(42, rs.getInt("score"));
 		}
 	}
 

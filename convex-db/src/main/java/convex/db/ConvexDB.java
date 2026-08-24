@@ -10,14 +10,16 @@ import convex.core.data.AString;
 import convex.core.data.Index;
 import convex.core.data.Keyword;
 import convex.core.store.AStore;
+import convex.core.data.Strings;
 import convex.db.jdbc.ConvexDriver;
+import convex.db.lattice.HybridDatabaseMapLattice;
+import convex.db.lattice.HybridTableStoreLattice;
 import convex.db.lattice.SQLDatabase;
-import convex.db.lattice.TableStoreLattice;
+import convex.lattice.ALattice;
 import convex.lattice.ALatticeComponent;
 import convex.lattice.cursor.ALatticeCursor;
 import convex.lattice.cursor.Cursors;
 import convex.lattice.generic.KeyedLattice;
-import convex.lattice.generic.MapLattice;
 import convex.node.NodeConfig;
 import convex.node.NodeServer;
 
@@ -31,10 +33,15 @@ import convex.node.NodeServer;
  *
  * <p>Lattice structure:
  * <pre>
- * ConvexDB (MapLattice: db-name → database-state)
- *   └─ SQLDatabase (KeyedLattice: :tables → TableStoreLattice)
+ * ConvexDB (HybridDatabaseMapLattice: schema-name → schema-state)
+ *   └─ SQLDatabase (KeyedLattice: :tables → HybridTableStoreLattice, per schema name)
  *        └─ SQLSchema / SQLTable / SQLRow
  * </pre>
+ *
+ * <p>The map and table-store levels use {@code Hybrid*} lattices, not the
+ * homogeneous {@code MapLattice}/{@code IndexLattice}-backed {@code
+ * TableStoreLattice}, so each table can independently be plain or versioned
+ * (row-history-tracked) — see {@link convex.db.lattice.TableVersionRegistry}.
  *
  * <p>Usage:
  * <pre>
@@ -66,17 +73,26 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	public static final Keyword KEY_TABLES = Keyword.intern("tables");
 
 	/**
-	 * The lattice type for a single database.
-	 * Structure: KeyedLattice { :tables → TableStoreLattice }
+	 * A generic, schema-name-agnostic single-database lattice, kept only for
+	 * its {@link ALattice#zero()} value (used by {@code SQLDatabase.connect()}
+	 * when initializing a not-yet-populated schema slot — zero() doesn't
+	 * consult {@code TableVersionRegistry}, so it's the same regardless of
+	 * schema name). Real table creation/merge goes through {@code
+	 * HybridDatabaseMapLattice}/{@code HybridTableStoreLattice} instead, which
+	 * is schema-name-aware — this constant is NOT what tables actually get
+	 * created against.
 	 */
 	public static final KeyedLattice DATABASE_LATTICE =
-		KeyedLattice.create(KEY_TABLES, TableStoreLattice.INSTANCE);
+		KeyedLattice.create(KEY_TABLES, new HybridTableStoreLattice(Strings.create("")));
 
 	/**
-	 * The lattice type for the database map (db name → database state).
+	 * The lattice type for the database map (schema name → schema state).
+	 * {@link HybridDatabaseMapLattice}, not the homogeneous {@code MapLattice}
+	 * — see that class's javadoc for why (each schema needs its own {@code
+	 * HybridTableStoreLattice} bound to its own name).
 	 */
-	public static final MapLattice<AString, Index<Keyword, ACell>>
-		DATABASE_MAP_LATTICE = MapLattice.create(DATABASE_LATTICE);
+	public static final ALattice<AHashMap<AString, Index<Keyword, ACell>>>
+		DATABASE_MAP_LATTICE = HybridDatabaseMapLattice.INSTANCE;
 
 	// ========== Named instance registry ==========
 

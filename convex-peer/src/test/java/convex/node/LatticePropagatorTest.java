@@ -227,6 +227,38 @@ public class LatticePropagatorTest {
 	}
 
 	/**
+	 * #611: {@link LatticeConnectionManager}'s per-peer scope map is a plain
+	 * accumulate/clear data structure -- this exercises it directly rather
+	 * than through a full broadcast, to pin down its contract independent of
+	 * {@code LatticePropagator}'s use of it.
+	 */
+	@Test
+	public void testPeerScopeAccumulatesAndClearsOnRemove() {
+		LatticeConnectionManager cm = server1.getPropagator().getConnectionManager();
+		AccountKey peerKey = AKeyPair.generate().getAccountKey();
+
+		// No scope declared yet -- unscoped, receives full root by default.
+		assertTrue(cm.getPeerScope(peerKey).isEmpty());
+
+		Keyword pathA = Keyword.create("a");
+		Keyword pathB = Keyword.create("b");
+		cm.addPeerScope(peerKey, pathA);
+		assertEquals(1, cm.getPeerScope(peerKey).size());
+		assertEquals(pathA, cm.getPeerScope(peerKey).get(0)[0]);
+
+		// A second call accumulates rather than replaces.
+		cm.addPeerScope(peerKey, pathB);
+		assertEquals(2, cm.getPeerScope(peerKey).size());
+
+		// Defensive copy: mutating the returned list must not affect internal state.
+		cm.getPeerScope(peerKey).clear();
+		assertEquals(2, cm.getPeerScope(peerKey).size());
+
+		cm.removePeer(peerKey);
+		assertTrue(cm.getPeerScope(peerKey).isEmpty(), "removePeer must clear any declared scope too");
+	}
+
+	/**
 	 * Tests that multiple updates are successfully propagated to remote peers.
 	 */
 	@Test

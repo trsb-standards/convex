@@ -14,6 +14,7 @@ import convex.lattice.ALatticeComponent;
 import convex.lattice.LatticeContext;
 import convex.lattice.cursor.ALatticeCursor;
 import convex.lattice.cursor.Cursors;
+import convex.lattice.generic.KeyedLattice;
 import convex.lattice.generic.OwnerLattice;
 
 /**
@@ -85,9 +86,16 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 	 * @return New SQLDatabase instance
 	 */
 	public static SQLDatabase create(String name, AKeyPair keyPair, ACell ownerKey) {
+		AString dbName = Strings.create(name);
+		// Built against this database's own name, not the generic placeholder
+		// ConvexDB.DATABASE_LATTICE — TableVersionRegistry disambiguates
+		// same-named tables by schema name, so a standalone database needs
+		// its own real name here, not a shared placeholder every standalone
+		// database would otherwise collide on.
 		ALatticeCursor<Index<Keyword, ACell>> cursor =
-			Cursors.createLattice(ConvexDB.DATABASE_LATTICE);
-		return new SQLDatabase(cursor, Strings.create(name), keyPair, ownerKey);
+			Cursors.createLattice(KeyedLattice.create(
+				ConvexDB.KEY_TABLES, new HybridTableStoreLattice(dbName)));
+		return new SQLDatabase(cursor, dbName, keyPair, ownerKey);
 	}
 
 	/**
@@ -125,7 +133,7 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 	 * @return SQLSchema instance for this database
 	 */
 	public SQLSchema tables() {
-		return new SQLSchema(cursor.path(ConvexDB.KEY_TABLES));
+		return new SQLSchema(cursor.path(ConvexDB.KEY_TABLES), dbName);
 	}
 
 	/**

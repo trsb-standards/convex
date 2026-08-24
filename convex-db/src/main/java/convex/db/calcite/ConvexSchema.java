@@ -11,6 +11,7 @@ import org.apache.calcite.schema.impl.AbstractSchema;
 import convex.db.calcite.pgcatalog.PgCatalogSchema;
 import convex.db.lattice.SQLDatabase;
 import convex.db.lattice.SQLSchema;
+import convex.db.lattice.VersionedSQLTable;
 
 /**
  * Calcite Schema backed by a Convex {@link SQLDatabase}.
@@ -66,7 +67,17 @@ public class ConvexSchema extends AbstractSchema {
 		String[] tableNames = tables.getTableNames();
 		for (String tableName : tableNames) {
 			tableMap.put(tableName, new ConvexTable(this, tableName));
+			// A "<table>_HISTORY" virtual table is only meaningful (and only
+			// registered) for versioned tables -- a plain table has no
+			// history to show. See ConvexHistoryTable's own class doc.
+			if (tables.getTable(tableName) instanceof VersionedSQLTable) {
+				tableMap.put(tableName + ConvexHistoryTable.SUFFIX, new ConvexHistoryTable(this, tableName));
+			}
 		}
+		// FILES is schema-wide (backed by the node's single shared BlobCAS
+		// store, not any one table) -- registered once, unconditionally, not
+		// per base table. See ConvexFilesTable's own class doc.
+		tableMap.put("FILES", new ConvexFilesTable());
 		return tableMap;
 	}
 

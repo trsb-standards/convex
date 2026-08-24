@@ -4,6 +4,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -25,6 +26,7 @@ import convex.core.data.Hash;
 import convex.core.data.Ref;
 import convex.core.data.Vectors;
 import convex.core.data.prim.CVMLong;
+import convex.core.lang.RT;
 import convex.core.message.Message;
 import convex.core.message.MessageTag;
 import convex.core.message.MessageType;
@@ -510,24 +512,7 @@ public class LatticePropagator implements Closeable {
 			long currentTime = Utils.getCurrentTimestamp();
 			if (!connectionManager.getPeers().isEmpty()
 					&& currentTime >= lastBroadcastTime + MIN_BROADCAST_DELAY) {
-				// Ensure the lattice root is available before the protocol envelope.
-				// Format.encodeDelta decodes its final list element as the message root,
-				// so the LATTICE_VALUE vector itself must be last. Encoding only the
-				// lattice value would lose the message tag and path on the wire.
-				// MemoryStore reports an embedded top-level value as novelty. Embedded
-				// cells are already inline in their parent and are invalid as trailing
-				// multi-cell children, so retain only independently addressable cells.
-				novelty.removeIf(ACell::isEmbedded);
-				if (!value.isEmbedded()
-						&& (novelty.isEmpty() || !novelty.get(novelty.size() - 1).equals(value))) {
-					novelty.add(value);
-				}
-				AVector<ACell> emptyPath = Vectors.empty();
-				AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, emptyPath, value);
-				novelty.add(payload);
-				Blob deltaData = Format.encodeDelta(novelty);
-				Message message = Message.create(MessageType.LATTICE_VALUE, payload, deltaData);
-				connectionManager.broadcast(message);
+				broadcastToPeers(value, novelty);
 				lastBroadcastTime = currentTime;
 				broadcastCount.incrementAndGet();
 			}
@@ -542,10 +527,113 @@ public class LatticePropagator implements Closeable {
 		return value;
 	}
 
+	// ========== Broadcast Scoping ==========
+
+	/** Path array denoting the lattice root, for peers with no declared scope. */
+	private static final ACell[] ROOT_PATH = new ACell[0];
+
+	/**
+	 * Sends a snapshot to every connected peer, honouring each peer's declared
+	 * broadcast scope (see {@link LatticeConnectionManager#getPeerScope}).
+	 *
+	 * <p>A peer with no declared scope receives the full root, richly inlined
+	 * as a delta — exactly the behaviour every peer got before per-peer
+	 * scoping existed, and still the default for any caller that never opts
+	 * a peer into scoping. A peer with one or more declared scope paths only
+	 * ever receives its own subtree(s), each as a small indirect-ref message
+	 * (see {@link #sendScopedUpdate}) — this is what stops an unrelated
+	 * region of the lattice growing large from ever being pushed to, or
+	 * acquired by, a peer that never asked for it (the root cause of #611:
+	 * an oversized, unrelated schema tripped every peer's inbound size limit
+	 * because the ambient broadcast path always targeted the full root,
+	 * regardless of what a given peer had actually pulled).
+	 *
+	 * @param value Full current root snapshot (store-backed)
+	 * @param novelty Cells newly announced this call — consumed to build the
+	 *                full-root delta, only when at least one peer needs it
+	 */
+	private void broadcastToPeers(ACell value, ArrayList<ACell> novelty) {
+		Map<AccountKey, Convex> peers = connectionManager.getConnections();
+
+		boolean needsFullMessage = false;
+		for (AccountKey peerKey : peers.keySet()) {
+			if (connectionManager.getPeerScope(peerKey).isEmpty()) {
+				needsFullMessage = true;
+				break;
+			}
+		}
+		Message fullMessage = needsFullMessage ? buildFullDeltaMessage(value, novelty) : null;
+
+		for (Map.Entry<AccountKey, Convex> entry : peers.entrySet()) {
+			Convex peerConnection = entry.getValue();
+			if (peerConnection == null || !peerConnection.isConnected()) continue;
+
+			List<ACell[]> scope = connectionManager.getPeerScope(entry.getKey());
+			if (scope.isEmpty()) {
+				peerConnection.trySend(fullMessage);
+			} else {
+				for (ACell[] path : scope) {
+					ACell subValue = RT.getIn(value, path);
+					if (subValue != null) sendScopedUpdate(peerConnection, path, subValue);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Builds the full, unscoped root delta message — byte-for-byte the same
+	 * construction every peer received before per-peer scoping existed.
+	 */
+	private Message buildFullDeltaMessage(ACell value, ArrayList<ACell> novelty) {
+		// Ensure the lattice root is available before the protocol envelope.
+		// Format.encodeDelta decodes its final list element as the message root,
+		// so the LATTICE_VALUE vector itself must be last. Encoding only the
+		// lattice value would lose the message tag and path on the wire.
+		// MemoryStore reports an embedded top-level value as novelty. Embedded
+		// cells are already inline in their parent and are invalid as trailing
+		// multi-cell children, so retain only independently addressable cells.
+		novelty.removeIf(ACell::isEmbedded);
+		if (!value.isEmbedded()
+				&& (novelty.isEmpty() || !novelty.get(novelty.size() - 1).equals(value))) {
+			novelty.add(value);
+		}
+		AVector<ACell> emptyPath = Vectors.empty();
+		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, emptyPath, value);
+		novelty.add(payload);
+		Blob deltaData = Format.encodeDelta(novelty);
+		return Message.create(MessageType.LATTICE_VALUE, payload, deltaData);
+	}
+
+	/**
+	 * Sends one peer a small, path-scoped update, encoded as an indirect ref
+	 * (a hash-only reference inside the envelope) rather than an inlined
+	 * delta — the receiver's own DATA_REQUEST/Acquiror machinery pulls
+	 * whatever it's actually missing under this path, exactly as the initial
+	 * scoped {@link #pullPath} already relies on. A null {@code subValue} is
+	 * never sent: {@code NodeServer.processLatticeValue} rejects a
+	 * LATTICE_VALUE with a missing value outright (and repeated rejects trip
+	 * the peer's consecutive-reject circuit breaker), so a path this node has
+	 * nothing for yet is silently skipped rather than sent as a reject-bound
+	 * no-op.
+	 *
+	 * @param peerConnection Live connection to send on
+	 * @param path Lattice path this update is scoped to (empty = root)
+	 * @param subValue Value at that path (must not be null)
+	 */
+	private void sendScopedUpdate(Convex peerConnection, ACell[] path, ACell subValue) {
+		AVector<ACell> pathVector = (path.length == 0) ? Vectors.empty() : Vectors.of((Object[]) path);
+		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, pathVector, subValue);
+		Blob envelopeData = payload.getEncoding();
+		Message message = Message.create(MessageType.LATTICE_VALUE, payload, envelopeData);
+		peerConnection.trySend(message);
+	}
+
 	// ========== Root Sync ==========
 
 	/**
-	 * Performs periodic root-only sync broadcast for divergence detection.
+	 * Performs periodic root-only sync broadcast for divergence detection,
+	 * honouring each peer's declared broadcast scope exactly as {@link
+	 * #broadcastToPeers} does for trigger-driven broadcasts.
 	 */
 	private void maybePerformRootSync(ACell value, long currentTime) {
 		if (value == null) return;
@@ -553,17 +641,28 @@ public class LatticePropagator implements Closeable {
 		if (connectionManager.getPeers().isEmpty()) return;
 
 		try {
-			AVector<ACell> emptyPath = Vectors.empty();
-			AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, emptyPath, value);
-			// Root-only sync still needs a complete protocol envelope. Its lattice
-			// value is encoded as an indirect ref; the receiver acquires missing
-			// branches from this propagator store before attempting a merge.
-			Blob rootData = payload.getEncoding();
-			Message message = Message.create(MessageType.LATTICE_VALUE, payload, rootData);
-			connectionManager.broadcast(message);
+			int sent = 0;
+			for (Map.Entry<AccountKey, Convex> entry : connectionManager.getConnections().entrySet()) {
+				Convex peerConnection = entry.getValue();
+				if (peerConnection == null || !peerConnection.isConnected()) continue;
+
+				List<ACell[]> scope = connectionManager.getPeerScope(entry.getKey());
+				if (scope.isEmpty()) {
+					sendScopedUpdate(peerConnection, ROOT_PATH, value);
+					sent++;
+				} else {
+					for (ACell[] path : scope) {
+						ACell subValue = RT.getIn(value, path);
+						if (subValue != null) {
+							sendScopedUpdate(peerConnection, path, subValue);
+							sent++;
+						}
+					}
+				}
+			}
 			lastRootSyncTime = currentTime;
 			rootSyncCount++;
-			log.debug("Sent root sync ({} bytes)", rootData.count());
+			log.debug("Sent root sync to {} peer path(s)", sent);
 		} catch (Exception e) {
 			log.warn("Error during root sync broadcast", e);
 		}

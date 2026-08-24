@@ -1,7 +1,10 @@
 package convex.db.jdbc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.File;
@@ -9,6 +12,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,8 +20,14 @@ import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import convex.core.data.AVector;
+import convex.core.data.ACell;
+import convex.core.data.Strings;
+import convex.core.data.prim.CVMLong;
 import convex.db.ConvexDB;
 import convex.db.calcite.ConvexType;
+import convex.db.lattice.SQLSchema;
+import convex.db.lattice.TableVersionRegistry;
 import convex.node.NodeServer;
 
 /**
@@ -323,6 +333,536 @@ public class ConvexDriverTest {
 		} finally {
 			cdb.unregister("samesession_anchor");
 			cdb.unregister("samesession_new");
+		}
+	}
+
+	/**
+	 * Isolates whether a bound null for a non-VARCHAR column is a pgwire-only
+	 * bug (PgProtocolHandler mis-binding) or a deeper ConvexMeta/Avatica one
+	 * — this goes through the native jdbc:convex: driver, no pgwire at all.
+	 */
+	@Test
+	public void testPreparedStatementBindsNullForIntegerColumn() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("nullbind_test").tables();
+		cdb.register("nullbind_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=nullbind_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE scores (id INTEGER, score INTEGER)");
+
+			try (PreparedStatement ps = conn.prepareStatement("INSERT INTO scores (id, score) VALUES (?, ?)")) {
+				ps.setInt(1, 1);
+				ps.setNull(2, java.sql.Types.INTEGER);
+				ps.executeUpdate();
+			}
+
+			ResultSet rs = stmt.executeQuery("SELECT id, score FROM scores WHERE id = 1");
+			assertTrue(rs.next());
+			assertEquals(1, rs.getInt("id"));
+			rs.getInt("score");
+			assertTrue(rs.wasNull(), "score should have round-tripped as SQL NULL");
+		} finally {
+			cdb.unregister("nullbind_test");
+		}
+	}
+
+	/**
+	 * MAX(CASE WHEN cond THEN expr END) is a common pivot-query pattern
+	 * (conditional aggregation). Calcite's own SqlToRelConverter lifts the
+	 * CASE out of the aggregate argument and synthesizes an IS_TRUE(cond)
+	 * guard elsewhere in the plan — this used to fail with
+	 * "UnsupportedOperationException: Operator not supported: IS_TRUE" in
+	 * ConvexExpressionEvaluator, which had no case for it.
+	 */
+	@Test
+	public void testMaxOfCaseWhenSupportsConditionalAggregation() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("pivot_test").tables();
+		cdb.register("pivot_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=pivot_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE readings (software VARCHAR, reading INTEGER)");
+			stmt.executeUpdate("INSERT INTO readings VALUES ('A', 10)");
+			stmt.executeUpdate("INSERT INTO readings VALUES ('A', 30)");
+			stmt.executeUpdate("INSERT INTO readings VALUES ('B', 5)");
+
+			try (ResultSet rs = stmt.executeQuery(
+					"SELECT MAX(CASE WHEN software = 'A' THEN reading END) AS a, "
+					+ "MAX(CASE WHEN software = 'B' THEN reading END) AS b FROM readings")) {
+				assertTrue(rs.next());
+				assertEquals(30, rs.getInt("a"));
+				assertEquals(5, rs.getInt("b"));
+			}
+		} finally {
+			cdb.unregister("pivot_test");
+		}
+	}
+
+	/**
+	 * Calcite wraps a scalar subquery (e.g. {@code WHERE x = (SELECT ...)})
+	 * in a SINGLE_VALUE aggregate to enforce the "at most one row" rule —
+	 * this used to fail with "Aggregate not supported: SINGLE_VALUE" since
+	 * ConvexAggregate had no case for it. Covers all three cardinalities:
+	 * zero rows (NULL), one row (that value), and more than one row (must
+	 * be a reported error, not a silently-picked row).
+	 */
+	@Test
+	public void testScalarSubqueryHandlesAllCardinalities() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("singlevalue_test").tables();
+		cdb.register("singlevalue_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=singlevalue_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, val INTEGER)");
+			stmt.executeUpdate("INSERT INTO t VALUES (1, 100)");
+
+			try (ResultSet rs = stmt.executeQuery(
+					"SELECT (SELECT val FROM t WHERE id = 1) AS x")) {
+				assertTrue(rs.next());
+				assertEquals(100, rs.getInt("x"));
+			}
+
+			try (ResultSet rs = stmt.executeQuery(
+					"SELECT (SELECT val FROM t WHERE id = 999) AS x")) {
+				assertTrue(rs.next());
+				rs.getInt("x");
+				assertTrue(rs.wasNull(), "scalar subquery with zero matching rows must be NULL");
+			}
+
+			stmt.executeUpdate("INSERT INTO t VALUES (2, 200)");
+			assertThrows(SQLException.class, () -> {
+				try (ResultSet rs = stmt.executeQuery("SELECT (SELECT val FROM t) AS x")) {
+					rs.next();
+				}
+			}, "scalar subquery returning more than one row must be reported as an error");
+		} finally {
+			cdb.unregister("singlevalue_test");
+		}
+	}
+
+	/**
+	 * Calcite's plain "standard" function library only defines a strictly
+	 * binary CONCAT — this used to fail SQL *validation* (not execution)
+	 * with "No match found for function signature CONCAT(...)" for 3+
+	 * arguments, since no library adding the N-ary MySQL-style CONCAT was
+	 * enabled on the connection.
+	 */
+	@Test
+	public void testConcatSupportsMoreThanTwoArguments() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("concat_test").tables();
+		cdb.register("concat_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=concat_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, a VARCHAR(20), b VARCHAR(20), c VARCHAR(20))");
+			stmt.executeUpdate("INSERT INTO t VALUES (1, 'foo', 'bar', 'baz')");
+
+			try (ResultSet rs = stmt.executeQuery("SELECT CONCAT(a, '-', b, '-', c) AS x FROM t")) {
+				assertTrue(rs.next());
+				assertEquals("foo-bar-baz", rs.getString("x"));
+			}
+		} finally {
+			cdb.unregister("concat_test");
+		}
+	}
+
+	/**
+	 * ROUND(x, n) on a genuinely fractional expression must stay a double;
+	 * ROUND(AVG(intCol), n) — where Calcite's own return-type inference for
+	 * ROUND follows AVG's declared BIGINT/INTEGER type (same rule
+	 * ConvexAggregate.computeAvg already matches) — must come back as a
+	 * long instead, or the JDBC layer throws a ClassCastException picking
+	 * an accessor from the column's declared type (Avatica's LongAccessor
+	 * choking on a runtime Double).
+	 */
+	@Test
+	public void testRoundMatchesCalcitesDeclaredReturnType() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("round_test").tables();
+		cdb.register("round_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=round_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, amount INTEGER)");
+			stmt.executeUpdate("INSERT INTO t VALUES (1, 100)");
+			stmt.executeUpdate("INSERT INTO t VALUES (2, 201)");
+
+			try (ResultSet rs = stmt.executeQuery("SELECT ROUND(amount / 3.0, 2) AS r FROM t WHERE id = 1")) {
+				assertTrue(rs.next());
+				assertEquals(33.33, rs.getDouble("r"), 0.001);
+			}
+
+			// AVG(INTEGER) truncates to a long before ROUND ever sees it —
+			// pre-existing, documented behavior of computeAvg ("Match
+			// Calcite's declared return type"), not something this fix
+			// changes: (100+201)/2 = 150.5 truncates to 150, so
+			// ROUND(150.0, 2) correctly comes back as 150, not a
+			// standard-rounded 151.
+			try (ResultSet rs = stmt.executeQuery("SELECT ROUND(AVG(amount), 2) AS r FROM t")) {
+				assertTrue(rs.next());
+				assertEquals(150, rs.getLong("r"));
+			}
+		} finally {
+			cdb.unregister("round_test");
+		}
+	}
+
+	/**
+	 * {@code CREATE TABLE ... VERSIONED} via the real JDBC/ConvexMeta path —
+	 * a sibling plain {@code CREATE TABLE} in the same schema stays plain,
+	 * proving the two coexist correctly (the actual point of this feature).
+	 * A SQL surface for history exists too ({@code SELECT * FROM t_HISTORY},
+	 * see {@code testHistorySuffixTableExposesFullRowHistoryIncludingDeletes}
+	 * below), but this test predates it and verification here still drops
+	 * down to the Java API, same object the DDL just
+	 * wrote through.
+	 */
+	@Test
+	public void testCreateTableVersionedTracksHistoryAndSiblingPlainTableDoesNot() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("versioned_ddl_test").tables();
+		cdb.register("versioned_ddl_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=versioned_ddl_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE tracked (id INTEGER, name VARCHAR(50)) VERSIONED");
+			stmt.executeUpdate("CREATE TABLE plain (id INTEGER, name VARCHAR(50))");
+
+			stmt.executeUpdate("INSERT INTO tracked VALUES (1, 'alpha')");
+			stmt.executeUpdate("UPDATE tracked SET name = 'beta' WHERE id = 1");
+
+			stmt.executeUpdate("INSERT INTO plain VALUES (1, 'alpha')");
+			stmt.executeUpdate("UPDATE plain SET name = 'beta' WHERE id = 1");
+
+			SQLSchema tables = cdb.database("versioned_ddl_test").tables();
+
+			// Calcite normalizes unquoted identifiers to uppercase
+			// (caseSensitive=false is a ConvexDriver default) -- these direct
+			// Java-API lookups need to match that, even though the SQL text
+			// above was written lowercase.
+			assertTrue(TableVersionRegistry.isVersioned(Strings.create("versioned_ddl_test"), Strings.create("TRACKED")));
+			assertEquals(false, TableVersionRegistry.isVersioned(Strings.create("versioned_ddl_test"), Strings.create("PLAIN")));
+
+			// 2: ConvexTable.executeUpdate only deleteByKey+insertRow's when
+			// the pk itself changes (fixed live 2026-08-10 -- it used to do
+			// that unconditionally, even for a plain non-pk column update
+			// like this one) -- an ordinary UPDATE upserts in place, so this
+			// is 1 insert entry + 1 genuine CT_UPDATE entry.
+			List<AVector<ACell>> trackedHistory = tables.getHistory("TRACKED", CVMLong.create(1L));
+			assertEquals(2, trackedHistory.size(), "insert (1 entry) + update (1 entry, in place)");
+
+			assertTrue(tables.getHistory("PLAIN", CVMLong.create(1L)).isEmpty(),
+				"a non-versioned table must report empty history, not an error");
+
+			// Both tables' live data is correct regardless of versioned-ness.
+			try (ResultSet rs = stmt.executeQuery("SELECT name FROM tracked WHERE id = 1")) {
+				assertTrue(rs.next());
+				assertEquals("beta", rs.getString("name"));
+			}
+			try (ResultSet rs = stmt.executeQuery("SELECT name FROM plain WHERE id = 1")) {
+				assertTrue(rs.next());
+				assertEquals("beta", rs.getString("name"));
+			}
+		} finally {
+			cdb.unregister("versioned_ddl_test");
+		}
+	}
+
+	/**
+	 * {@code ALTER TABLE t VERSIONED} — converts an existing plain table
+	 * (with pre-existing rows) to versioned in place via the real JDBC/
+	 * ConvexMeta path. History must be empty immediately after conversion
+	 * (nothing backfilled) and start populating only from the next write.
+	 */
+	@Test
+	public void testAlterTableVersionedConvertsInPlaceWithNoBackfill() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("alter_versioned_test").tables();
+		cdb.register("alter_versioned_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=alter_versioned_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, name VARCHAR(50))");
+			stmt.executeUpdate("INSERT INTO t VALUES (1, 'alpha')");
+
+			// Calcite normalizes unquoted identifiers to uppercase -- these
+			// direct Java-API lookups need to match that.
+			assertEquals(false, TableVersionRegistry.isVersioned(Strings.create("alter_versioned_test"), Strings.create("T")));
+
+			stmt.executeUpdate("ALTER TABLE t VERSIONED");
+
+			assertTrue(TableVersionRegistry.isVersioned(Strings.create("alter_versioned_test"), Strings.create("T")));
+
+			SQLSchema tables = cdb.database("alter_versioned_test").tables();
+
+			// Pre-existing row survives the conversion unchanged.
+			try (ResultSet rs = stmt.executeQuery("SELECT name FROM t WHERE id = 1")) {
+				assertTrue(rs.next());
+				assertEquals("alpha", rs.getString("name"));
+			}
+
+			// No history backfilled for the pre-conversion insert.
+			assertTrue(tables.getHistory("T", CVMLong.create(1L)).isEmpty());
+
+			// A write from this point onward IS tracked -- a plain non-pk
+			// UPDATE upserts in place (see the comment in the sibling
+			// CREATE TABLE VERSIONED test above), so this is 1 entry.
+			stmt.executeUpdate("UPDATE t SET name = 'alpha-v2' WHERE id = 1");
+			assertEquals(1, tables.getHistory("T", CVMLong.create(1L)).size());
+		} finally {
+			cdb.unregister("alter_versioned_test");
+		}
+	}
+
+	/**
+	 * Regression test for the live bug reported 2026-08-09: a caller
+	 * connected to the WRONG schema (e.g. "meta" when the table actually
+	 * lives in "ose") ran {@code ALTER TABLE test VERSIONED} and got back
+	 * "OK" even though nothing was converted -- {@code ConvexMeta} used to
+	 * discard {@code convertToVersioned}'s boolean return value
+	 * unconditionally. Must now throw instead of silently no-opping.
+	 */
+	@Test
+	public void testAlterTableVersionedOnMissingTableThrowsInsteadOfSilentlySucceeding() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("alter_versioned_missing_test").tables();
+		cdb.register("alter_versioned_missing_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=alter_versioned_missing_test");
+				Statement stmt = conn.createStatement()) {
+			SQLException ex = assertThrows(SQLException.class,
+				() -> stmt.executeUpdate("ALTER TABLE nosuchtable VERSIONED"));
+			assertTrue(ex.getMessage().contains("NOSUCHTABLE"));
+			assertEquals(false, TableVersionRegistry.isVersioned(
+				Strings.create("alter_versioned_missing_test"), Strings.create("NOSUCHTABLE")));
+		} finally {
+			cdb.unregister("alter_versioned_missing_test");
+		}
+	}
+
+	/**
+	 * {@code CREATE TABLE ... AUTOINCREMENT} via the real JDBC/ConvexMeta
+	 * path — an omitted (NULL) primary key value generates sequential ids
+	 * starting at 1, and an explicit value ahead of the counter pulls it
+	 * forward past that value (mirrors MySQL/PostgreSQL auto-increment
+	 * semantics; see {@code AutoIncrementCounters}'s own doc).
+	 */
+	@Test
+	public void testCreateTableAutoIncrementGeneratesSequentialIdsAndHonorsExplicitValues() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("autoincrement_ddl_test").tables();
+		cdb.register("autoincrement_ddl_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=autoincrement_ddl_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, name VARCHAR(50)) AUTOINCREMENT");
+
+			assertTrue(convex.db.lattice.AutoIncrementRegistry.isAutoIncrement(
+				Strings.create("autoincrement_ddl_test"), Strings.create("T")));
+
+			stmt.executeUpdate("INSERT INTO t (name) VALUES ('alpha')");
+			stmt.executeUpdate("INSERT INTO t (name) VALUES ('beta')");
+			// An explicit value ahead of the counter must be honored, and pull
+			// the counter forward past it for the next generated value.
+			stmt.executeUpdate("INSERT INTO t (id, name) VALUES (50, 'explicit')");
+			stmt.executeUpdate("INSERT INTO t (name) VALUES ('gamma')");
+
+			try (ResultSet rs = stmt.executeQuery("SELECT id, name FROM t ORDER BY id")) {
+				assertTrue(rs.next());
+				assertEquals(1L, rs.getLong("id"));
+				assertEquals("alpha", rs.getString("name"));
+				assertTrue(rs.next());
+				assertEquals(2L, rs.getLong("id"));
+				assertEquals("beta", rs.getString("name"));
+				assertTrue(rs.next());
+				assertEquals(50L, rs.getLong("id"));
+				assertEquals("explicit", rs.getString("name"));
+				assertTrue(rs.next());
+				assertEquals(51L, rs.getLong("id"));
+				assertEquals("gamma", rs.getString("name"));
+				assertFalse(rs.next());
+			}
+		} finally {
+			cdb.unregister("autoincrement_ddl_test");
+		}
+	}
+
+	/**
+	 * {@code ALTER TABLE t AUTOINCREMENT} — converts an existing plain table
+	 * with pre-existing rows, seeding the counter from that data's actual
+	 * {@code MAX(id)} rather than starting back at 1 (the exact scenario the
+	 * real MariaDB migration needs: historical rows already present).
+	 */
+	@Test
+	public void testAlterTableAutoIncrementSeedsFromExistingData() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("alter_autoincrement_test").tables();
+		cdb.register("alter_autoincrement_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=alter_autoincrement_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, name VARCHAR(50))");
+			stmt.executeUpdate("INSERT INTO t (id, name) VALUES (5, 'five')");
+			stmt.executeUpdate("INSERT INTO t (id, name) VALUES (196, 'one-ninety-six')");
+
+			assertEquals(false, convex.db.lattice.AutoIncrementRegistry.isAutoIncrement(
+				Strings.create("alter_autoincrement_test"), Strings.create("T")));
+
+			stmt.executeUpdate("ALTER TABLE t AUTOINCREMENT");
+
+			assertTrue(convex.db.lattice.AutoIncrementRegistry.isAutoIncrement(
+				Strings.create("alter_autoincrement_test"), Strings.create("T")));
+
+			stmt.executeUpdate("INSERT INTO t (name) VALUES ('next')");
+
+			try (ResultSet rs = stmt.executeQuery("SELECT id, name FROM t WHERE id = 197")) {
+				assertTrue(rs.next());
+				assertEquals("next", rs.getString("name"));
+			}
+		} finally {
+			cdb.unregister("alter_autoincrement_test");
+		}
+	}
+
+	/**
+	 * Regression-style coverage mirroring {@code
+	 * testAlterTableVersionedOnMissingTableThrowsInsteadOfSilentlySucceeding}
+	 * — {@code ALTER TABLE ... AUTOINCREMENT} against a table that doesn't
+	 * exist in the connected schema must throw, not silently report success.
+	 */
+	@Test
+	public void testAlterTableAutoIncrementOnMissingTableThrowsInsteadOfSilentlySucceeding() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("alter_autoincrement_missing_test").tables();
+		cdb.register("alter_autoincrement_missing_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=alter_autoincrement_missing_test");
+				Statement stmt = conn.createStatement()) {
+			SQLException ex = assertThrows(SQLException.class,
+				() -> stmt.executeUpdate("ALTER TABLE nosuchtable AUTOINCREMENT"));
+			assertTrue(ex.getMessage().contains("NOSUCHTABLE"));
+		} finally {
+			cdb.unregister("alter_autoincrement_missing_test");
+		}
+	}
+
+	/**
+	 * Covers the SQL-level "see all records including updated/deleted ones"
+	 * ask: {@code SELECT * FROM <table>_HISTORY} on a versioned table.
+	 *
+	 * <p>An ordinary (non-pk) {@code UPDATE} upserts in place and produces a
+	 * genuine {@code CT_UPDATE} entry — {@code ConvexTable.executeUpdate}
+	 * only decomposes into {@code deleteByKey} + {@code insertRow} when the
+	 * pk column itself is actually changing (fixed live 2026-08-10; it used
+	 * to do that unconditionally, so every update looked like a fake
+	 * DELETE+INSERT pair and a real UPDATE change-type never appeared via
+	 * SQL at all). A pk-changing update still legitimately decomposes into
+	 * DELETE (old pk, no values — reconstructed from the history key) +
+	 * INSERT (new pk) below, since that really is a move to a new key.
+	 */
+	@Test
+	public void testHistorySuffixTableExposesFullRowHistoryIncludingDeletes() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("history_suffix_test").tables();
+		cdb.register("history_suffix_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=history_suffix_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, name VARCHAR(50)) VERSIONED");
+			stmt.executeUpdate("INSERT INTO t VALUES (1, 'alpha')");
+			stmt.executeUpdate("UPDATE t SET name = 'alpha-v2' WHERE id = 1");
+			stmt.executeUpdate("UPDATE t SET id = 2 WHERE id = 1"); // pk change: alpha-v2, now at id=2
+			stmt.executeUpdate("DELETE FROM t WHERE id = 2");
+
+			try (ResultSet rs = stmt.executeQuery("SELECT ID, NAME, CHANGETYPE FROM t_HISTORY ORDER BY WRITESEQ")) {
+				assertTrue(rs.next());
+				assertEquals(1, rs.getInt("ID"));
+				assertEquals("alpha", rs.getString("NAME"));
+				assertEquals("INSERT", rs.getString("CHANGETYPE"));
+
+				// Ordinary (non-pk) UPDATE: genuine CT_UPDATE, in place.
+				assertTrue(rs.next());
+				assertEquals(1, rs.getInt("ID"));
+				assertEquals("alpha-v2", rs.getString("NAME"));
+				assertEquals("UPDATE", rs.getString("CHANGETYPE"));
+
+				// pk-changing UPDATE's internal deleteByKey (old pk=1).
+				assertTrue(rs.next());
+				assertEquals(1, rs.getInt("ID"));
+				assertNull(rs.getString("NAME"));
+				assertEquals("DELETE", rs.getString("CHANGETYPE"));
+
+				// pk-changing UPDATE's internal insert at the new pk=2.
+				assertTrue(rs.next());
+				assertEquals(2, rs.getInt("ID"));
+				assertEquals("alpha-v2", rs.getString("NAME"));
+				assertEquals("INSERT", rs.getString("CHANGETYPE"));
+
+				// The explicit DELETE (pk=2).
+				assertTrue(rs.next());
+				assertEquals(2, rs.getInt("ID"));
+				assertNull(rs.getString("NAME"));
+				assertEquals("DELETE", rs.getString("CHANGETYPE"));
+
+				assertFalse(rs.next());
+			}
+		} finally {
+			cdb.unregister("history_suffix_test");
+		}
+	}
+
+	/**
+	 * Covers "how do I convert the ordering column to seconds ago" --
+	 * {@code CHANGEDAT} (a TIMESTAMP derived from {@code WRITESEQ}, an
+	 * HLC-style wall-clock-comparable value -- see {@code
+	 * VersionedSQLTable.nextHistorySeq}'s own doc; there used to be a raw
+	 * {@code System.nanoTime()}-based NANOTIME column instead, replaced live
+	 * 2026-08-10 both for this reason and because nanoTime() is per-host and
+	 * meaningless once two nodes' history is merged). Verifies it
+	 * round-trips correctly through a real {@code TIMESTAMPDIFF} query, not
+	 * just that the raw value looks right.
+	 */
+	@Test
+	public void testHistoryChangedAtSupportsSecondsAgoQuery() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("history_changedat_test").tables();
+		cdb.register("history_changedat_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=history_changedat_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, name VARCHAR(50)) VERSIONED");
+			stmt.executeUpdate("INSERT INTO t VALUES (1, 'alpha')");
+
+			try (ResultSet rs = stmt.executeQuery(
+					"SELECT TIMESTAMPDIFF(SECOND, CHANGEDAT, CURRENT_TIMESTAMP) AS SECONDS_AGO FROM t_HISTORY")) {
+				assertTrue(rs.next());
+				long secondsAgo = rs.getLong("SECONDS_AGO");
+				// Just-written row: comfortably under a minute old, never negative.
+				assertTrue(secondsAgo >= 0 && secondsAgo < 60,
+					"expected a small non-negative seconds-ago value, got " + secondsAgo);
+			}
+		} finally {
+			cdb.unregister("history_changedat_test");
+		}
+	}
+
+	/** A non-versioned table has no "_HISTORY" counterpart at all. */
+	@Test
+	public void testHistorySuffixTableDoesNotExistForPlainTable() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("history_suffix_plain_test").tables();
+		cdb.register("history_suffix_plain_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=history_suffix_plain_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, name VARCHAR(50))");
+			assertThrows(SQLException.class, () -> stmt.executeQuery("SELECT * FROM t_HISTORY"));
+		} finally {
+			cdb.unregister("history_suffix_plain_test");
 		}
 	}
 

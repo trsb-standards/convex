@@ -117,6 +117,15 @@ public class ConvexDriver extends Driver {
 		if (!info.containsKey("parserFactory")) {
 			info.setProperty("parserFactory", "convex.db.calcite.ConvexDdlExecutor#PARSER_FACTORY");
 		}
+		// Calcite's plain "standard" function library only has a strictly
+		// binary CONCAT (ANSI CONCAT(a, b)) -- adding "mysql" pulls in
+		// SqlLibraryOperatorTable's N-ary CONCAT(a, b, c, ...) alongside it,
+		// without removing anything standard already provides. Found live:
+		// CONCAT(a, b, c) failed SQL validation entirely ("No match found
+		// for function signature") before this, not just at execution time.
+		if (!info.containsKey("fun")) {
+			info.setProperty("fun", "standard,mysql");
+		}
 
 		// Resolve the ConvexDB instance
 		ConvexDB cdb = resolveInstance(parsed);

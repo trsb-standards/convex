@@ -1,7 +1,9 @@
 package convex.node;
 
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -84,6 +86,21 @@ public class LatticeConnectionManager extends AConnectionManager {
 	 * reconnects peers whose connections have dropped.
 	 */
 	private final ConcurrentHashMap<AccountKey, DesiredPeer> desiredPeers = new ConcurrentHashMap<>();
+
+	/**
+	 * Per-peer broadcast scope — the lattice path(s) a given peer is actually
+	 * entitled to receive. A peer with no entry here (the default for every
+	 * existing caller of {@link #addPeer(AccountKey, Convex)}) receives the
+	 * full, unscoped root on every broadcast, exactly as before this field
+	 * existed. A peer with one or more entries only ever receives updates
+	 * scoped to those specific paths — see {@link LatticePropagator}'s
+	 * broadcast methods, which are the sole readers of this map.
+	 *
+	 * <p>This is what lets one node host several independent lattice regions
+	 * (e.g. one sub-tree per logical database) without every connected peer
+	 * being pushed all of them regardless of which one it actually asked for.
+	 */
+	private final ConcurrentHashMap<AccountKey, List<ACell[]>> peerScopes = new ConcurrentHashMap<>();
 
 	/**
 	 * Store set on peer connections. Determines what data peers can resolve
@@ -301,11 +318,54 @@ public class LatticeConnectionManager extends AConnectionManager {
 	public void removePeer(AccountKey peerKey) {
 		if (peerKey == null) return;
 		desiredPeers.remove(peerKey);
+		peerScopes.remove(peerKey);
 		Convex removed = connections.remove(peerKey);
 		if (removed != null) {
 			closeSilently(removed);
 			log.debug("Removed peer: {}", peerKey);
 		}
+	}
+
+	// ========== Broadcast Scope ==========
+
+	/**
+	 * Declares that broadcasts to this peer should only ever cover the given
+	 * lattice path, in addition to any paths already declared for it — never
+	 * the full root. Call once per path a peer is actually entitled to (e.g.
+	 * once per database/schema it has genuinely pulled); repeated calls for
+	 * different paths accumulate rather than replace.
+	 *
+	 * <p>A peer with no declared scope keeps receiving the full, unscoped
+	 * root on every broadcast — this call is what opts a peer out of that
+	 * default and into path-scoped updates only.
+	 *
+	 * @param peerKey AccountKey of the peer to scope
+	 * @param path Lattice path this peer should receive updates for (may be
+	 *             empty, meaning root — equivalent to leaving it unscoped)
+	 */
+	public void addPeerScope(AccountKey peerKey, ACell... path) {
+		if (peerKey == null || path == null) return;
+		ACell[] pathCopy = path.clone();
+		peerScopes.compute(peerKey, (k, existing) -> {
+			List<ACell[]> updated = (existing == null) ? new ArrayList<>() : new ArrayList<>(existing);
+			updated.add(pathCopy);
+			return updated;
+		});
+	}
+
+	/**
+	 * Returns the lattice path(s) this peer is scoped to, or an empty list if
+	 * the peer has no declared scope (meaning it receives the full, unscoped
+	 * root — the default for every peer added via {@link #addPeer(AccountKey, Convex)}
+	 * without a follow-up {@link #addPeerScope} call).
+	 *
+	 * @param peerKey AccountKey of the peer to look up
+	 * @return Defensive copy of the peer's scoped paths, empty if unscoped
+	 */
+	public List<ACell[]> getPeerScope(AccountKey peerKey) {
+		if (peerKey == null) return List.of();
+		List<ACell[]> scope = peerScopes.get(peerKey);
+		return (scope == null) ? List.of() : new ArrayList<>(scope);
 	}
 
 	// ========== Desired Peer Management ==========

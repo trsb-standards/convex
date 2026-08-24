@@ -3,6 +3,7 @@ package convex.db.lattice;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
@@ -17,13 +18,44 @@ import convex.lattice.generic.IndexLattice;
 
 /**
  * A system-versioned SQL table: extends {@link SQLTable} with a history index
- * that records every insert, update, and deletion with a nanotime timestamp.
+ * that records every insert, update, and deletion with a write-sequence
+ * timestamp.
  *
  * <p>State vector: {@code [schema, rows, utime, liveCount, history]}
  * <ul>
  *   <li>{@code history} — {@code Index<ABlob, AVector<ACell>>} keyed by
- *       {@link HistoryKey} (pk ++ nanotime), value = {@code [Blob(values)|null, nanotime, changeType]};
- *       use {@link #getHistoryValues} to decode the values slot</li>
+ *       {@link HistoryKey} (pk ++ writeSeq), value = {@code [Blob(values)|null, writeSeq, changeType]};
+ *       use {@link #getHistoryValues} to decode the values slot. {@code
+ *       writeSeq} (used for the key, for ordering, and directly convertible
+ *       to a wall-clock timestamp) comes from {@link #nextHistorySeq()} — an
+ *       HLC-style counter (always {@code >= System.currentTimeMillis()},
+ *       strictly increasing per-process even for same-millisecond writes),
+ *       the same technique {@link SQLSchema}'s own {@code WRITE_SEQ} uses
+ *       for row-level LWW, kept as an independent counter here rather than
+ *       reusing that one (this codebase's established precedent — see
+ *       {@code Querylog.LOGID}'s own doc — is to keep sequence counters
+ *       serving different purposes independent, even when generated
+ *       identically, so a change to one's semantics can't silently affect
+ *       the other).
+ *
+ *       <p><b>Corrected design, 2026-08-10:</b> earlier this same day this
+ *       key used raw {@link System#nanoTime()} instead. Reported live by a
+ *       user: for a *distributed* database, that's a serious bug, not just
+ *       a display nit — {@code nanoTime()} is backed by a per-HOST monotonic
+ *       clock (confirmed via this project's own live restart data: values
+ *       kept increasing across a process restart, but that's an artifact of
+ *       Linux/HotSpot tying it to system uptime, not a portable guarantee,
+ *       and it is NOT comparable *across different machines* at all). Since
+ *       history merges via union semantics across nodes (see this class's
+ *       merge doc below), two nodes' entries for the same table would
+ *       interleave in a genuinely meaningless order once merged — not just
+ *       mislabeled, actually wrong. {@code writeSeq} fixes this: it's wall-
+ *       clock-derived, so it stays meaningfully ordered across nodes given
+ *       normal NTP sync, the same assumption {@code WRITE_SEQ} itself
+ *       already relies on for row-level LWW. This also folds what used to
+ *       be a separate {@code CHANGEDAT}-only 4th tuple element back into
+ *       the key/ordering slot itself, since it's now wall-clock-meaningful
+ *       there directly.</li>
  * </ul>
  *
  * <p>Change types:
@@ -37,7 +69,7 @@ import convex.lattice.generic.IndexLattice;
  * current live row (same content → same Etch cell hash).
  *
  * <p>Merge: history uses union semantics — history keys are unique by design
- * (pk + nanotime), so merging two replicas simply takes all entries from both.
+ * (pk + writeSeq), so merging two replicas simply takes all entries from both.
  */
 public class VersionedSQLTable extends SQLTable {
 
@@ -52,9 +84,34 @@ public class VersionedSQLTable extends SQLTable {
 	public static final long CT_DELETE = 3;
 
 	/**
+	 * HLC-style monotonic write-sequence counter for history-key ordering —
+	 * see this class's own doc for why this exists as an independent
+	 * counter from {@code SQLSchema.WRITE_SEQ}, and why raw {@code
+	 * System.nanoTime()} was wrong for a distributed table.
+	 */
+	private static final AtomicLong HISTORY_SEQ = new AtomicLong(System.currentTimeMillis());
+
+	/**
+	 * Next history write-sequence value: always {@code >=
+	 * System.currentTimeMillis()} (so it genuinely reflects, and stays
+	 * comparable to, real wall-clock time across nodes given normal NTP
+	 * sync), while guaranteeing strict per-process monotonicity (advances by
+	 * at least 1 even for multiple writes within the same millisecond).
+	 */
+	static long nextHistorySeq() {
+		long prev;
+		long next;
+		do {
+			prev = HISTORY_SEQ.get();
+			next = Math.max(prev + 1, System.currentTimeMillis());
+		} while (!HISTORY_SEQ.compareAndSet(prev, next));
+		return next;
+	}
+
+	/**
 	 * Leaf lattice for individual history entries.
-	 * History keys are unique by (pk, nanotime), so conflicts do not occur in practice.
-	 * When they do (same nanotime), own value wins per lattice convention.
+	 * History keys are unique by (pk, writeSeq), so conflicts do not occur in practice.
+	 * When they do (same writeSeq), own value wins per lattice convention.
 	 */
 	@SuppressWarnings("unchecked")
 	static final ALattice<AVector<ACell>> HISTORY_ENTRY_LATTICE = new ALattice<>() {
@@ -104,12 +161,11 @@ public class VersionedSQLTable extends SQLTable {
 	 *
 	 * @param pk             Primary key blob
 	 * @param values         Full row values vector
-	 * @param nanotime       Monotonic timestamp for history ordering
 	 * @param milliTimestamp Wall-clock timestamp for LWW conflict resolution
 	 * @return true if the row was written; false if skipped as duplicate
 	 */
 	@SuppressWarnings("unchecked")
-	public boolean insertRowVersioned(ABlob pk, AVector<ACell> values, long nanotime, CVMLong milliTimestamp) {
+	public boolean insertRowVersioned(ABlob pk, AVector<ACell> values, CVMLong milliTimestamp) {
 		boolean[] changed = {false};
 		cursor.updateAndGet(state -> {
 			if (!isLiveState(state)) return state;
@@ -129,10 +185,11 @@ public class VersionedSQLTable extends SQLTable {
 			rows = rows.assoc(bk, RowBlock.put(block, pk, SQLRow.create(values, milliTimestamp)));
 			long liveCount = getLiveCount(state) + (addsLive ? 1 : 0);
 
+			long writeSeq = nextHistorySeq();
 			Index<ABlob, AVector<ACell>> history = historyFrom(state);
 			history = history.assoc(
-				HistoryKey.of(pk, nanotime),
-				Vectors.of(SQLRow.encodeValues(values), CVMLong.create(nanotime), CVMLong.create(changeType))
+				HistoryKey.of(pk, writeSeq),
+				Vectors.of(SQLRow.encodeValues(values), CVMLong.create(writeSeq), CVMLong.create(changeType))
 			);
 
 			changed[0] = true;
@@ -145,18 +202,18 @@ public class VersionedSQLTable extends SQLTable {
 	 * Batch-inserts pre-sorted rows with history tracking in a single atomic update.
 	 *
 	 * <p>Applies the same block-grouping optimisation as {@link SQLTable#insertRows}
-	 * and additionally records one history entry per non-deduplicated row.
-	 * Nanotimes are assigned sequentially from {@code startNanotime} to guarantee
-	 * ordering within the batch.
+	 * and additionally records one history entry per non-deduplicated row,
+	 * each with its own fresh {@link #nextHistorySeq()} value (guarantees
+	 * ordering within the batch, and against any concurrent write on another
+	 * thread, the same way the single-row path does).
 	 *
 	 * @param sortedEntries  (pk → row-values) pairs sorted by pk ascending
-	 * @param startNanotime  Monotonic base timestamp; incremented per row written
 	 * @param milliTimestamp Wall-clock timestamp for LWW conflict resolution
 	 * @return number of newly-live rows inserted
 	 */
 	@SuppressWarnings("unchecked")
 	public int insertRowsVersioned(List<Map.Entry<ABlob, AVector<ACell>>> sortedEntries,
-			long startNanotime, CVMLong milliTimestamp) {
+			CVMLong milliTimestamp) {
 		if (sortedEntries.isEmpty()) return 0;
 		int[] newLive = {0};
 		cursor.updateAndGet(state -> {
@@ -169,7 +226,6 @@ public class VersionedSQLTable extends SQLTable {
 			List<AVector<ACell>> blockRows = new ArrayList<>();
 			// We also need to track history entries per block group
 			// but history entries are individual per row — collect them separately
-			long nanotime = startNanotime;
 
 			// We need to handle deduplication check before batching
 			// so we use the single-row path for history but batch for blocks
@@ -200,7 +256,6 @@ public class VersionedSQLTable extends SQLTable {
 				// Check deduplication
 				if (existing != null && SQLRow.isLive(existing)
 						&& values.equals(SQLRow.getValues(existing))) {
-					nanotime++;
 					continue;
 				}
 
@@ -210,11 +265,11 @@ public class VersionedSQLTable extends SQLTable {
 				blockPks.add(pk);
 				blockRows.add(SQLRow.create(values, milliTimestamp));
 
+				long writeSeq = nextHistorySeq();
 				history = history.assoc(
-					HistoryKey.of(pk, nanotime),
-					Vectors.of(SQLRow.encodeValues(values), CVMLong.create(nanotime), CVMLong.create(changeType))
+					HistoryKey.of(pk, writeSeq),
+					Vectors.of(SQLRow.encodeValues(values), CVMLong.create(writeSeq), CVMLong.create(changeType))
 				);
-				nanotime++;
 			}
 			if (curBk != null && !blockPks.isEmpty()) {
 				ACell existing = rows.get(curBk);
@@ -233,12 +288,11 @@ public class VersionedSQLTable extends SQLTable {
 	 * No-op if the row does not exist or is already deleted.
 	 *
 	 * @param pk             Primary key blob
-	 * @param nanotime       Monotonic timestamp for history ordering
 	 * @param milliTimestamp Wall-clock timestamp for LWW conflict resolution
 	 * @return true if the row was deleted; false if not found
 	 */
 	@SuppressWarnings("unchecked")
-	public boolean deleteRowVersioned(ABlob pk, long nanotime, CVMLong milliTimestamp) {
+	public boolean deleteRowVersioned(ABlob pk, CVMLong milliTimestamp) {
 		boolean[] changed = {false};
 		cursor.updateAndGet(state -> {
 			if (!isLiveState(state)) return state;
@@ -252,10 +306,11 @@ public class VersionedSQLTable extends SQLTable {
 			rows = rows.assoc(bk, RowBlock.put(block, pk, SQLRow.createTombstone(milliTimestamp)));
 			long liveCount = getLiveCount(state) - 1;
 
+			long writeSeq = nextHistorySeq();
 			Index<ABlob, AVector<ACell>> history = historyFrom(state);
 			history = history.assoc(
-				HistoryKey.of(pk, nanotime),
-				Vectors.of(null, CVMLong.create(nanotime), CVMLong.create(CT_DELETE))
+				HistoryKey.of(pk, writeSeq),
+				Vectors.of(null, CVMLong.create(writeSeq), CVMLong.create(CT_DELETE))
 			);
 
 			changed[0] = true;
@@ -280,11 +335,22 @@ public class VersionedSQLTable extends SQLTable {
 		return (AVector<ACell>) cell;                              // legacy
 	}
 
+	/**
+	 * Gets the write-sequence value from a history entry — an HLC-style
+	 * value that is directly a wall-clock epoch-millisecond timestamp for
+	 * any entry written by {@link #nextHistorySeq()} (i.e. everything since
+	 * 2026-08-10's fix — see this class's own doc). Safe to convert to a SQL
+	 * TIMESTAMP and compare against {@code CURRENT_TIMESTAMP}.
+	 */
+	public static long getHistoryWriteSeq(AVector<ACell> histEntry) {
+		return ((CVMLong) histEntry.get(1)).longValue();
+	}
+
 	// ── Temporal queries ─────────────────────────────────────────────────────
 
 	/**
 	 * Returns all history entries for the given pk, oldest first.
-	 * Each entry is {@code [values|null, CVMLong(nanotime), CVMLong(changeType)]}.
+	 * Each entry is {@code [values|null, CVMLong(writeSeq), CVMLong(changeType)]}.
 	 *
 	 * @param pk Primary key blob
 	 * @return Ordered list of history entries; empty if none recorded
@@ -299,20 +365,21 @@ public class VersionedSQLTable extends SQLTable {
 	}
 
 	/**
-	 * Returns the latest history entry for pk at or before the given nanotime
-	 * (i.e., the row as it existed at that point in time).
+	 * Returns the latest history entry for pk at or before the given
+	 * writeSeq (i.e. the row as it existed at that point in time).
 	 *
 	 * @param pk       Primary key blob
-	 * @param nanotime Upper bound timestamp (inclusive)
+	 * @param writeSeq Upper bound timestamp (inclusive) — comparable to
+	 *                 {@code System.currentTimeMillis()}-derived values
 	 * @return History entry, or null if no version existed at that point
 	 */
 	@SuppressWarnings("unchecked")
-	public AVector<ACell> getAsOf(ABlob pk, long nanotime) {
+	public AVector<ACell> getAsOf(ABlob pk, long writeSeq) {
 		ABlob prefix = HistoryKey.prefix(pk);
 		AVector<ACell>[] best = new AVector[1];
 		getHistoryIndex().forEach((k, v) -> {
-			if (HistoryKey.hasPrefix(k, prefix) && HistoryKey.extractNanotime(k) <= nanotime)
-				best[0] = v; // forEach is ordered → last match is the latest ≤ nanotime
+			if (HistoryKey.hasPrefix(k, prefix) && HistoryKey.extractWriteSeq(k) <= writeSeq)
+				best[0] = v; // forEach is ordered → last match is the latest ≤ writeSeq
 		});
 		return best[0];
 	}

@@ -201,23 +201,30 @@ public class VersionedSQLSchemaTest {
 
 	@Test
 	void testGetAsOfReturnsVersionAtTimestamp() {
-		long t1 = System.nanoTime();
+		// Cutoffs are derived from the actual recorded writeSeq values (not
+		// an external clock capture) -- writeSeq is an HLC-style value (see
+		// VersionedSQLTable.nextHistorySeq's own doc), strictly increasing
+		// per write even within the same millisecond, so comparing against
+		// real System.nanoTime()/currentTimeMillis() snapshots taken BETWEEN
+		// writes would be both scale-mismatched (nanoTime() vs millis-scale
+		// writeSeq) and potentially flaky (sub-millisecond writes). Reading
+		// the real values back is robust regardless.
 		schema.insert(TBL, row(1, "alpha", 10));
-		long t2 = System.nanoTime();
+		long seq1 = VersionedSQLTable.getHistoryWriteSeq(schema.getHistory(TBL, pk(1)).get(0));
 		schema.insert(TBL, row(1, "alpha", 20));
-		long t3 = System.nanoTime();
+		long seq2 = VersionedSQLTable.getHistoryWriteSeq(schema.getHistory(TBL, pk(1)).get(1));
 
 		// AS OF before first insert: nothing
-		assertNull(schema.getAsOf(TBL, pk(1), t1 - 1));
+		assertNull(schema.getAsOf(TBL, pk(1), seq1 - 1));
 
-		// AS OF between first and second insert: first version
-		AVector<ACell> v1 = schema.getAsOf(TBL, pk(1), t2 - 1);
+		// AS OF at the first insert's own writeSeq: first version
+		AVector<ACell> v1 = schema.getAsOf(TBL, pk(1), seq1);
 		assertNotNull(v1);
 		AVector<ACell> vals1 = VersionedSQLTable.getHistoryValues(v1);
 		assertEquals(CVMLong.create(10), vals1.get(2));
 
-		// AS OF after second insert: second version
-		AVector<ACell> v2 = schema.getAsOf(TBL, pk(1), t3);
+		// AS OF at or after second insert: second version
+		AVector<ACell> v2 = schema.getAsOf(TBL, pk(1), seq2);
 		assertNotNull(v2);
 		AVector<ACell> vals2 = VersionedSQLTable.getHistoryValues(v2);
 		assertEquals(CVMLong.create(20), vals2.get(2));
@@ -226,11 +233,10 @@ public class VersionedSQLSchemaTest {
 	@Test
 	void testGetAsOfAfterDeleteShowsDeleteEntry() {
 		schema.insert(TBL, row(1, "alpha", 10));
-		long tDelete = System.nanoTime();
 		schema.deleteByKey(TBL, pk(1));
-		long tAfter = System.nanoTime();
+		long seqDelete = VersionedSQLTable.getHistoryWriteSeq(schema.getHistory(TBL, pk(1)).get(1));
 
-		AVector<ACell> entry = schema.getAsOf(TBL, pk(1), tAfter);
+		AVector<ACell> entry = schema.getAsOf(TBL, pk(1), seqDelete);
 		assertNotNull(entry);
 		assertEquals(VersionedSQLTable.CT_DELETE, changeType(entry));
 		assertNull(VersionedSQLTable.getHistoryValues(entry));

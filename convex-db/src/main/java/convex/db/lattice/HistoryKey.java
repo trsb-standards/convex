@@ -6,42 +6,48 @@ import convex.core.data.Blob;
 /**
  * Encoding and decoding utilities for history index keys.
  *
- * <p>Key format: {@code [1 byte: pkLength] [pkLength bytes: pk] [8 bytes: nanotime big-endian]}
+ * <p>Key format: {@code [1 byte: pkLength] [pkLength bytes: pk] [8 bytes: writeSeq big-endian]}
  *
  * <p>The 1-byte length prefix supports pk blobs up to 255 bytes, covering all practical
  * key types (CVMLong = 8 bytes, typical strings well within 255).
  *
- * <p>Big-endian nanotime ensures that entries for the same pk are sorted chronologically
+ * <p>Big-endian writeSeq ensures that entries for the same pk are sorted chronologically
  * in the radix tree — {@code forEach} yields them oldest-first with no extra sorting.
+ *
+ * <p>{@code writeSeq} comes from {@link VersionedSQLTable#nextHistorySeq()} — an
+ * HLC-style value, not raw {@link System#nanoTime()} (changed 2026-08-10; see
+ * {@link VersionedSQLTable}'s own class doc for why the original nanoTime()-based
+ * design was a real bug for a distributed, multi-node table: nanoTime() is
+ * per-host and meaningless once two nodes' history is merged together).
  */
 public class HistoryKey {
 
-	static final int NANOTIME_BYTES = 8;
+	static final int SEQ_BYTES = 8;
 	static final int LENGTH_BYTES = 1;
 
 	private HistoryKey() {}
 
 	/**
-	 * Creates a history index key from a pk blob and a nanotime.
+	 * Creates a history index key from a pk blob and a write-sequence value.
 	 *
-	 * @param pk      Primary key blob (max 255 bytes)
-	 * @param nanotime Monotonic timestamp from {@link System#nanoTime()}
+	 * @param pk       Primary key blob (max 255 bytes)
+	 * @param writeSeq Monotonic value from {@link VersionedSQLTable#nextHistorySeq()}
 	 * @return History key blob
 	 */
-	public static ABlob of(ABlob pk, long nanotime) {
+	public static ABlob of(ABlob pk, long writeSeq) {
 		int pkLen = (int) pk.count();
 		if (pkLen > 255) throw new IllegalArgumentException("Primary key too long: " + pkLen);
-		byte[] key = new byte[LENGTH_BYTES + pkLen + NANOTIME_BYTES];
+		byte[] key = new byte[LENGTH_BYTES + pkLen + SEQ_BYTES];
 		key[0] = (byte) pkLen;
 		for (int i = 0; i < pkLen; i++) key[LENGTH_BYTES + i] = byteAt(pk, i);
-		long v = nanotime;
-		for (int i = NANOTIME_BYTES - 1; i >= 0; i--) { key[LENGTH_BYTES + pkLen + i] = (byte)(v & 0xFF); v >>>= 8; }
+		long v = writeSeq;
+		for (int i = SEQ_BYTES - 1; i >= 0; i--) { key[LENGTH_BYTES + pkLen + i] = (byte)(v & 0xFF); v >>>= 8; }
 		return Blob.wrap(key);
 	}
 
 	/**
 	 * Returns the prefix blob used to scan all history entries for a given pk.
-	 * This is the {@code [pkLength | pk bytes]} portion without the nanotime suffix.
+	 * This is the {@code [pkLength | pk bytes]} portion without the writeSeq suffix.
 	 *
 	 * @param pk Primary key blob
 	 * @return Prefix blob for radix-tree iteration
@@ -68,13 +74,29 @@ public class HistoryKey {
 	}
 
 	/**
-	 * Extracts the nanotime from a history key.
+	 * Extracts the raw primary-key bytes from a history key.
 	 *
 	 * @param hkey History key blob
-	 * @return Nanotime value embedded in the key
+	 * @return The pk blob this history entry belongs to
 	 */
-	public static long extractNanotime(ABlob hkey) {
-		// First byte is pkLength; nanotime starts at byte (1 + pkLength)
+	public static ABlob extractPk(ABlob hkey) {
+		int pkLen = (hkey.getHexDigit(0) << 4) | hkey.getHexDigit(1);
+		byte[] pk = new byte[pkLen];
+		for (int i = 0; i < pkLen; i++) {
+			int hi = 2 + i * 2;
+			pk[i] = (byte) ((hkey.getHexDigit(hi) << 4) | hkey.getHexDigit(hi + 1));
+		}
+		return Blob.wrap(pk);
+	}
+
+	/**
+	 * Extracts the write-sequence value from a history key.
+	 *
+	 * @param hkey History key blob
+	 * @return writeSeq value embedded in the key
+	 */
+	public static long extractWriteSeq(ABlob hkey) {
+		// First byte is pkLength; writeSeq starts at byte (1 + pkLength)
 		int pkLen = (hkey.getHexDigit(0) << 4) | hkey.getHexDigit(1);
 		long ts = 0;
 		int startNibble = 2 + 2 * pkLen; // skip [length byte] + [pk bytes]

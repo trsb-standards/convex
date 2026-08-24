@@ -208,15 +208,27 @@ public class ConvexTable extends AbstractQueryableTable
 
 				List<ACell> oldPk = primaryKeyCells(row);
 				List<ACell> newPk = primaryKeyCells(updatedRow);
+				boolean pkChanged = pkBeingUpdated && !oldPk.equals(newPk);
 
-				if (pkBeingUpdated && !oldPk.equals(newPk)) {
+				// Only delete-then-insert when the pk itself is actually
+				// changing (a genuine "move" to a new key). Found live
+				// 2026-08-10: this used to unconditionally deleteByKey then
+				// insertRow for EVERY update, even ordinary non-pk column
+				// updates -- insertRow already upserts an existing pk in
+				// place (see SQLTable.insertRow), so the delete was not just
+				// redundant but actively wrong for versioned tables: it
+				// recorded a spurious DELETE history entry (pk only, no
+				// values) immediately followed by a fresh INSERT, so a plain
+				// "UPDATE t SET name = ... WHERE id = ..." never produced a
+				// CT_UPDATE history entry, only ever DELETE+INSERT pairs --
+				// surprising and misleading when reading <table>_HISTORY.
+				if (pkChanged) {
 					if (schema.getTables().selectByKey(tableName, newPk) != null) {
 						throw new RuntimeException("Unique constraint violation: primary key '" +
 							newPk + "' already exists in table '" + tableName + "'");
 					}
+					schema.getTables().deleteByKey(tableName, oldPk);
 				}
-
-				schema.getTables().deleteByKey(tableName, oldPk);
 				if (insertRow(updatedRow)) {
 					count++;
 				}

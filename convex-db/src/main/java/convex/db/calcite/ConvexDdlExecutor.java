@@ -30,6 +30,7 @@ import org.apache.calcite.sql.validate.SqlValidator;
 import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Util;
 
+import convex.core.data.Strings;
 import convex.db.ConvexDB;
 import convex.db.lattice.SQLDatabase;
 
@@ -50,6 +51,33 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 	private static final Logger LOG = LoggerFactory.getLogger(ConvexDdlExecutor.class);
 
 	public static final ConvexDdlExecutor INSTANCE = new ConvexDdlExecutor();
+
+	/**
+	 * Carries the {@code VERSIONED} flag from {@code ConvexMeta.prepareAndExecute}
+	 * (which strips a trailing {@code VERSIONED} keyword off a {@code CREATE
+	 * TABLE} statement via regex before handing the rest to Calcite's real
+	 * parser — there's no grammar for it, and no properties/{@code WITH}-clause
+	 * bag on {@code SqlCreateTable} to piggyback on) through to {@link
+	 * #execute(SqlCreateTable, CalcitePrepare.Context)} below. A 3rd method
+	 * parameter isn't possible: Calcite's {@code ReflectUtil.MethodDispatcher}
+	 * reflectively dispatches on the exact 2-arg signature. {@code ThreadLocal}
+	 * rather than a plain field since this executor is a process-wide
+	 * singleton — set immediately before the {@code super.prepareAndExecute}
+	 * call that will (synchronously, same thread) reach {@code execute} below,
+	 * and always cleared there whether or not it was actually a CREATE TABLE
+	 * (so a stale true never leaks into some later, unrelated statement on the
+	 * same thread).
+	 */
+	public static final ThreadLocal<Boolean> PENDING_VERSIONED = new ThreadLocal<>();
+
+	/**
+	 * Carries the {@code AUTOINCREMENT} flag from {@code ConvexMeta.prepareAndExecute}
+	 * to {@link #execute(SqlCreateTable, CalcitePrepare.Context)} below —
+	 * exact same mechanism/reasoning as {@link #PENDING_VERSIONED}, kept as
+	 * a separate ThreadLocal (not reused) since the two are orthogonal
+	 * flags a statement could in principle set independently.
+	 */
+	public static final ThreadLocal<Boolean> PENDING_AUTOINCREMENT = new ThreadLocal<>();
 
 	/**
 	 * Fired after a CREATE TABLE / CREATE SCHEMA / DROP TABLE statement has
@@ -269,6 +297,11 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 	 * Executes CREATE TABLE by creating a Convex lattice-backed table.
 	 */
 	public void execute(SqlCreateTable create, CalcitePrepare.Context context) {
+		boolean versioned = Boolean.TRUE.equals(PENDING_VERSIONED.get());
+		PENDING_VERSIONED.remove();
+		boolean autoIncrement = Boolean.TRUE.equals(PENDING_AUTOINCREMENT.get());
+		PENDING_AUTOINCREMENT.remove();
+
 		final Pair<CalciteSchema, String> pair = schema(context, create.name);
 		CalciteSchema schema = requireNonNull(pair.left, "schema");
 		String tableName = pair.right;
@@ -306,9 +339,10 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 		// Find the ConvexSchema and create the table in the lattice
 		Schema unwrapped = schema.plus().unwrap(ConvexSchema.class);
 		if (unwrapped instanceof ConvexSchema convexSchema) {
-			convexSchema.getTables().createTable(tableName,
+			convexSchema.getTables().createTable(Strings.create(tableName),
 					columnNames.toArray(new String[0]),
-					columnTypes.toArray(new ConvexColumnType[0]));
+					columnTypes.toArray(new ConvexColumnType[0]),
+					1, versioned, autoIncrement);
 			// Add to Calcite's schema so it's immediately visible
 			schema.plus().add(tableName, new ConvexTable(convexSchema, tableName));
 			fireDdlExecuted(ConvexDB.lookup(convexSchema.getName()));

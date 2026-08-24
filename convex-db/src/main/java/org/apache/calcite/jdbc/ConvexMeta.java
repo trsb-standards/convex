@@ -8,13 +8,16 @@ import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.Meta.ExecuteResult;
 import org.apache.calcite.avatica.Meta.MetaResultSet;
 import org.apache.calcite.avatica.Meta.PrepareCallback;
+import org.apache.calcite.avatica.Meta.Signature;
 import org.apache.calcite.avatica.Meta.StatementHandle;
 import org.apache.calcite.avatica.NoSuchStatementException;
 import org.apache.calcite.schema.SchemaPlus;
+import org.apache.calcite.server.CalciteServerStatement;
 
 import convex.db.ConvexDB;
 import convex.db.calcite.ConvexDdlExecutor;
 import convex.db.calcite.ConvexSchema;
+import convex.db.calcite.QueryLog;
 import convex.db.lattice.SQLDatabase;
 
 /**
@@ -66,6 +69,31 @@ public class ConvexMeta extends CalciteMetaImpl {
 		return new ConvexMeta((CalciteConnectionImpl) connection);
 	}
 
+	/**
+	 * Resolves the original SQL text for an already-prepared statement --
+	 * needed by {@link #execute(StatementHandle, java.util.List, int)} (the
+	 * bound-{@code PreparedStatement} path), which receives neither the SQL
+	 * text as a parameter nor a populated {@code h.signature} (checked live
+	 * 2026-08-07: null at that call site for a local, non-remote
+	 * connection). Uses the exact same lookup {@code CalciteMetaImpl}'s own
+	 * {@code execute}/{@code fetch} use internally
+	 * ({@code calciteConnection.server.getStatement(h).getSignature()}) --
+	 * this is live, authoritative state the framework already tracks, not
+	 * a duplicate of it (a first attempt tried caching sql in a local map
+	 * populated from a {@code prepare} override, but {@code prepare} turned
+	 * out to never be called at all for this driver's local
+	 * {@code PreparedStatement} path -- checked live, confirmed empty).
+	 */
+	private String signatureSql(StatementHandle h) {
+		try {
+			CalciteServerStatement stmt = calciteConnection.server.getStatement(h);
+			Signature signature = stmt.getSignature();
+			return (signature != null) ? signature.sql : null;
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
 	// ── Secondary index DDL interception ─────────────────────────────────────
 
 	// Table name accepts an optional "schema." qualifier (e.g. "meta.otcol")
@@ -104,87 +132,279 @@ public class ConvexMeta extends CalciteMetaImpl {
 	private static final Pattern REPLICATE_SCHEMA = Pattern.compile(
 		"(?i)REPLICATE\\s+SCHEMA\\s+['\"]?(\\w+)\\.(\\w+)['\"]?\\s*");
 
+	// CREATE TABLE ... (...) VERSIONED -- unlike the fully-intercepted
+	// statements above, CREATE TABLE genuinely needs Calcite's real
+	// column/type parsing (hand-rolling that would be a real capability
+	// regression), and SqlCreateTable has no properties/WITH-clause bag to
+	// piggyback a flag on. So this only strips the trailing VERSIONED
+	// keyword (captured group excludes it) and hands the rest, unchanged,
+	// to Calcite's real parser via the normal super.prepareAndExecute
+	// fallthrough below -- see ConvexDdlExecutor.PENDING_VERSIONED for how
+	// the flag actually crosses to the CREATE TABLE handler.
+	private static final Pattern CREATE_TABLE_VERSIONED_SUFFIX = Pattern.compile(
+		"(?i)^(.*\\))\\s*VERSIONED\\s*(;\\s*)?$", Pattern.DOTALL);
+
+	// ALTER TABLE t VERSIONED -- converts an existing plain table to
+	// versioned in place. Unlike CREATE TABLE, there's no real underlying
+	// Calcite ALTER TABLE semantics being reused here (this isn't a column/
+	// constraint change), and the CREATE-TABLE-style "strip the keyword,
+	// let Calcite parse the rest" trick doesn't work: stripping VERSIONED
+	// from "ALTER TABLE t VERSIONED" would leave "ALTER TABLE t", which
+	// isn't valid SQL on its own. So this is a fully intercepted statement,
+	// same pattern as REPLICATE DB/REGISTER PEER above.
+	private static final Pattern ALTER_TABLE_VERSIONED = Pattern.compile(
+		"(?i)ALTER\\s+TABLE\\s+(?:(\\w+)\\.)?(\\w+)\\s+VERSIONED\\s*");
+
+	// CREATE TABLE ... (...) AUTOINCREMENT / ALTER TABLE t AUTOINCREMENT --
+	// same regex-interception shapes as their VERSIONED counterparts above,
+	// for the exact same reasons (real column/type parsing needed for
+	// CREATE TABLE, no properties bag to piggyback a flag on; ALTER TABLE
+	// has no real underlying Calcite semantics being reused, and stripping
+	// the keyword would leave invalid SQL). A statement combining both
+	// VERSIONED and AUTOINCREMENT is out of scope for now — these are
+	// checked independently, not together.
+	private static final Pattern CREATE_TABLE_AUTOINCREMENT_SUFFIX = Pattern.compile(
+		"(?i)^(.*\\))\\s*AUTOINCREMENT\\s*(;\\s*)?$", Pattern.DOTALL);
+
+	private static final Pattern ALTER_TABLE_AUTOINCREMENT = Pattern.compile(
+		"(?i)ALTER\\s+TABLE\\s+(?:(\\w+)\\.)?(\\w+)\\s+AUTOINCREMENT\\s*");
+
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>The whole method body is timed and reported to {@link QueryLog},
+	 * not just the {@code super.prepareAndExecute(...)} fallthrough path --
+	 * found live 2026-08-07: an earlier attempt at this hooked {@code
+	 * PgProtocolHandler} instead, which (a) only sees pgwire clients, since
+	 * {@code PgServer}'s own connection supplier is itself an ordinary
+	 * {@code jdbc:convex:} caller and every OTHER direct Java caller of this
+	 * driver was invisible to it, and (b) missed every regex-intercepted
+	 * admin statement below ({@code CREATE INDEX}/{@code DROP INDEX}/{@code
+	 * REPLICATE DB}/{@code REGISTER PEER}/{@code REPLICATE SCHEMA}), since
+	 * those return before ever reaching the Calcite fallthrough. Hooking
+	 * here instead covers every caller and every statement shape in one
+	 * place, with no double-counting.
+	 */
 	@Override
 	public ExecuteResult prepareAndExecute(StatementHandle h, String sql,
 			long maxRowCount, int maxRowsInFirstFrame, PrepareCallback callback)
 			throws NoSuchStatementException {
-		Matcher m = CREATE_INDEX.matcher(sql.trim());
-		if (m.matches()) {
-			boolean ifNotExists = m.group(1) != null;
-			String indexName  = m.group(2);
-			String schemaName = (m.group(3) != null) ? m.group(3) : getSchemaName();
-			String tableName  = m.group(4);
-			String columnName = m.group(5);
-			ConvexSchema schema = findConvexSchema(schemaName);
-			if (schema == null) {
-				throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
+		long startNanos = System.nanoTime();
+		Long rowCount = null;
+		String errorMessage = null;
+		try {
+			Matcher m = CREATE_INDEX.matcher(sql.trim());
+			if (m.matches()) {
+				boolean ifNotExists = m.group(1) != null;
+				String indexName  = m.group(2);
+				String schemaName = (m.group(3) != null) ? m.group(3) : getSchemaName();
+				String tableName  = m.group(4);
+				String columnName = m.group(5);
+				ConvexSchema schema = findConvexSchema(schemaName);
+				if (schema == null) {
+					throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
+				}
+				schema.createIndex(indexName, tableName, columnName, ifNotExists);
+				fireDdlExecuted(schema);
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
 			}
-			schema.createIndex(indexName, tableName, columnName, ifNotExists);
-			fireDdlExecuted(schema);
-			return new ExecuteResult(Collections.singletonList(
-					MetaResultSet.count(h.connectionId, h.id, 0L)));
-		}
 
-		m = DROP_INDEX.matcher(sql.trim());
-		if (m.matches()) {
-			boolean ifExists = m.group(1) != null;
-			String indexName = m.group(2);
-			String schemaName = (m.group(3) != null) ? m.group(3) : getSchemaName();
-			ConvexSchema schema = findConvexSchema(schemaName);
-			if (schema == null) {
-				throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
+			m = DROP_INDEX.matcher(sql.trim());
+			if (m.matches()) {
+				boolean ifExists = m.group(1) != null;
+				String indexName = m.group(2);
+				String schemaName = (m.group(3) != null) ? m.group(3) : getSchemaName();
+				ConvexSchema schema = findConvexSchema(schemaName);
+				if (schema == null) {
+					throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
+				}
+				schema.dropIndex(indexName, ifExists);
+				fireDdlExecuted(schema);
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
 			}
-			schema.dropIndex(indexName, ifExists);
-			fireDdlExecuted(schema);
-			return new ExecuteResult(Collections.singletonList(
-					MetaResultSet.count(h.connectionId, h.id, 0L)));
-		}
 
-		m = REPLICATE_DB.matcher(sql.trim());
-		if (m.matches()) {
-			String dbName = m.group(1);
-			ConvexDdlExecutor.fireReplicateDb(dbName);
-			return new ExecuteResult(Collections.singletonList(
-					MetaResultSet.count(h.connectionId, h.id, 0L)));
-		}
+			m = REPLICATE_DB.matcher(sql.trim());
+			if (m.matches()) {
+				String dbName = m.group(1);
+				ConvexDdlExecutor.fireReplicateDb(dbName);
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
 
-		m = REGISTER_PEER.matcher(sql.trim());
-		if (m.matches()) {
-			String host = m.group(1);
-			int port = Integer.parseInt(m.group(2));
-			String keyHex = m.group(3);
-			ConvexDdlExecutor.fireRegisterPeer(host, port, keyHex);
-			return new ExecuteResult(Collections.singletonList(
-					MetaResultSet.count(h.connectionId, h.id, 0L)));
-		}
+			m = REGISTER_PEER.matcher(sql.trim());
+			if (m.matches()) {
+				String host = m.group(1);
+				int port = Integer.parseInt(m.group(2));
+				String keyHex = m.group(3);
+				ConvexDdlExecutor.fireRegisterPeer(host, port, keyHex);
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
 
-		m = REPLICATE_SCHEMA.matcher(sql.trim());
-		if (m.matches()) {
-			String dbName = m.group(1);
-			String schemaName = m.group(2);
-			ConvexDdlExecutor.fireReplicateSchema(dbName, schemaName);
-			return new ExecuteResult(Collections.singletonList(
-					MetaResultSet.count(h.connectionId, h.id, 0L)));
-		}
+			m = REPLICATE_SCHEMA.matcher(sql.trim());
+			if (m.matches()) {
+				String dbName = m.group(1);
+				String schemaName = m.group(2);
+				ConvexDdlExecutor.fireReplicateSchema(dbName, schemaName);
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
 
-		ExecuteResult result = super.prepareAndExecute(h, sql, maxRowCount, maxRowsInFirstFrame, callback);
-		syncIfAutoCommit();
-		return result;
+			m = ALTER_TABLE_VERSIONED.matcher(sql.trim());
+			if (m.matches()) {
+				String schemaName = (m.group(1) != null) ? m.group(1) : getSchemaName();
+				// Unlike CREATE TABLE (which goes through Calcite's real
+				// parser and gets its identifiers normalized), this whole
+				// statement is regex-intercepted -- the captured table name
+				// is exactly as the caller typed it. Uppercase to match
+				// Calcite's own unquoted-identifier normalization (this
+				// connection defaults to caseSensitive=false), or a table
+				// created via ordinary "CREATE TABLE t (...)" (stored as
+				// "T") would never be found by "ALTER TABLE t VERSIONED".
+				String tableName = m.group(2).toUpperCase();
+				ConvexSchema schema = findConvexSchema(schemaName);
+				if (schema == null) {
+					throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
+				}
+				// convertToVersioned returns false (no-op) if the table
+				// doesn't exist in this schema -- found live 2026-08-09: a
+				// caller connected to the wrong schema (e.g. "meta" instead
+				// of "ose") got a silent "OK" for a statement that did
+				// nothing, since this return value used to be discarded.
+				if (!schema.getTables().convertToVersioned(tableName)) {
+					throw new IllegalStateException(
+						"Table \"" + tableName + "\" not found in schema \"" + schemaName + "\"");
+				}
+				fireDdlExecuted(schema);
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
+
+			m = ALTER_TABLE_AUTOINCREMENT.matcher(sql.trim());
+			if (m.matches()) {
+				String schemaName = (m.group(1) != null) ? m.group(1) : getSchemaName();
+				// Same uppercase-normalization reasoning as ALTER_TABLE_VERSIONED above.
+				String tableName = m.group(2).toUpperCase();
+				ConvexSchema schema = findConvexSchema(schemaName);
+				if (schema == null) {
+					throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
+				}
+				if (!schema.getTables().convertToAutoIncrement(tableName)) {
+					throw new IllegalStateException(
+						"Table \"" + tableName + "\" not found in schema \"" + schemaName + "\"");
+				}
+				fireDdlExecuted(schema);
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
+
+			String effectiveSql = sql;
+			String trimmedUpper = sql.trim().toUpperCase();
+			if (trimmedUpper.startsWith("CREATE TABLE") || trimmedUpper.startsWith("CREATE OR REPLACE TABLE")) {
+				Matcher vm = CREATE_TABLE_VERSIONED_SUFFIX.matcher(sql.trim());
+				if (vm.matches()) {
+					effectiveSql = vm.group(1);
+					ConvexDdlExecutor.PENDING_VERSIONED.set(true);
+				} else {
+					Matcher am = CREATE_TABLE_AUTOINCREMENT_SUFFIX.matcher(sql.trim());
+					if (am.matches()) {
+						effectiveSql = am.group(1);
+						ConvexDdlExecutor.PENDING_AUTOINCREMENT.set(true);
+					}
+				}
+			}
+
+			ExecuteResult result = super.prepareAndExecute(h, effectiveSql, maxRowCount, maxRowsInFirstFrame, callback);
+			syncIfAutoCommit();
+			rowCount = rowCountOf(result);
+			return result;
+		} catch (NoSuchStatementException e) {
+			errorMessage = e.getMessage();
+			throw e;
+		} catch (RuntimeException e) {
+			errorMessage = e.getMessage();
+			throw e;
+		} finally {
+			QueryLog.fire(sql, elapsedMs(startNanos), rowCount, errorMessage, h.connectionId);
+		}
 	}
 
 	/**
 	 * {@inheritDoc}
 	 *
-	 * <p>Overridden for the same reason as {@link #prepareAndExecute} below --
+	 * <p>Overridden for the same reason as {@link #prepareAndExecute} above --
 	 * a bound {@code PreparedStatement} (unlike a fresh simple-query string)
-	 * goes through this entry point instead.
+	 * goes through this entry point instead. The original SQL text isn't a
+	 * parameter here, and {@code h.signature} is null at this call site for
+	 * a local connection (checked live 2026-08-07) -- {@link #signatureSql}
+	 * resolves it the same way {@code CalciteMetaImpl}'s own {@code execute}
+	 * does internally.
 	 */
 	@Override
 	public ExecuteResult execute(StatementHandle h, java.util.List<org.apache.calcite.avatica.remote.TypedValue> parameterValues,
 			int maxRowsInFirstFrame) throws NoSuchStatementException {
-		ExecuteResult result = super.execute(h, parameterValues, maxRowsInFirstFrame);
-		syncIfAutoCommit();
-		return result;
+		long startNanos = System.nanoTime();
+		Long rowCount = null;
+		String errorMessage = null;
+		String sql = signatureSql(h);
+		try {
+			ExecuteResult result = super.execute(h, parameterValues, maxRowsInFirstFrame);
+			syncIfAutoCommit();
+			rowCount = rowCountOf(result);
+			return result;
+		} catch (NoSuchStatementException e) {
+			errorMessage = e.getMessage();
+			throw e;
+		} catch (RuntimeException e) {
+			errorMessage = e.getMessage();
+			throw e;
+		} finally {
+			if (sql != null) {
+				QueryLog.fire(sql, elapsedMs(startNanos), rowCount, errorMessage, h.connectionId);
+			}
+		}
+	}
+
+	private static long elapsedMs(long startNanos) {
+		return (System.nanoTime() - startNanos) / 1_000_000;
+	}
+
+	/**
+	 * Row count from an ExecuteResult, when actually available: exact for a
+	 * real {@code updateCount} (regex-intercepted admin statements set this
+	 * explicitly to 0 at their own call sites above; an ordinary INSERT/
+	 * UPDATE/DELETE would use this too, if this execution path ever
+	 * populated it -- see below).
+	 *
+	 * <p>Checked live 2026-08-07 (logged actual {@code MetaResultSet} shapes
+	 * for a real SELECT/INSERT/bound-PreparedStatement against this
+	 * implementation): {@code updateCount} was {@code -1} and {@code
+	 * firstFrame} was either {@code null} or an empty, not-yet-{@code done}
+	 * frame in every ordinary-SQL case observed. Row data for this
+	 * implementation is fetched lazily, via separate {@code Meta.fetch(...)}
+	 * calls issued by {@code AvaticaResultSet} *after* {@code
+	 * prepareAndExecute}/{@code execute} return -- it genuinely does not
+	 * exist yet at the point this hook fires, not just "isn't exposed
+	 * conveniently." A prior attempt at counting an available-but-not-yet-
+	 * {@code done} first frame was removed: it would have silently reported
+	 * "0 rows" for ordinary SELECTs rather than the honest "unknown," which
+	 * is worse. {@code Querylog.ROWCOUNT} is null for ordinary SELECT/
+	 * INSERT/UPDATE/DELETE through this path as a result -- duration, type,
+	 * and error message remain reliable regardless.
+	 */
+	private static Long rowCountOf(ExecuteResult result) {
+		if (result == null || result.resultSets == null || result.resultSets.isEmpty()) return null;
+		MetaResultSet rs = result.resultSets.get(0);
+		return (rs.updateCount >= 0) ? rs.updateCount : null;
 	}
 
 	/**
