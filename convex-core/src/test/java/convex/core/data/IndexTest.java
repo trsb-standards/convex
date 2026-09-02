@@ -827,4 +827,138 @@ public class IndexTest {
 			}
 		}
 	}
+
+	/**
+	 * Keys beyond MAX_KEY_BYTES are clamped to MAX_DEPTH and alias on their first
+	 * 255 bytes. The clamp must also apply when a non-embedded oversized key is
+	 * resolved lazily after a store reload, and a depth outside the range must be
+	 * rejected at construction rather than truncated.
+	 */
+	@Test
+	public void testOversizedKeysClampDepthAcrossStoreReload() throws Exception {
+		byte[] base=new byte[300];
+		Arrays.fill(base,(byte)0x51);
+		Blob huge=Blob.wrap(base); // non-embedded and beyond MAX_KEY_BYTES
+		byte[] aliasBytes=Arrays.copyOf(base,1000);
+		aliasBytes[999]=0x77;
+		Blob hugeAlias=Blob.wrap(aliasBytes); // same first 255 bytes, different tail
+		Blob sibling=Blob.wrap(Arrays.copyOf(base,254)); // shorter key on the same prefix
+		Blob other=Blob.fromHex("ff");
+
+		Index<ABlob,CVMLong> single=Index.of(huge,CVMLong.ONE);
+		assertEquals(Index.MAX_DEPTH,single.getDepth());
+		Index<ABlob,CVMLong> index=Index.of(huge,CVMLong.ONE,sibling,CVMLong.create(2),other,CVMLong.ZERO);
+		assertEquals(3,index.count());
+
+		for (Index<ABlob,CVMLong> original : java.util.List.of(single,index)) {
+			EtchStore store=EtchStore.createTemp("index-oversized");
+			File file=store.getFile();
+			Hash hash=Cells.persist(original,store).getHash();
+			store.close();
+			EtchStore reopened=EtchStore.create(file);
+			try {
+				Index<ABlob,CVMLong> reloaded=reopened.<Index<ABlob,CVMLong>>refForHash(hash).getValue();
+				assertEquals(original.count(),reloaded.count());
+				assertEquals(CVMLong.ONE,reloaded.get(huge));
+				assertEquals(CVMLong.ONE,reloaded.get(hugeAlias),"oversized keys alias on the first 255 bytes");
+				assertEquals(huge,reloaded.getEntry(hugeAlias).getKey());
+				reloaded.validate();
+				assertEquals(original,reloaded);
+
+				// The reloaded oversized entry resolves to exactly MAX_DEPTH
+				Index<ABlob,CVMLong> only=reloaded.dissoc(other).dissoc(sibling);
+				assertEquals(1,only.count());
+				assertEquals(Index.MAX_DEPTH,only.getDepth());
+
+				// Aliasing keys replace and remove the same entry
+				Index<ABlob,CVMLong> replaced=reloaded.assoc(hugeAlias,CVMLong.create(9));
+				assertEquals(reloaded.count(),replaced.count());
+				assertEquals(CVMLong.create(9),replaced.get(huge));
+				Index<ABlob,CVMLong> removed=reloaded.dissoc(hugeAlias);
+				assertEquals(reloaded.count()-1,removed.count());
+				assertNull(removed.get(huge));
+			} finally {
+				reopened.close();
+			}
+		}
+
+		// Out-of-range depths are rejected, never silently truncated to int
+		assertThrows(IllegalArgumentException.class,
+			() -> Index.unsafeCreate(Index.MAX_DEPTH+1,null,Index.EMPTY_CHILDREN,0,0));
+		assertThrows(IllegalArgumentException.class,
+			() -> Index.unsafeCreate(Long.MAX_VALUE,null,Index.EMPTY_CHILDREN,0,0));
+		assertThrows(IllegalArgumentException.class,
+			() -> Index.unsafeCreate(-2,null,Index.EMPTY_CHILDREN,0,0));
+	}
+
+	/**
+	 * A decoded single-entry node with a non-embedded key holds UNRESOLVED_DEPTH
+	 * until first use. The sentinel must never reach an encoding: a single-entry
+	 * node encodes no depth, every multi-entry construction resolves it first, and
+	 * the constructor refuses it for anything but a single-entry node.
+	 */
+	@SuppressWarnings({ "rawtypes", "unchecked" })
+	@Test
+	public void testUnresolvedDepthIsNeverEncoded() throws Exception {
+		byte[] bytes=new byte[200];
+		Arrays.fill(bytes,(byte)0x37);
+		Blob longKey=Blob.wrap(bytes);
+		Blob shortKey=Blob.fromHex("ff");
+		Index<ABlob,CVMLong> single=Index.of(longKey,CVMLong.ONE);
+		Index<ABlob,CVMLong> pair=Index.of(longKey,CVMLong.ONE,shortKey,CVMLong.ZERO);
+
+		// Encode a sentinel node directly: no cached encoding, so encodeRaw runs
+		MapEntry<ABlob,CVMLong> entry=MapEntry.create(longKey,CVMLong.ONE);
+		Index<ABlob,CVMLong> unresolved=Index.unsafeCreate(Index.UNRESOLVED_DEPTH,entry,Index.EMPTY_CHILDREN,0,1);
+		assertEquals(single.getEncoding(),unresolved.getEncoding());
+		assertEquals(single.getEncodingLength(),unresolved.getEncodingLength());
+		assertEquals(single.getHash(),unresolved.getHash());
+		assertEquals(single.isEmbedded(),unresolved.isEmbedded());
+		assertEquals(CVMLong.ONE,unresolved.get(longKey));
+		assertEquals(longKey.hexLength(),unresolved.getDepth());
+		unresolved.validate();
+
+		// Growing a sentinel node resolves the depth before any multi-entry node is built
+		Index<ABlob,CVMLong> fresh=Index.unsafeCreate(Index.UNRESOLVED_DEPTH,entry,Index.EMPTY_CHILDREN,0,1);
+		Index<ABlob,CVMLong> grown=fresh.assoc(shortKey,CVMLong.ZERO);
+		assertEquals(pair.getEncoding(),grown.getEncoding());
+		assertEquals(pair,grown);
+		grown.validate();
+
+		// The sentinel is only legal on a single-entry node
+		assertThrows(IllegalArgumentException.class,
+			() -> Index.unsafeCreate(Index.UNRESOLVED_DEPTH,null,Index.EMPTY_CHILDREN,0,0));
+		assertThrows(IllegalArgumentException.class,
+			() -> Index.unsafeCreate(Index.UNRESOLVED_DEPTH,null,Index.EMPTY_CHILDREN,0,1));
+		assertThrows(IllegalArgumentException.class,
+			() -> Index.unsafeCreate(Index.UNRESOLVED_DEPTH,entry,Index.EMPTY_CHILDREN,0,2));
+
+		// Reload from a store, then persist again into a second store before any lookup
+		for (Index<ABlob,CVMLong> original : java.util.List.of(single,pair)) {
+			Blob expected=original.getEncoding();
+			EtchStore store=EtchStore.createTemp("index-unresolved");
+			File file=store.getFile();
+			Hash hash=Cells.persist(original,store).getHash();
+			store.close();
+			EtchStore reopened=EtchStore.create(file);
+			EtchStore second=EtchStore.createTemp("index-unresolved-2");
+			File secondFile=second.getFile();
+			try {
+				Index<ABlob,CVMLong> reloaded=reopened.<Index<ABlob,CVMLong>>refForHash(hash).getValue();
+				Hash again=Cells.persist(reloaded,second).getHash();
+				assertEquals(hash,again);
+				second.close();
+				second=EtchStore.create(secondFile);
+				Index<ABlob,CVMLong> twice=second.<Index<ABlob,CVMLong>>refForHash(again).getValue();
+				assertEquals(expected,twice.getEncoding());
+				assertEquals(CVMLong.ONE,twice.get(longKey));
+				assertEquals(original,twice);
+				twice.validate();
+				assertEquals(expected,reopened.decode(expected).getEncoding());
+			} finally {
+				reopened.close();
+				second.close();
+			}
+		}
+	}
 }
