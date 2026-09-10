@@ -759,6 +759,34 @@ public abstract class Convex implements AutoCloseable {
 	}
 
 	/**
+	 * Sends a message expecting a correlated result, without ever blocking
+	 * on network I/O to send it -- unlike {@link #request(Message)}, whose
+	 * connection-oriented overrides use a send path documented to block
+	 * with a bounded timeout under backpressure. Uses the same
+	 * guaranteed-non-blocking send path as {@link #trySend(Message)}, but
+	 * still returns a future for a correlated result rather than being
+	 * fire-and-forget.
+	 *
+	 * <p>If the message can't be queued without blocking, returns an
+	 * already-completed future ({@link Result#FULL_CLIENT_BUFFER}) instead
+	 * of waiting -- a caller wanting to distinguish "queued, awaiting
+	 * response" from "not even sent" can check whether the returned future
+	 * is already done.
+	 *
+	 * <p>Intended for callers on a shared processing thread that must never
+	 * block on I/O (see {@code AConnection.trySendMessage}'s own doc) but
+	 * still need a correlated result. Default implementation delegates to
+	 * {@link #request(Message)} (which may block); connection-oriented
+	 * clients override with a truly non-blocking send.
+	 *
+	 * @param message semantic request message with a replaceable ID slot
+	 * @return future for the correlated result
+	 */
+	public CompletableFuture<Result> requestNonBlocking(Message message) {
+		return request(message);
+	}
+
+	/**
 	 * Non-blocking fire-and-forget message send. Returns false immediately if
 	 * the message cannot be queued (buffer full, connection closed).
 	 *

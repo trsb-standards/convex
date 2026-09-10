@@ -324,6 +324,68 @@ public class PgServerTest {
 	}
 
 	@Test
+	public void testUcanAuthAcceptsAValidTokenForABoundDid() throws Exception {
+		server.stop();
+		convex.core.crypto.AKeyPair kp = convex.core.crypto.AKeyPair.generate();
+		String did = convex.auth.did.DID.forKey(kp.getAccountKey()).toString();
+		convex.core.data.AString jwt = convex.auth.ucan.UCAN.createJWT(kp, kp.getAccountKey(),
+			System.currentTimeMillis() / 1000L + 3600, convex.core.data.Vectors.empty(), null);
+
+		PgServer ucanServer = PgServer.builder()
+			.port(0).database(dbName)
+			.ucanPrincipalResolver(d -> d.equals(did) ? 42L : null)
+			.build();
+		ucanServer.start();
+		try (Socket socket = new Socket("localhost", ucanServer.getPort())) {
+			socket.setSoTimeout(5000);
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+			sendStartupMessage(out, dbName, "testuser");
+			assertEquals('R', in.readByte());
+			in.readInt();
+			assertEquals(3, in.readInt()); // CleartextPassword requested
+			sendPassword(out, jwt.toString());
+			assertEquals('R', in.readByte());
+			in.readInt();
+			assertEquals(0, in.readInt()); // AuthenticationOk
+			skipToReadyForQuery(in);
+		} finally {
+			ucanServer.stop();
+		}
+	}
+
+	@Test
+	public void testUcanAuthRejectsAnUnboundDidAndAGarbageToken() throws Exception {
+		server.stop();
+		convex.core.crypto.AKeyPair kp = convex.core.crypto.AKeyPair.generate();
+		convex.core.data.AString jwt = convex.auth.ucan.UCAN.createJWT(kp, kp.getAccountKey(),
+			System.currentTimeMillis() / 1000L + 3600, convex.core.data.Vectors.empty(), null);
+
+		PgServer ucanServer = PgServer.builder()
+			.port(0).database(dbName)
+			.ucanPrincipalResolver(d -> null) // nothing is bound
+			.build();
+		ucanServer.start();
+		try {
+			for (String secret : new String[]{ jwt.toString(), "not-a-jwt" }) {
+				try (Socket socket = new Socket("localhost", ucanServer.getPort())) {
+					socket.setSoTimeout(5000);
+					DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+					DataInputStream in = new DataInputStream(socket.getInputStream());
+					sendStartupMessage(out, dbName, "testuser");
+					assertEquals('R', in.readByte());
+					in.readInt();
+					assertEquals(3, in.readInt());
+					sendPassword(out, secret);
+					assertEquals('E', in.readByte(), "expected ErrorResponse for: " + secret);
+				}
+			}
+		} finally {
+			ucanServer.stop();
+		}
+	}
+
+	@Test
 	public void testEmptyQuery() throws IOException {
 		try (Socket socket = new Socket("localhost", server.getPort())) {
 			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
@@ -491,6 +553,57 @@ public class PgServerTest {
 				assertEquals("row-" + i, rs.getString("name"));
 			}
 			assertFalse(rs.next());
+		}
+	}
+
+	/**
+	 * Found live 2026-08-25: a SELECT {@code PreparedStatement} reused across
+	 * many executions crashed the real pgjdbc client with {@code
+	 * java.util.NoSuchElementException} at {@code ArrayDeque.removeFirst} deep
+	 * in {@code QueryExecutorImpl.processResults} — pgjdbc's own client-side
+	 * response bookkeeping desynced. Root cause: pgjdbc only sends an explicit
+	 * {@code Describe} message for a statement's first few executions (its own
+	 * {@code prepareThreshold}, default 5); once it has the row shape cached
+	 * client-side, later executions send Bind+Execute only. The server's old
+	 * per-portal "did Describe just run" tracking (cleared on every Bind)
+	 * then wrongly concluded "not described" on every one of those later
+	 * executions and resent an unrequested {@code RowDescription} mid-stream.
+	 * See {@code PgProtocolHandler.describedStatements}'s own doc for the
+	 * fix (statement-scoped tracking, not portal-scoped) — this test proves
+	 * it holds well past that threshold, with genuinely varying bound values
+	 * each time (so a stale/reused result would also be caught, not just a
+	 * protocol-level crash).
+	 */
+	@Test
+	public void testSelectPreparedStatementReusedPastPgjdbcsDescribeThreshold() throws Exception {
+		ConvexColumnType[] types = {
+			ConvexColumnType.of(ConvexType.INTEGER), // id
+			ConvexColumnType.varchar(50),            // name
+		};
+		db.tables().createTable("selreused", new String[]{"id", "name"}, types);
+
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		int rowCount = 40; // well past pgjdbc's default prepareThreshold of 5
+		try (Connection conn = DriverManager.getConnection(url);
+			 java.sql.PreparedStatement ins = conn.prepareStatement("INSERT INTO selreused (id, name) VALUES (?, ?)")) {
+			for (int i = 0; i < rowCount; i++) {
+				ins.setInt(1, i);
+				ins.setString(2, "row-" + i);
+				assertEquals(1, ins.executeUpdate());
+			}
+		}
+
+		try (Connection conn = DriverManager.getConnection(url);
+			 java.sql.PreparedStatement sel = conn.prepareStatement("SELECT id, name FROM selreused WHERE id = ?")) {
+			for (int i = 0; i < rowCount; i++) {
+				sel.setInt(1, i);
+				try (ResultSet rs = sel.executeQuery()) {
+					assertTrue(rs.next(), "row " + i + " must be found");
+					assertEquals(i, rs.getInt("id"));
+					assertEquals("row-" + i, rs.getString("name"));
+					assertFalse(rs.next(), "exactly one row expected for id=" + i);
+				}
+			}
 		}
 	}
 

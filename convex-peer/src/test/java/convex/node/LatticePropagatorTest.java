@@ -1,5 +1,6 @@
 package convex.node;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -32,6 +33,7 @@ import convex.core.data.Blobs;
 import convex.core.data.Hash;
 import convex.core.data.Index;
 import convex.core.data.Keyword;
+import convex.core.data.Maps;
 import convex.core.data.Ref;
 import convex.core.data.Sets;
 import convex.core.data.prim.CVMLong;
@@ -44,6 +46,7 @@ import convex.lattice.ALattice;
 import convex.lattice.Lattice;
 import convex.lattice.LatticeContext;
 import convex.lattice.generic.LWWLattice;
+import convex.lattice.generic.MapLattice;
 import convex.lattice.generic.SetLattice;
 
 /**
@@ -589,4 +592,346 @@ public class LatticePropagatorTest {
 				"Server2 should have received update " + (i + 1) + " from server1");
 		}
 	}
+
+	/**
+	 * Tests that {@code NodeServer.setNextSyncAckTarget} genuinely makes the
+	 * next {@code sync()} wait for a real peer response -- not just "sent",
+	 * but "the peer actually merged it" -- before returning, by checking the
+	 * value is already visible on server2 the instant sync() returns (no
+	 * poll/retry, which the ordinary fire-and-forget path would need).
+	 */
+	@Test
+	public void testAckTargetWaitsForRealPeerMerge() throws Exception {
+		Keyword dataKeyword = Keyword.intern("data");
+		ACell testValue = CVMLong.create(555555);
+		Hash valueHash = Hash.get(testValue);
+
+		@SuppressWarnings("unchecked")
+		Index<Hash, ACell> values = (Index<Hash, ACell>) Index.EMPTY;
+		values = values.assoc(valueHash, testValue);
+		server1.getCursor().assoc(dataKeyword, values);
+
+		NodeServer.setNextSyncAckTarget(1, 5000);
+		server1.getCursor().sync();
+
+		// No pull, no poll, no sleep: if this passes, the ack we waited for
+		// really did mean "server2 has already merged this".
+		assertEquals(testValue, RT.getIn(server2.getLocalValue(), dataKeyword, valueHash),
+			"Value should already be visible on server2 the instant sync() returns");
+	}
+
+	/**
+	 * Tests that a pending ack target is consumed by exactly one sync() and
+	 * does not leak into the next, unrelated sync() on the same thread.
+	 */
+	@Test
+	public void testAckTargetIsConsumedOnce() throws Exception {
+		Keyword dataKeyword = Keyword.intern("data");
+
+		NodeServer.setNextSyncAckTarget(1, 5000);
+		server1.getCursor().assoc(dataKeyword, CVMLong.create(1));
+		server1.getCursor().sync(); // consumes the pending target
+
+		// A second, unrelated sync on the same thread must not still be
+		// waiting on a stale ack target -- it should behave like an
+		// ordinary processSnapshot call (fast, no wait requirement).
+		long start = System.nanoTime();
+		server1.getCursor().assoc(dataKeyword, CVMLong.create(2));
+		server1.getCursor().sync();
+		long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+		assertTrue(elapsedMs < 2000, "Second sync should not have waited on a stale ack target: " + elapsedMs + "ms");
+	}
+
+	/**
+	 * Tests that requesting more acks than there are connected peers does
+	 * not hang for the full timeout -- it should cap at the actual
+	 * connected count and return promptly once that many have responded.
+	 */
+	@Test
+	public void testAckTargetCapsAtConnectedPeerCount() throws Exception {
+		Keyword dataKeyword = Keyword.intern("data");
+
+		// Only one peer (server2) is connected in this fixture; ask for far more.
+		NodeServer.setNextSyncAckTarget(50, 5000);
+		long start = System.nanoTime();
+		server1.getCursor().assoc(dataKeyword, CVMLong.create(999));
+		server1.getCursor().sync();
+		long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+		assertTrue(elapsedMs < 2000,
+			"Requesting more acks than connected peers should cap and return promptly, not wait for the full timeout: " + elapsedMs + "ms");
+	}
+
+	/**
+	 * Tests that a timeout waiting for acks never throws or fails the
+	 * publish -- the announced value is still returned, matching this
+	 * class's established best-effort tolerance for broadcast-step
+	 * failures elsewhere (see LatticePropagator's own doc).
+	 */
+	@Test
+	public void testAckTargetTimeoutDoesNotFailThePublish() throws Exception {
+		Keyword dataKeyword = Keyword.intern("data");
+
+		// server2 is connected but will never actually be asked to respond
+		// within an impossibly short timeout -- this must still complete.
+		NodeServer.setNextSyncAckTarget(1, 1);
+		server1.getCursor().assoc(dataKeyword, CVMLong.create(42));
+		assertDoesNotThrow(() -> server1.getCursor().sync(),
+			"A timed-out ack wait must not throw or fail the publish");
+	}
+
+	/**
+	 * Reproduces a live symptom (2026-08-24): many rapid, back-to-back
+	 * ack-tracked publishes on the same connection -- each should complete
+	 * in real ack-round-trip time, not fall back to the full configured
+	 * timeout. A per-call timeout fallback would make this take
+	 * {@code N * timeoutMs}, not {@code N * (real round trip)} -- the
+	 * assertion bound distinguishes the two.
+	 */
+	@Test
+	public void testManyRapidAckTargetPublishesDoNotEachPayTheFullTimeout() throws Exception {
+		Keyword dataKeyword = Keyword.intern("data");
+		int rounds = 50;
+		long timeoutMs = 5000;
+
+		long start = System.nanoTime();
+		for (int i = 0; i < rounds; i++) {
+			NodeServer.setNextSyncAckTarget(1, timeoutMs);
+			server1.getCursor().assoc(dataKeyword, CVMLong.create(i));
+			server1.getCursor().sync();
+		}
+		long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+		System.out.printf("  %d rapid ack-tracked publishes: %,dms total (%.1fms avg)%n",
+			rounds, elapsedMs, elapsedMs / (double) rounds);
+		assertTrue(elapsedMs < rounds * 500L,
+			"Rapid publishes should complete in real round-trip time, not fall back to the "
+			+ timeoutMs + "ms timeout per call: " + elapsedMs + "ms for " + rounds + " rounds");
+	}
+
+	/**
+	 * Isolates whether real disk persistence on the *receiving* peer is
+	 * what makes ack-tracked publishes expensive on a real fleet, as
+	 * opposed to a bug in ack correlation/dispatch itself. Own disk-backed
+	 * (not MemoryStore) two-server setup, mirroring how a real dbase node
+	 * is configured -- unlike the class fixture above, which uses
+	 * MemoryStore and shows no meaningful per-round cost at all.
+	 *
+	 * <p>Not a pass/fail correctness assertion (there's no "wrong" answer
+	 * here) -- prints per-round timing for direct comparison against the
+	 * class fixture's own reported average, to attribute where the real
+	 * fleet's cost actually comes from.
+	 */
+	@Test
+	public void testAckTargetCostWithRealDiskPersistenceOnBothSides() throws Exception {
+		AStore diskStoreA = EtchStore.createTemp("ackcost-a");
+		AStore diskStoreB = EtchStore.createTemp("ackcost-b");
+		NodeServer<?> serverA = new NodeServer<>(lattice, diskStoreA, NodeConfig.port(0));
+		NodeServer<?> serverB = new NodeServer<>(lattice, diskStoreB, NodeConfig.port(0));
+		try {
+			serverA.setInboundPropagatorSelector(c -> serverA.getPropagator());
+			serverB.setInboundPropagatorSelector(c -> serverB.getPropagator());
+			serverA.launch();
+			serverB.launch();
+
+			AccountKey keyB = AKeyPair.generate().getAccountKey();
+			Convex aToB = ConvexRemote.connect(serverB.getHostAddress());
+			serverA.getPropagator().addPeer(keyB, aToB);
+
+			Keyword dataKeyword = Keyword.intern("data");
+			int rounds = 30;
+			long timeoutMs = 5000;
+
+			long start = System.nanoTime();
+			for (int i = 0; i < rounds; i++) {
+				NodeServer.setNextSyncAckTarget(1, timeoutMs);
+				serverA.getCursor().assoc(dataKeyword, CVMLong.create(i));
+				serverA.getCursor().sync();
+			}
+			long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+			System.out.printf("  %d rounds, BOTH sides disk-backed (Etch): %,dms total (%.1fms avg)%n",
+				rounds, elapsedMs, elapsedMs / (double) rounds);
+		} finally {
+			serverA.close();
+			serverB.close();
+			diskStoreA.close();
+			diskStoreB.close();
+		}
+	}
+
+	/**
+	 * Same as {@link #testAckTargetCostWithRealDiskPersistenceOnBothSides}
+	 * plus real, configured keypairs on both sides (so admission goes
+	 * through the genuine async identity-verification handshake, not the
+	 * {@code kp == null} synchronous shortcut every other test in this
+	 * class fixture uses) -- the one remaining structural difference from
+	 * a real dbase node's peer connections not yet isolated.
+	 */
+	@Test
+	public void testAckTargetCostWithRealDiskPersistenceAndVerifiedIdentity() throws Exception {
+		AStore diskStoreA = EtchStore.createTemp("ackcost-verified-a");
+		AStore diskStoreB = EtchStore.createTemp("ackcost-verified-b");
+		NodeServer<?> serverA = new NodeServer<>(lattice, diskStoreA, NodeConfig.port(0));
+		NodeServer<?> serverB = new NodeServer<>(lattice, diskStoreB, NodeConfig.port(0));
+		try {
+			AKeyPair keyA = AKeyPair.generate();
+			AKeyPair keyB = AKeyPair.generate();
+			serverA.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyA));
+			serverB.setMergeContext(LatticeContext.create(CVMLong.create(System.currentTimeMillis()), keyB));
+			serverA.setInboundPropagatorSelector(c -> serverA.getPropagator());
+			serverB.setInboundPropagatorSelector(c -> serverB.getPropagator());
+			serverA.launch();
+			serverB.launch();
+
+			Convex aToB = ConvexRemote.connect(serverB.getHostAddress());
+			serverA.getPropagator().addPeer(keyB.getAccountKey(), aToB);
+
+			Keyword dataKeyword = Keyword.intern("data");
+			int rounds = 30;
+			long timeoutMs = 5000;
+
+			long start = System.nanoTime();
+			for (int i = 0; i < rounds; i++) {
+				NodeServer.setNextSyncAckTarget(1, timeoutMs);
+				serverA.getCursor().assoc(dataKeyword, CVMLong.create(i));
+				serverA.getCursor().sync();
+			}
+			long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+			System.out.printf("  %d rounds, disk-backed + verified identity: %,dms total (%.1fms avg)%n",
+				rounds, elapsedMs, elapsedMs / (double) rounds);
+		} finally {
+			serverA.close();
+			serverB.close();
+			diskStoreA.close();
+			diskStoreB.close();
+		}
+	}
+
+	/**
+	 * Reproduces the live 2026-08-25 incident directly: an unscoped peer's
+	 * periodic root sync used to reference the entire root as one value, so
+	 * once accumulated data exceeded the receiver's inbound size limit,
+	 * every single sync failed -- even data that had nothing to do with
+	 * the oversized entry. Sets up A's own data (a small entry and a
+	 * deliberately oversized one under a *different* top-level keyword)
+	 * with no peer connected yet, so the ordinary trigger-driven broadcast
+	 * (already correctly delta-bounded, not what's being tested here)
+	 * never runs -- then connects B (with a tight inbound size limit) and
+	 * calls {@code maybePerformRootSync} directly, isolating exactly the
+	 * mechanism this fixes.
+	 */
+	@Test
+	public void testUnscopedRootSyncDecomposesByTopLevelKeySoOneOversizedEntryDoesNotBlockOthers() throws Exception {
+		// Lattice.ROOT is a KeyedLattice with a small, fixed, pre-registered
+		// set of top-level keywords (:data, :fs, ...) -- AKeyedLattice.merge
+		// silently drops any key outside that set (see its own #561 comment),
+		// so arbitrary test keywords like :small/:big would never actually
+		// merge in under it regardless of this fix. A generic open-key
+		// MapLattice (the same shape as the real-world case this fix targets,
+		// ConvexDB.DATABASE_MAP_LATTICE) is used here instead, purpose-built
+		// for this test rather than the shared `lattice` field.
+		ALattice<?> openKeyLattice = MapLattice.create(LWWLattice.INSTANCE);
+		AStore storeA = new MemoryStore();
+		AStore storeB = new MemoryStore();
+		NodeConfig tightB = NodeConfig.create(Maps.of(NodeConfig.MAX_INBOUND_VALUE_SIZE, CVMLong.create(2000)));
+		NodeServer<?> serverA = new NodeServer<>(openKeyLattice, storeA, NodeConfig.port(0));
+		NodeServer<?> serverB = new NodeServer<>(openKeyLattice, storeB, tightB);
+		try {
+			serverA.setInboundPropagatorSelector(c -> serverA.getPropagator());
+			serverB.setInboundPropagatorSelector(c -> serverB.getPropagator());
+			serverA.launch();
+			serverB.launch();
+
+			Keyword smallKeyword = Keyword.intern("small");
+			Keyword bigKeyword = Keyword.intern("big");
+			ACell smallValue = CVMLong.create(42);
+			ACell bigValue = Blobs.createRandom(5000); // well over tightB's 2000-byte limit
+
+			// No peer connected yet: sync() here only announces/persists
+			// locally on A, nothing is broadcast anywhere.
+			serverA.getCursor().assoc(smallKeyword, smallValue);
+			serverA.getCursor().assoc(bigKeyword, bigValue);
+			serverA.getCursor().sync();
+			assertTrue(serverA.getPropagator().getPeers().isEmpty(),
+				"sanity: no peer yet, so the write above could not have reached B any other way");
+
+			AccountKey keyB = AKeyPair.generate().getAccountKey();
+			Convex aToB = ConvexRemote.connect(serverB.getHostAddress());
+			serverA.getPropagator().addPeer(keyB, aToB);
+
+			// The single mechanism under test -- called directly rather
+			// than waiting a real ROOT_SYNC_INTERVAL.
+			assertDoesNotThrow(() -> serverA.getPropagator().maybePerformRootSync(System.currentTimeMillis()));
+
+			// Give the non-blocking sends + B's own dispatcher a moment to settle.
+			Thread.sleep(500);
+
+			assertEquals(smallValue, RT.getIn(serverB.getLocalValue(), smallKeyword),
+				"the small entry must arrive even though a sibling entry was oversized");
+			assertNull(RT.getIn(serverB.getLocalValue(), bigKeyword),
+				"the oversized entry must be rejected, not merged");
+		} finally {
+			serverA.close();
+			serverB.close();
+			storeA.close();
+			storeB.close();
+		}
+	}
+
+	/**
+	 * Confirms {@link LatticePropagator#maybePerformRootSync} backs off a
+	 * peer after a failed attempt rather than retrying it immediately --
+	 * the fix for the other half of the same live incident (the old,
+	 * single global {@code lastRootSyncTime} retried a peer that had JUST
+	 * failed at the exact same fixed interval as a healthy one, forever).
+	 * Reuses the same oversized-entry fixture to produce a genuine
+	 * failure, then calls {@code maybePerformRootSync} a second time
+	 * immediately afterward and confirms no further send attempt is made
+	 * (observed via the connection's own send count not increasing).
+	 */
+	@Test
+	public void testFailedRootSyncBacksOffInsteadOfRetryingImmediately() throws Exception {
+		AStore storeA = new MemoryStore();
+		AStore storeB = new MemoryStore();
+		NodeConfig tightB = NodeConfig.create(Maps.of(NodeConfig.MAX_INBOUND_VALUE_SIZE, CVMLong.create(2000)));
+		NodeServer<?> serverA = new NodeServer<>(lattice, storeA, NodeConfig.port(0));
+		NodeServer<?> serverB = new NodeServer<>(lattice, storeB, tightB);
+		try {
+			serverA.setInboundPropagatorSelector(c -> serverA.getPropagator());
+			serverB.setInboundPropagatorSelector(c -> serverB.getPropagator());
+			serverA.launch();
+			serverB.launch();
+
+			// A single, non-decomposable oversized value (not a map) --
+			// guarantees the whole sync attempt fails, exercising the
+			// PeerSyncState.recordFailure path deterministically.
+			ACell bigValue = Blobs.createRandom(5000);
+			serverA.getCursor().assoc(Keyword.intern("data"), bigValue);
+			serverA.getCursor().sync();
+
+			AccountKey keyB = AKeyPair.generate().getAccountKey();
+			Convex aToB = ConvexRemote.connect(serverB.getHostAddress());
+			serverA.getPropagator().addPeer(keyB, aToB);
+
+			long t0 = System.currentTimeMillis();
+			serverA.getPropagator().maybePerformRootSync(t0);
+			long attemptsAfterFirst = serverA.getPropagator().getRootSyncCount();
+			assertEquals(1L, attemptsAfterFirst, "sanity: the first call should have attempted this newly-due peer");
+
+			// Immediately again, same peer -- must not re-attempt (backoff active).
+			serverA.getPropagator().maybePerformRootSync(t0 + 1);
+			long attemptsAfterSecond = serverA.getPropagator().getRootSyncCount();
+
+			assertEquals(attemptsAfterFirst, attemptsAfterSecond,
+				"a peer that just failed root sync must not be retried on the very next call");
+		} finally {
+			serverA.close();
+			serverB.close();
+			storeA.close();
+			storeB.close();
+		}
+	}
+
 }

@@ -193,4 +193,68 @@ class SQLSchemaAutoIncrementTest {
 		schema.insert("t", row);
 		assertEquals("x", schema.selectByKey("t", CVMLong.create(1L)).get(1).toString());
 	}
+
+	// ── versioned + auto-increment together ──────────────────────────────
+
+	private static SQLSchema versionedAutoIncrementTable(String name) {
+		SQLSchema schema = SQLSchema.create();
+		schema.createTable(Strings.create(name),
+			new String[]{"ID", "VAL"},
+			new ConvexColumnType[]{
+				ConvexColumnType.of(ConvexType.INTEGER),
+				ConvexColumnType.of(ConvexType.VARCHAR)},
+			1, /*versioned*/ true, /*autoIncrement*/ true);
+		return schema;
+	}
+
+	@Test
+	void versionedAutoIncrementGeneratesSequentialPksAndRecordsInsertHistory() {
+		SQLSchema schema = versionedAutoIncrementTable("t");
+		schema.insert("t", Vectors.of(null, "alpha"));
+		schema.insert("t", Vectors.of(null, "beta"));
+
+		// live data: generated ids 1, 2
+		assertEquals("alpha", schema.selectByKey("t", CVMLong.create(1L)).get(1).toString());
+		assertEquals("beta", schema.selectByKey("t", CVMLong.create(2L)).get(1).toString());
+
+		// each generated row also got a CT_INSERT history entry
+		var h1 = schema.getHistory("t", CVMLong.create(1L));
+		assertEquals(1, h1.size());
+		assertEquals(VersionedSQLTable.CT_INSERT, ((CVMLong) h1.get(0).get(2)).longValue());
+		var h2 = schema.getHistory("t", CVMLong.create(2L));
+		assertEquals(1, h2.size());
+		assertEquals(VersionedSQLTable.CT_INSERT, ((CVMLong) h2.get(0).get(2)).longValue());
+	}
+
+	@Test
+	void versionedAutoIncrementExplicitPkPullsCounterForwardAndKeepsHistory() {
+		SQLSchema schema = versionedAutoIncrementTable("t");
+		schema.insert("t", Vectors.of(CVMLong.create(100L), "explicit"));
+		schema.insert("t", Vectors.of(null, "next"));
+
+		assertEquals("explicit", schema.selectByKey("t", CVMLong.create(100L)).get(1).toString());
+		// generated value skipped past the explicit 100
+		assertEquals("next", schema.selectByKey("t", CVMLong.create(101L)).get(1).toString());
+
+		assertEquals(1, schema.getHistory("t", CVMLong.create(100L)).size());
+		assertEquals(1, schema.getHistory("t", CVMLong.create(101L)).size());
+	}
+
+	@Test
+	void convertToAutoIncrementNowWorksOnAVersionedTable() {
+		SQLSchema schema = SQLSchema.create();
+		schema.createTable(Strings.create("t"),
+			new String[]{"ID", "VAL"},
+			new ConvexColumnType[]{
+				ConvexColumnType.of(ConvexType.INTEGER),
+				ConvexColumnType.of(ConvexType.VARCHAR)},
+			1, /*versioned*/ true, /*autoIncrement*/ false);
+		schema.insert("t", Vectors.of(CVMLong.create(5L), "seed"));
+
+		assertTrue(schema.convertToAutoIncrement("t"));
+		schema.insert("t", Vectors.of(null, "generated"));
+		// counter seeded from MAX(pk)=5, so next generated is 6
+		assertEquals("generated", schema.selectByKey("t", CVMLong.create(6L)).get(1).toString());
+		assertEquals(1, schema.getHistory("t", CVMLong.create(6L)).size());
+	}
 }

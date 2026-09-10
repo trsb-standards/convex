@@ -194,7 +194,7 @@ public abstract class AConvexConnected extends Convex {
 		if (conn==null) {
 			return CompletableFuture.completedFuture(Result.CLOSED_CONNECTION);
 		}
-		return send(conn,m);
+		return send(conn,m,true);
 	}
 
 	@Override
@@ -208,22 +208,52 @@ public abstract class AConvexConnected extends Convex {
 			return CompletableFuture.failedFuture(
 					new IllegalArgumentException("Message type does not support request IDs"));
 		}
-		return send(conn,request);
+		return send(conn,request,true);
 	}
 
-	private CompletableFuture<Result> send(AConnection conn, Message m) {
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>Identical to {@link #request(Message)} except the actual send uses
+	 * {@link AConnection#trySendMessage(Message)} (guaranteed non-blocking)
+	 * instead of {@link AConnection#sendMessage(Message)} (documented to
+	 * block with a bounded timeout under backpressure) -- for a caller on a
+	 * shared processing thread that must never block on I/O.
+	 */
+	@Override
+	public CompletableFuture<Result> requestNonBlocking(Message m) {
+		AConnection conn=connection;
+		if (conn==null) {
+			return CompletableFuture.completedFuture(Result.CLOSED_CONNECTION);
+		}
+		Message request=m.withID(conn.nextRequestID());
+		if (request==null) {
+			return CompletableFuture.failedFuture(
+					new IllegalArgumentException("Message type does not support request IDs"));
+		}
+		return send(conn,request,false);
+	}
+
+	/**
+	 * @param allowBlocking true to send via {@link AConnection#sendMessage(Message)}
+	 *        (may block under backpressure), false to send via {@link
+	 *        AConnection#trySendMessage(Message)} (guaranteed non-blocking,
+	 *        returns {@link Result#FULL_CLIENT_BUFFER} instead of waiting
+	 *        if it can't queue immediately).
+	 */
+	private CompletableFuture<Result> send(AConnection conn, Message m, boolean allowBlocking) {
 		ACell id=m.getRequestID();
 		try {
 			if (id==null) {
 				// Not expecting any return message, so just report sending
-				boolean sent = conn.sendMessage(m);
+				boolean sent = allowBlocking ? conn.sendMessage(m) : conn.trySendMessage(m);
 				if (!sent) return CompletableFuture.completedFuture(Result.FULL_CLIENT_BUFFER);
 				return CompletableFuture.completedFuture(Result.SENT_MESSAGE);
 			}
 
 			// Register future BEFORE send — response handler can find it immediately
 			CompletableFuture<Result> cf = awaitResult(id, timeout);
-			boolean sent = conn.sendMessage(m);
+			boolean sent = allowBlocking ? conn.sendMessage(m) : conn.trySendMessage(m);
 			if (!sent) {
 				awaiting.remove(id);
 				return CompletableFuture.completedFuture(Result.FULL_CLIENT_BUFFER);

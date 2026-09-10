@@ -19,6 +19,7 @@ import convex.db.calcite.ConvexDdlExecutor;
 import convex.db.calcite.ConvexSchema;
 import convex.db.calcite.QueryLog;
 import convex.db.lattice.SQLDatabase;
+import convex.node.NodeServer;
 
 /**
  * Calcite Meta implementation for Convex SQL databases.
@@ -56,6 +57,20 @@ public class ConvexMeta extends CalciteMetaImpl {
 
 	/** Reentrancy guard: getSchema() triggers connectionSync() internally. */
 	private boolean inSync = false;
+
+	/**
+	 * Per-connection override for how many peer acknowledgements every
+	 * subsequent autocommit statement's sync should wait for, set via
+	 * {@code SET WRITE_ACKS = <n>}. {@code -1} (the default) means
+	 * unconfigured: {@link #syncIfAutoCommit} leaves NodeServer's own
+	 * per-call ack target unset, so publication uses its ordinary fully
+	 * synchronous behavior, unchanged from before this feature existed.
+	 */
+	private int writeAcks = -1;
+
+	/** Fixed wait bound for a configured {@link #writeAcks} target. Not yet
+	 *  independently configurable -- see SET_WRITE_ACKS's own doc. */
+	private static final long WRITE_ACKS_TIMEOUT_MS = 5000;
 
 	protected ConvexMeta(CalciteConnectionImpl connection) {
 		super(connection,
@@ -168,6 +183,20 @@ public class ConvexMeta extends CalciteMetaImpl {
 
 	private static final Pattern ALTER_TABLE_AUTOINCREMENT = Pattern.compile(
 		"(?i)ALTER\\s+TABLE\\s+(?:(\\w+)\\.)?(\\w+)\\s+AUTOINCREMENT\\s*");
+
+	// SET WRITE_ACKS = <n> -- per-connection durability/latency knob for
+	// every subsequent autocommit statement on this connection. See
+	// syncIfAutoCommit's own doc for what this actually changes; the short
+	// version: by default, every autocommit write's response waits for a
+	// full synchronous broadcast attempt to every connected peer (no acks
+	// tracked). Setting this to 0 makes autocommit writes return as soon as
+	// they're durably persisted on THIS node, firing the broadcast without
+	// waiting on it at all. Setting it to N>0 waits for at least N peers to
+	// respond (capped at however many are actually connected) before
+	// returning, trading some of that latency back for a stronger, but
+	// still bounded (WRITE_ACKS_TIMEOUT_MS), delivery guarantee.
+	private static final Pattern SET_WRITE_ACKS = Pattern.compile(
+		"(?i)SET\\s+WRITE_ACKS\\s*=\\s*(\\d+)\\s*");
 
 	/**
 	 * {@inheritDoc}
@@ -307,6 +336,14 @@ public class ConvexMeta extends CalciteMetaImpl {
 						MetaResultSet.count(h.connectionId, h.id, 0L)));
 			}
 
+			m = SET_WRITE_ACKS.matcher(sql.trim());
+			if (m.matches()) {
+				writeAcks = Integer.parseInt(m.group(1));
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
+
 			String effectiveSql = sql;
 			String trimmedUpper = sql.trim().toUpperCase();
 			if (trimmedUpper.startsWith("CREATE TABLE") || trimmedUpper.startsWith("CREATE OR REPLACE TABLE")) {
@@ -324,7 +361,7 @@ public class ConvexMeta extends CalciteMetaImpl {
 			}
 
 			ExecuteResult result = super.prepareAndExecute(h, effectiveSql, maxRowCount, maxRowsInFirstFrame, callback);
-			syncIfAutoCommit();
+			syncIfAutoCommit(trimmedUpper.startsWith("SELECT"));
 			rowCount = rowCountOf(result);
 			return result;
 		} catch (NoSuchStatementException e) {
@@ -358,7 +395,7 @@ public class ConvexMeta extends CalciteMetaImpl {
 		String sql = signatureSql(h);
 		try {
 			ExecuteResult result = super.execute(h, parameterValues, maxRowsInFirstFrame);
-			syncIfAutoCommit();
+			syncIfAutoCommit(sql != null && sql.trim().toUpperCase().startsWith("SELECT"));
 			rowCount = rowCountOf(result);
 			return result;
 		} catch (NoSuchStatementException e) {
@@ -434,9 +471,52 @@ public class ConvexMeta extends CalciteMetaImpl {
 	 * transaction's writes belong to {@link #txDatabase} and must not become
 	 * visible to peers (or even to this node's own non-transactional readers)
 	 * until {@link #commit} explicitly syncs it.
+	 *
+	 * <p>If {@link #writeAcks} has been configured (via {@code SET
+	 * WRITE_ACKS = <n>}), sets NodeServer's per-thread ack target
+	 * (NodeServer.setNextSyncAckTarget) before calling {@code db.sync()},
+	 * so the publish this sync triggers bounds how many peer
+	 * acknowledgements it waits for instead of always doing a full
+	 * synchronous broadcast to every connected peer. See {@link
+	 * convex.node.LatticePropagator#publishWithAckTarget}'s own doc for
+	 * exact semantics -- the short version: {@code writeAcks == 0} returns
+	 * as soon as the write is durably persisted on this node (broadcast
+	 * still fires, just not waited on); {@code writeAcks > 0} waits for
+	 * that many peer responses (capped at however many are connected) or
+	 * {@link #WRITE_ACKS_TIMEOUT_MS}, whichever comes first, but never
+	 * fails the statement on a timeout. Left unconfigured (the default,
+	 * {@code writeAcks == -1}), this method touches nothing extra and
+	 * publication behaves exactly as it did before this feature existed.
+	 *
+	 * <p><b>Found live 2026-08-25</b>: the ack-target logic used to apply
+	 * unconditionally, the same as the {@code sync()} call itself -- but
+	 * unlike a no-op {@code sync()} (genuinely cheap on an unchanged
+	 * cursor, per this method's own original doc above), a configured
+	 * ack-target is NOT cheap for a no-op: {@code LatticePropagator.
+	 * publishWithAckTarget} decides whether to wait purely from {@code
+	 * minAcks > 0} and {@code snapshot.hasPeers()} -- neither checks
+	 * whether the value actually changed -- so a plain SELECT on a
+	 * connection with {@code WRITE_ACKS} configured still built a real
+	 * ack-tracked broadcast and blocked on a genuine peer round-trip,
+	 * exactly as if it had written something. Measured live: SELECT
+	 * latency on an {@code acks=1} connection jumped from ~400µs to
+	 * ~7ms -- the same order of magnitude as an actual acked write,
+	 * for a statement that never touched any data. {@code isQuery} scopes
+	 * the ack-target to genuine writes only; {@code sync()} itself still
+	 * runs unconditionally either way (still cheap for a no-op, and worth
+	 * keeping for the reasons in this method's own original doc).
+	 *
+	 * @param isQuery true if the statement that just ran was a read (e.g.
+	 *        a {@code SELECT}) -- skips configuring an ack target
+	 *        regardless of {@link #writeAcks}, since a read never has
+	 *        anything for a peer to acknowledge.
 	 */
-	private void syncIfAutoCommit() {
+	private void syncIfAutoCommit(boolean isQuery) {
 		if (!autoCommit) return;
+		boolean ackTargetSet = !isQuery && writeAcks >= 0;
+		if (ackTargetSet) {
+			NodeServer.setNextSyncAckTarget(writeAcks, WRITE_ACKS_TIMEOUT_MS);
+		}
 		try {
 			SQLDatabase db = findDatabase();
 			if (db != null) db.sync();
@@ -447,6 +527,15 @@ public class ConvexMeta extends CalciteMetaImpl {
 			// visible statement failure. Matches the tolerance shown
 			// elsewhere in this class and in DbaseServer's own peer-sync
 			// helpers for the same class of best-effort operation.
+		} finally {
+			// publishApplicationRoot already consumes+clears this the
+			// instant it reads it, but db.sync() can throw before ever
+			// reaching that point (e.g. findDatabase() itself failing) --
+			// clear defensively so a never-consumed target can't leak into
+			// a later, unrelated sync() on this same connection's thread.
+			if (ackTargetSet) {
+				NodeServer.clearNextSyncAckTarget();
+			}
 		}
 	}
 

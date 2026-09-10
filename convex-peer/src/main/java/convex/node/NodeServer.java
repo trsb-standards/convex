@@ -350,6 +350,7 @@ public class NodeServer<V extends ACell> implements Closeable {
 				p.setPersistenceEnabled(config.isPersist());
 				p.setMaxDeltaMessageSize(config.getMaxDeltaMessageSize());
 				p.setMaxDeltaBroadcastSize(config.getMaxDeltaBroadcastSize());
+				p.setMaxOutboundReferenceSize(config.getMaxInboundValueSize());
 			}
 
 			// Outbound sockets begin at the public/untrusted cap. Their connection manager
@@ -1393,6 +1394,30 @@ public class NodeServer<V extends ACell> implements Closeable {
 	 * the dispatcher thread, bounding merge cost from untrusted peers. {@code getMemorySize}
 	 * is cached (computed at decode), so this is O(1). Package-visible for testing.
 	 *
+	 * <p>Found + reverted live 2026-08-25: a possession-aware short-circuit was tried
+	 * here (skip the size check if {@code store.refForHash(value.getHash())} already
+	 * found the value locally), aimed at an unscoped peer's periodic root sync (see
+	 * {@code LatticePropagator.maybePerformRootSync}) repeatedly failing this guard on
+	 * a peer that had, in fact, already fully caught up. It was tautologically true at
+	 * both of this method's real call sites: {@code NodeServer.completeLatticeMessage}
+	 * unconditionally {@code Cells.persist}s the inbound value into this same store
+	 * one line before calling this method, and the {@code acquired} dispatch path
+	 * (this method's other caller) only ever reaches it after {@code Acquiror} has
+	 * already durably fetched-and-stored every missing cell -- so by the time either
+	 * caller's value reaches this check, it has *always* just been written to this
+	 * store, "already possessed" or not. The short-circuit therefore always fired,
+	 * silently disabling this guard for every inbound value, not just genuinely
+	 * already-caught-up ones -- caught by
+	 * {@code LatticePropagatorTest.testUnscopedRootSyncDecomposesByTopLevelKeySoOneOversizedEntryDoesNotBlockOthers},
+	 * whose oversized sibling entry stopped being rejected at all. Reverted rather than
+	 * threading a pre-persist possession flag through both call sites: the per-top-level-key
+	 * decomposition this guard's own incident motivated ({@code sendUnscopedRootSync})
+	 * already isolates one oversized entry from its siblings, which was the actual live
+	 * incident (accumulated size across every hosted database, not one database alone
+	 * exceeding the limit) -- a single entry that is itself oversized, even if the peer
+	 * already holds it from an earlier sync, is a narrower residual gap than this
+	 * short-circuit's own blast radius justified fixing here.
+	 *
 	 * @param value inbound value (may be null)
 	 * @return true if the value may be merged, false if it is too large
 	 */
@@ -2086,13 +2111,56 @@ public class NodeServer<V extends ACell> implements Closeable {
 		propagators.add(propagator);
 	}
 
+	/**
+	 * Per-thread override for how many peer acknowledgements the primary
+	 * propagator's next {@link #publishApplicationRoot} should wait for --
+	 * an opt-in escape hatch from this class's own default, fully
+	 * synchronous broadcast, so a caller (e.g. dbase's own autocommit SQL
+	 * layer) can trade durability guarantees for latency on a per-call
+	 * basis without changing this class's default behavior for every other
+	 * caller. See {@link LatticePropagator#publishWithAckTarget} for exact
+	 * semantics of {@code minAcks}/{@code timeoutMs}.
+	 *
+	 * <p>Unset (the default, and the state after every publish, successful
+	 * or not): {@code publishApplicationRoot} calls {@link
+	 * LatticePropagator#processSnapshot} exactly as before this feature
+	 * existed -- fully synchronous announce+persist+broadcast, unchanged.
+	 */
+	private static final ThreadLocal<AckTarget> PENDING_ACK_TARGET = new ThreadLocal<>();
+
+	private record AckTarget(int minAcks, long timeoutMs) {}
+
+	/**
+	 * Configures how many peer acknowledgements the next {@code sync()} on
+	 * this thread should wait for, instead of blocking for a full
+	 * synchronous broadcast to every peer. Consumed and cleared
+	 * automatically by that next publish -- callers do not need to clear it
+	 * themselves on the success path, only if they decide not to publish
+	 * after all (see {@link #clearNextSyncAckTarget}).
+	 *
+	 * @param minAcks Minimum peer responses to wait for (0 = don't wait for any)
+	 * @param timeoutMs Maximum time to wait for those responses
+	 */
+	public static void setNextSyncAckTarget(int minAcks, long timeoutMs) {
+		PENDING_ACK_TARGET.set(new AckTarget(minAcks, timeoutMs));
+	}
+
+	/** Clears a pending {@link #setNextSyncAckTarget} that was never consumed by a sync. */
+	public static void clearNextSyncAckTarget() {
+		PENDING_ACK_TARGET.remove();
+	}
+
 	private V publishApplicationRoot(V value) {
 		if (propagators.isEmpty()) {
 			throw new IllegalStateException("NodeServer has no primary publication pipeline");
 		}
+		AckTarget ackTarget = PENDING_ACK_TARGET.get();
+		if (ackTarget != null) PENDING_ACK_TARGET.remove();
 		ACell announced;
 		try {
-			announced=propagators.get(0).processSnapshot(value);
+			announced = (ackTarget != null)
+				? propagators.get(0).publishWithAckTarget(value, ackTarget.minAcks(), ackTarget.timeoutMs())
+				: propagators.get(0).processSnapshot(value);
 		} catch (IOException e) {
 			throw new StoreException("NodeServer sync failed: persistence error",e);
 		}

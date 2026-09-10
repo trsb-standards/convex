@@ -374,11 +374,12 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	 * (an auto-generating composite key has no sensible definition in any
 	 * SQL database), and that column must be {@link ConvexType#INTEGER} —
 	 * {@code AutoIncrementCounters} generates plain 64-bit sequential
-	 * values, not arbitrary-precision or string keys. Combining {@code
-	 * versioned} and {@code autoIncrement} on the same table is out of
-	 * scope for now (not needed by anything using this yet) — not rejected
-	 * outright, but untested; callers wanting both should treat it as
-	 * unsupported.
+	 * values, not arbitrary-precision or string keys. {@code versioned} and
+	 * {@code autoIncrement} on the same table IS supported: a generated pk
+	 * is claimed and written through {@link
+	 * VersionedSQLTable#insertRowVersionedIfAbsent} /
+	 * {@link VersionedSQLTable#insertRowVersioned}, so each auto-generated
+	 * row still gets its {@code CT_INSERT} {@code _HISTORY} entry.
 	 */
 	@SuppressWarnings({"unchecked", "rawtypes"})
 	public boolean createTable(AString name, String[] columns, ConvexColumnType[] types, int pkCount,
@@ -568,7 +569,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	public boolean insert(AString tableName, AVector<ACell> row) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
-		if (!(table instanceof VersionedSQLTable) && AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
+		if (AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
 			return insertAutoIncrement(table, tableName, row);
 		}
 		if (table instanceof VersionedSQLTable vt) {
@@ -600,12 +601,20 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	 * to silently retry past).
 	 */
 	private boolean insertAutoIncrement(SQLTable table, AString tableName, AVector<ACell> row) {
+		// A versioned + auto-increment table claims/writes through the
+		// history-recording path (insertRowVersionedIfAbsent /
+		// insertRowVersioned) instead of the plain SQLTable one, so its
+		// _HISTORY still gets a CT_INSERT entry per generated row.
+		VersionedSQLTable vt = (table instanceof VersionedSQLTable v) ? v : null;
 		if (row.get(0) == null) {
 			while (true) {
 				long candidate = AutoIncrementCounters.nextCandidate(this, tableName);
 				AVector<ACell> candidateRow = row.assoc(0, CVMLong.create(candidate));
 				ABlob pk = toKey(CVMLong.create(candidate));
-				if (table.insertRowIfAbsent(pk, candidateRow, now())) return true;
+				boolean claimed = (vt != null)
+					? vt.insertRowVersionedIfAbsent(pk, candidateRow, millis())
+					: table.insertRowIfAbsent(pk, candidateRow, now());
+				if (claimed) return true;
 				// Slot claimed by something else (e.g. a peer's write merged
 				// in since we last observed this table) -- retry with a fresh candidate.
 			}
@@ -614,7 +623,9 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 			AutoIncrementCounters.recordValue(this, tableName, explicit.longValue());
 		}
 		ABlob pk = toKey(row.get(0));
-		return table.insertRow(pk, row, now());
+		return (vt != null)
+			? vt.insertRowVersioned(pk, row, millis())
+			: table.insertRow(pk, row, now());
 	}
 
 	/** Inserts a row with auto-conversion from Java types. First value is primary key. */
@@ -641,7 +652,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (rows == null || rows.isEmpty()) return 0;
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return 0;
-		if (!(table instanceof VersionedSQLTable) && AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
+		if (AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
 			// Auto-increment generation needs per-row atomic claim-and-retry
 			// (see insertAutoIncrement's own doc) -- doesn't fit this
 			// method's single-batch-write optimization, so an auto-increment
@@ -837,10 +848,10 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	public boolean convertToAutoIncrement(AString tableName) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
-		if (table instanceof VersionedSQLTable) {
-			throw new UnsupportedOperationException(
-				"Cannot make a versioned table auto-increment — not supported together in this pass");
-		}
+		// Versioned + auto-increment is supported: the flag is a pure
+		// AutoIncrementRegistry marker regardless, and SQLSchema.insert's
+		// auto-increment path routes a VersionedSQLTable through the
+		// history-recording claim/write methods.
 		if (AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) return true; // already, no-op
 
 		int pkCount = SQLTable.getPkCount(table.getState());

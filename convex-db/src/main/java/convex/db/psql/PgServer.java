@@ -47,6 +47,7 @@ public class PgServer {
 	private final String database;
 	private final String password;
 	private final Function<String, Connection> connectionSupplier;
+	private final Function<String, Long> ucanPrincipalResolver;
 
 	private EventLoopGroup bossGroup;
 	private EventLoopGroup workerGroup;
@@ -57,6 +58,7 @@ public class PgServer {
 		this.port = builder.port;
 		this.database = builder.database;
 		this.password = builder.password;
+		this.ucanPrincipalResolver = builder.ucanPrincipalResolver;
 
 		if (builder.connectionSupplier != null) {
 			this.connectionSupplier = builder.connectionSupplier;
@@ -101,7 +103,7 @@ public class PgServer {
 					protected void initChannel(SocketChannel ch) {
 						ch.pipeline().addLast(
 							new PgMessageDecoder(),
-							new PgProtocolHandler(connectionSupplier, password)
+							new PgProtocolHandler(connectionSupplier, password, ucanPrincipalResolver)
 						);
 					}
 				})
@@ -227,6 +229,7 @@ public class PgServer {
 		private String database = "convex";
 		private String password = null;
 		private Function<String, Connection> connectionSupplier = null;
+		private Function<String, Long> ucanPrincipalResolver = null;
 
 		/**
 		 * Sets the port to listen on. Default is 5432.
@@ -260,6 +263,19 @@ public class PgServer {
 		 */
 		public Builder connectionSupplier(Function<String, Connection> supplier) {
 			this.connectionSupplier = supplier;
+			return this;
+		}
+
+		/**
+		 * Enables UCAN bearer-token authentication: the client sends a
+		 * JWT-encoded UCAN in the password slot; the server verifies it
+		 * ({@code did:key} signature + temporal bounds + proof chain) and
+		 * calls this function with the issuer DID to resolve an application
+		 * principal id (return null to reject the connection). If not set,
+		 * the {@link #password}/trust behaviour is used.
+		 */
+		public Builder ucanPrincipalResolver(Function<String, Long> resolver) {
+			this.ucanPrincipalResolver = resolver;
 			return this;
 		}
 

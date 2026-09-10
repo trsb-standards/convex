@@ -10,6 +10,16 @@ public final class PgType {
 
 	private PgType() {}
 
+	/**
+	 * Milliseconds between the Unix epoch (1970-01-01) and the PostgreSQL
+	 * binary epoch (2000-01-01) that binary-format {@code timestamp}/{@code
+	 * timestamptz} values are counted from (as microseconds). Shared between
+	 * {@code PgProtocolHandler.bindBinaryValue} (decoding an inbound bound
+	 * parameter) and {@code DataRow}'s own binary encoding (the outbound
+	 * counterpart) so the two conversions can't drift apart.
+	 */
+	public static final long BINARY_EPOCH_MILLIS = 946684800000L;
+
 	// Numeric types
 	public static final int BOOL = 16;
 	public static final int BYTEA = 17;

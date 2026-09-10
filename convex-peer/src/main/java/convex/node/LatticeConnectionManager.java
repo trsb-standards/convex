@@ -443,11 +443,39 @@ public class LatticeConnectionManager extends AConnectionManager {
 	// ========== Broadcast Scope ==========
 
 	/**
+	 * Clears any previously declared scope for this peer. {@link
+	 * #addPeerScope} deliberately accumulates across calls WITHIN one
+	 * registration (several paths for one peer, declared one call at a
+	 * time) -- but that same accumulation is wrong ACROSS independent
+	 * registrations: a peer that re-registers (e.g. every process restart)
+	 * with a smaller, corrected scope must not keep the larger, stale scope
+	 * from its previous registration layered underneath the new one.
+	 *
+	 * <p>Found live 2026-08-25: a peer's own {@code Dbnode} catalog link
+	 * was corrected (a stale whole-db link removed) and it re-registered
+	 * with the now-correctly-narrower scope -- but the peer kept receiving
+	 * broadcasts for the schema that should have dropped out, because nothing
+	 * ever cleared its first registration's scope entries first. Callers
+	 * that re-derive a peer's full scope on every registration (e.g. {@code
+	 * DbaseServer.onRegisterPeer}) should call this immediately before their
+	 * own {@link #addPeerScope} calls.
+	 *
+	 * @param peerKey AccountKey of the peer to clear scope for
+	 */
+	public void clearPeerScope(AccountKey peerKey) {
+		if (peerKey == null) return;
+		peerScopes.remove(peerKey);
+	}
+
+	/**
 	 * Declares that broadcasts to this peer should only ever cover the given
 	 * lattice path, in addition to any paths already declared for it — never
 	 * the full root. Call once per path a peer is actually entitled to (e.g.
 	 * once per database/schema it has genuinely pulled); repeated calls for
-	 * different paths accumulate rather than replace.
+	 * different paths accumulate rather than replace within one registration
+	 * — call {@link #clearPeerScope} first if this is a fresh registration
+	 * that should replace, not add to, whatever this peer was scoped to
+	 * before.
 	 *
 	 * <p>A peer with no declared scope keeps receiving the full, unscoped
 	 * root on every broadcast — this call is what opts a peer out of that

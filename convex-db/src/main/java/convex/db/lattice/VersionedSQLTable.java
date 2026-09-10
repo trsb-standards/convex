@@ -199,6 +199,52 @@ public class VersionedSQLTable extends SQLTable {
 	}
 
 	/**
+	 * Atomic "insert only if this pk isn't already live" — the versioned
+	 * counterpart to {@link SQLTable#insertRowIfAbsent}, used by
+	 * auto-increment pk generation on a versioned table (see {@code
+	 * SQLSchema.insertAutoIncrement}). Unlike {@link #insertRowVersioned},
+	 * an already-live pk is a no-op returning {@code false} (the caller
+	 * retries with a fresh candidate) rather than an UPDATE. On success,
+	 * writes the row and appends a {@code CT_INSERT} history entry, exactly
+	 * as {@link #insertRowVersioned} does for a genuinely new key.
+	 *
+	 * @param pk             Primary key blob
+	 * @param values         Full row values vector
+	 * @param milliTimestamp Wall-clock timestamp for LWW conflict resolution
+	 * @return true if the row was written; false if the slot was already live
+	 */
+	@SuppressWarnings("unchecked")
+	public boolean insertRowVersionedIfAbsent(ABlob pk, AVector<ACell> values, CVMLong milliTimestamp) {
+		boolean[] inserted = {false};
+		cursor.updateAndGet(state -> {
+			if (!isLiveState(state)) return state;
+
+			Index<ABlob, ACell> rows = rowsFrom(state);
+			ABlob bk = RowBlock.blockKey(pk);
+			ACell block = rows.get(bk);
+			AVector<ACell> existing = RowBlock.get(block, pk);
+			if (existing != null && SQLRow.isLive(existing)) {
+				inserted[0] = false;
+				return state; // slot occupied -- no-op, caller retries with a new candidate
+			}
+
+			rows = rows.assoc(bk, RowBlock.put(block, pk, SQLRow.create(values, milliTimestamp)));
+			long liveCount = getLiveCount(state) + 1;
+
+			long writeSeq = nextHistorySeq();
+			Index<ABlob, AVector<ACell>> history = historyFrom(state);
+			history = history.assoc(
+				HistoryKey.of(pk, writeSeq),
+				Vectors.of(SQLRow.encodeValues(values), CVMLong.create(writeSeq), CVMLong.create(CT_INSERT))
+			);
+
+			inserted[0] = true;
+			return buildState(state.get(POS_SCHEMA), rows, milliTimestamp, CVMLong.create(liveCount), history);
+		});
+		return inserted[0];
+	}
+
+	/**
 	 * Batch-inserts pre-sorted rows with history tracking in a single atomic update.
 	 *
 	 * <p>Applies the same block-grouping optimisation as {@link SQLTable#insertRows}

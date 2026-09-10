@@ -2451,6 +2451,45 @@ public class NodeServerTest {
 	}
 
 	/**
+	 * Found live 2026-08-25: {@code addPeerScope} deliberately accumulates
+	 * across calls (several paths for one registration) -- but a peer that
+	 * re-registers (e.g. every process restart) with a smaller, corrected
+	 * scope must not keep the larger, stale scope from its first
+	 * registration layered underneath the new one. A live incident traced
+	 * to exactly this: a peer's Dbnode link was corrected to drop an
+	 * oversized, unrelated database, the peer re-registered with the
+	 * now-correctly-narrower scope, but kept receiving broadcasts for the
+	 * dropped database anyway, because nothing had ever cleared its first
+	 * registration's scope entries. {@code clearPeerScope} is the fix --
+	 * confirms it actually empties the accumulated set rather than, say,
+	 * only affecting entries added after it's called.
+	 */
+	@Test
+	public void testClearPeerScopeRemovesAccumulatedEntriesFromAnEarlierRegistration() throws IOException, InterruptedException {
+		ALattice<AInteger> lattice = MaxLattice.create();
+		maxNodeServer = new NodeServer<>(lattice, store);
+		maxNodeServer.launch();
+
+		LatticeConnectionManager cm = maxNodeServer.getPropagator().getConnectionManager();
+		AccountKey peerKey = AKeyPair.generate().getAccountKey();
+
+		// First "registration": accumulates two scoped regions.
+		cm.addPeerScope(peerKey, Strings.create("meta"));
+		cm.addPeerScope(peerKey, Strings.create("bench"));
+		assertEquals(2, cm.getPeerScope(peerKey).size(), "sanity: addPeerScope accumulates within one registration");
+
+		// A re-registration must fully replace, not layer on top of, the
+		// stale scope -- clear first, exactly as DbaseServer.onRegisterPeer
+		// now does before its own addPeerScope calls.
+		cm.clearPeerScope(peerKey);
+		assertTrue(cm.getPeerScope(peerKey).isEmpty(), "clearPeerScope must remove every previously accumulated entry");
+
+		cm.addPeerScope(peerKey, Strings.create("meta"));
+		assertEquals(1, cm.getPeerScope(peerKey).size(),
+			"re-registration's scope must be exactly what it declares -- the stale 'bench' entry must not reappear");
+	}
+
+	/**
 	 * Outbound peer connections start at the public cap and receive the larger tier
 	 * only when the live endpoint has proved the AccountKey used for its manager slot.
 	 */

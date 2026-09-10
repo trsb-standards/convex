@@ -18,6 +18,7 @@ import convex.core.Result;
 import convex.core.cpos.CPoSConstants;
 import convex.core.data.AccountKey;
 import convex.core.data.ACell;
+import convex.core.data.AMap;
 import convex.core.data.AVector;
 import convex.core.data.Blob;
 import convex.core.data.Cells;
@@ -84,6 +85,19 @@ public class LatticePropagator implements Closeable {
 	public static final long ROOT_SYNC_INTERVAL = 30_000L;
 
 	/**
+	 * How long a single root-sync send to one peer waits for that peer's
+	 * response before treating the attempt as failed, for backoff purposes.
+	 * Bounded and modest -- this runs on the propagator's own background
+	 * thread, never a client-facing one, so briefly blocking it here is
+	 * safe, but an unbounded or overly generous wait would still delay this
+	 * thread's other duties (draining {@link #triggerQueue}) for no benefit.
+	 */
+	private static final long ROOT_SYNC_ACK_TIMEOUT_MS = 3_000L;
+
+	/** Backoff ceiling for a peer that keeps failing root sync (milliseconds). */
+	private static final long ROOT_SYNC_MAX_BACKOFF = 10 * 60_000L;
+
+	/**
 	 * Store for delta tracking (novelty detection via announce), persistence
 	 * (setRootData), and peer data resolution. Missing data requests for an announced
 	 * value should be routed here.
@@ -140,6 +154,32 @@ public class LatticePropagator implements Closeable {
 	/** Maximum combined encoded bodies materialised for one eager delta broadcast. */
 	private volatile int maxDeltaBroadcastSize = NodeConfig.DEFAULT_MAX_DELTA_BROADCAST_SIZE;
 
+	/**
+	 * Logical size ceiling (bytes, via {@link ACell#getMemorySize}) for a single
+	 * top-level entry {@link #sendUnscopedRootSync} will reference during
+	 * periodic root sync. Defaults to this node's own {@code
+	 * NodeConfig#getMaxInboundValueSize()} (wired by {@code NodeServer}, same
+	 * pattern as {@link #maxDeltaMessageSize}) -- a reasonable proxy for what
+	 * most peers will actually accept, since nodes in a fleet typically share
+	 * the same default.
+	 *
+	 * <p>Found live 2026-08-25: sending an indirect reference to a schema that
+	 * will obviously be rejected for size anyway still makes the receiver walk
+	 * its full {@code Acquiror}/DATA_REQUEST acquisition path for it first --
+	 * {@code NodeServer.withinInboundSizeLimit} only runs *after* acquisition
+	 * completes. Fetching an 11MB+ value in that many-chunk exchange, over and
+	 * over on every periodic sync tick to an oversized schema, is exactly the
+	 * kind of high-volume, multi-message-per-second traffic that surfaced a
+	 * separate, still-not-fully-root-caused decode/framing corruption on a
+	 * freshly (re)established connection (see this project's own live
+	 * incident notes) -- checking size on the SENDING side, before ever
+	 * referencing the data at all, means acquisition for an obviously
+	 * oversized entry is never attempted in the first place, sidestepping
+	 * that failure mode entirely rather than chasing it deeper into the
+	 * acquisition layer.
+	 */
+	private volatile long maxOutboundReferenceSize = Long.MAX_VALUE;
+
 	/** Whether root publication has changed the persistent store since its last checkpoint. */
 	private boolean dirty;
 
@@ -167,9 +207,60 @@ public class LatticePropagator implements Closeable {
 	private volatile long lastBroadcastTime = 0L;
 
 	/**
-	 * Timestamp of last root sync broadcast (background thread only).
+	 * Timestamp of last root sync broadcast (background thread only). Kept
+	 * for {@link #getLastRootSyncTime()}'s existing observability contract
+	 * (tracks the most recent round across every peer); the actual per-peer
+	 * due/backoff decision is {@link #rootSyncState} below, not this field.
 	 */
 	private long lastRootSyncTime = 0L;
+
+	/**
+	 * Per-peer root-sync scheduling state -- when a peer is next due for a
+	 * sync attempt, and how many consecutive attempts have failed.
+	 *
+	 * <p>Found live 2026-08-25: the pre-existing design used a single,
+	 * propagator-wide {@link #lastRootSyncTime} with no per-peer memory of
+	 * outcome at all, so a peer that had just rejected an oversized sync
+	 * (see the fix on {@code NodeServer.withinInboundSizeLimit} and {@link
+	 * #sendUnscopedRootSync}) was retried at the exact same fixed interval
+	 * as a healthy one, forever -- turning what should have been a
+	 * self-limiting or self-resolving issue into a sustained, silent
+	 * failure loop for the life of the process. Background thread only, so
+	 * plain (unsynchronized) mutable fields on {@link PeerSyncState} are
+	 * safe -- see that class's own doc.
+	 */
+	private final Map<AccountKey, PeerSyncState> rootSyncState = new java.util.concurrent.ConcurrentHashMap<>();
+
+	/**
+	 * Mutable scheduling state for one peer's root sync. Only ever read or
+	 * written from {@link #maybePerformRootSync}, which always runs on this
+	 * propagator's own single background thread (see {@link
+	 * #propagationLoop}) -- never concurrently with itself -- so plain
+	 * fields (no {@code volatile}/atomics) are sufficient; only the owning
+	 * {@link #rootSyncState} map itself needs concurrent-safe structure,
+	 * for the (background-thread-only) {@code computeIfAbsent} pattern.
+	 */
+	private static final class PeerSyncState {
+		long nextAttemptTime = 0L;
+		int consecutiveFailures = 0;
+
+		boolean dueFor(long now) {
+			return now >= nextAttemptTime;
+		}
+
+		void recordSuccess(long now) {
+			consecutiveFailures = 0;
+			nextAttemptTime = now + ROOT_SYNC_INTERVAL;
+		}
+
+		void recordFailure(long now) {
+			consecutiveFailures++;
+			// Exponential backoff, capped: INTERVAL, 2x, 4x, ... up to the ceiling.
+			long backoff = ROOT_SYNC_INTERVAL << Math.min(consecutiveFailures, 10);
+			if (backoff < 0 || backoff > ROOT_SYNC_MAX_BACKOFF) backoff = ROOT_SYNC_MAX_BACKOFF;
+			nextAttemptTime = now + backoff;
+		}
+	}
 
 	/**
 	 * Count of broadcasts sent. Atomic because both the caller's thread and
@@ -289,6 +380,22 @@ public class LatticePropagator implements Closeable {
 
 	public int getMaxDeltaBroadcastSize() {
 		return maxDeltaBroadcastSize;
+	}
+
+	/**
+	 * Configures the logical size ceiling for a single top-level entry
+	 * referenced during periodic root sync (see {@link
+	 * #maxOutboundReferenceSize}'s own doc for why this exists).
+	 */
+	public void setMaxOutboundReferenceSize(long limit) {
+		if (limit < 1) {
+			throw new IllegalArgumentException("Max outbound reference size must be positive: " + limit);
+		}
+		this.maxOutboundReferenceSize = limit;
+	}
+
+	public long getMaxOutboundReferenceSize() {
+		return maxOutboundReferenceSize;
 	}
 
 	// ========== Accessors ==========
@@ -427,6 +534,7 @@ public class LatticePropagator implements Closeable {
 		running = true;
 		lastBroadcastTime = 0L;
 		lastRootSyncTime = 0L;
+		rootSyncState.clear();
 		broadcastCount.set(0L);
 
 		propagationThread = new Thread(this::propagationLoop, "Lattice propagator thread");
@@ -619,52 +727,200 @@ public class LatticePropagator implements Closeable {
 	 * @throws IOException If announce or root publication fails
 	 */
 	public ACell processSnapshot(ACell value) throws IOException {
-		CompletableFuture<ACell> announceFuture;
+		AnnouncedSnapshot snapshot;
 		synchronized (writeLock) {
-			// Primary input is already authoritative. A secondary instead keeps its
-			// established view as own, preserving local refs and pending inbound values.
-			if ((workingCursor != null) && !primary && (lattice != null)) {
-				value = lattice.merge(mergeContext, workingCursor.get(), value);
-			}
-
-			// Filtering is outbound-only: pending inbound state participates in the
-			// reconciliation above, then projection precedes every outbound operation.
-			value = filter.filter(value);
-			if (value == null) throw new IllegalArgumentException("Lattice filter returned null");
-
-			// 1. Announce to store (writes cells, collects novelty for delta)
-			boolean hasPeers=!connectionManager.getPeers().isEmpty();
-			Cells.NoveltyCollector noveltyCollector=hasPeers
-				?new Cells.NoveltyCollector(maxDeltaBroadcastSize):null;
-			value = Cells.announce(value, noveltyCollector, store);
-			if (workingCursor == null) {
-				workingCursor = Cursors.createLattice(lattice, value, mergeContext);
-			} else {
-				workingCursor.set(value);
-			}
-
-			// 2. Set root data for restore (if persist enabled)
-			if (persistenceEnabled) {
-				store.setRootData(value);
-				dirty = true;
-			}
-
-			announcedCursor.set(value);
-			announceFuture = nextAnnounceFuture;
-			nextAnnounceFuture = new CompletableFuture<>();
+			snapshot = announceAndPersist(value);
 
 			// 3. Broadcast to peers. Background triggers are already coalesced by
 			// LatestUpdateQueue; an explicitly processed snapshot must not be dropped.
-			if (hasPeers) {
+			if (snapshot.hasPeers()) {
 				try {
-					broadcastToPeers(value, noveltyCollector.getCells());
+					broadcastToPeers(snapshot.value(), snapshot.novelty());
 				} catch (RuntimeException e) {
 					log.warn("Unable to encode or queue lattice delta; periodic root sync will retry",e);
 				}
 			}
 		}
+		return snapshot.value();
+	}
+
+	/**
+	 * Result of the announce+persist portion of {@link #processSnapshot}'s
+	 * pipeline (its steps 1-2) — the announced, store-backed value; whether
+	 * any peers are currently connected (so a caller knows whether
+	 * broadcasting is even meaningful); and the collected novelty (cells
+	 * newly announced this call), needed to build a delta for broadcast.
+	 */
+	private record AnnouncedSnapshot(ACell value, boolean hasPeers, ArrayList<ACell> novelty) {}
+
+	/**
+	 * Runs steps 1-2 of {@link #processSnapshot}'s pipeline (announce to
+	 * store, set root data) and completes this call's {@link #nextAnnounce()}
+	 * future -- but does not broadcast. Extracted so {@link
+	 * #publishWithAckTarget} can do the same local, durable announce+persist
+	 * work synchronously while deferring or bounding the broadcast step
+	 * separately (see that method's own doc for why).
+	 *
+	 * <p>Must be called with {@link #writeLock} held -- same requirement
+	 * {@link #processSnapshot} itself already had for this work, now just
+	 * factored out rather than inlined.
+	 *
+	 * @param value Snapshot to process (must not be null)
+	 * @return The announced snapshot plus peer/novelty info for broadcast
+	 * @throws IOException If announce or root publication fails
+	 */
+	private AnnouncedSnapshot announceAndPersist(ACell value) throws IOException {
+		// Primary input is already authoritative. A secondary instead keeps its
+		// established view as own, preserving local refs and pending inbound values.
+		if ((workingCursor != null) && !primary && (lattice != null)) {
+			value = lattice.merge(mergeContext, workingCursor.get(), value);
+		}
+
+		// Filtering is outbound-only: pending inbound state participates in the
+		// reconciliation above, then projection precedes every outbound operation.
+		value = filter.filter(value);
+		if (value == null) throw new IllegalArgumentException("Lattice filter returned null");
+
+		// 1. Announce to store (writes cells, collects novelty for delta)
+		boolean hasPeers=!connectionManager.getPeers().isEmpty();
+		Cells.NoveltyCollector noveltyCollector=hasPeers
+			?new Cells.NoveltyCollector(maxDeltaBroadcastSize):null;
+		value = Cells.announce(value, noveltyCollector, store);
+		if (workingCursor == null) {
+			workingCursor = Cursors.createLattice(lattice, value, mergeContext);
+		} else {
+			workingCursor.set(value);
+		}
+
+		// 2. Set root data for restore (if persist enabled)
+		if (persistenceEnabled) {
+			store.setRootData(value);
+			dirty = true;
+		}
+
+		announcedCursor.set(value);
+		CompletableFuture<ACell> announceFuture = nextAnnounceFuture;
+		nextAnnounceFuture = new CompletableFuture<>();
 		announceFuture.complete(value);
-		return value;
+
+		ArrayList<ACell> novelty = hasPeers ? noveltyCollector.getCells() : null;
+		return new AnnouncedSnapshot(value, hasPeers, novelty);
+	}
+
+	/**
+	 * Publishes a snapshot the same way {@link #processSnapshot} does for
+	 * its announce+persist steps (synchronous, local, durable -- unchanged),
+	 * but bounds how much of the broadcast step this call actually waits
+	 * for, rather than always blocking the caller until every connected
+	 * peer's send has been attempted.
+	 *
+	 * <p>Built to let a synchronous, client-facing caller (e.g. dbase's own
+	 * {@code ConvexMeta.syncIfAutoCommit}) choose a durability/latency
+	 * tradeoff per call, instead of always paying full ambient-broadcast
+	 * latency for every write regardless of whether the caller needed that
+	 * guarantee. Mirrors how Convex's own CPoS consensus layer never blocks
+	 * a processing thread on peer network I/O -- the difference here is
+	 * this method lets the caller opt back into waiting, up to a bound,
+	 * rather than always reporting success only once a background loop
+	 * reports finality.
+	 *
+	 * <p>{@code minAcks <= 0}: fire the broadcast and return immediately
+	 * once locally persisted -- the broadcast itself is still attempted
+	 * (queued via the same {@link #triggerBroadcast} mechanism already used
+	 * for secondary propagators, so it still runs promptly on this
+	 * propagator's own background thread), but this call never waits on it.
+	 *
+	 * <p>{@code minAcks > 0}: waits (outside any lock -- see below) until at
+	 * least {@code min(minAcks, connectedPeerCount)} peers have returned a
+	 * response for this specific broadcast, or {@code timeoutMs} elapses,
+	 * whichever comes first. "Responded" means the peer's own {@code
+	 * NodeServer.processLatticeValue} handler completed and replied -- a
+	 * rejected merge counts as a response (the peer definitely processed
+	 * this delta, even if it declined to apply it), a hung or unreachable
+	 * peer does not. A peer count below what's connected right now is not
+	 * an error: {@code minAcks} is a request, not a guarantee, and this
+	 * method never throws on a timeout -- it returns the announced value
+	 * regardless, matching this class's established best-effort tolerance
+	 * for broadcast-step failures elsewhere.
+	 *
+	 * <p>Only tracks acks for peers reachable via the single-message delta
+	 * path (the ordinary case for an SQL-statement-sized write). A delta too
+	 * large to fit in one message falls back to the untracked, chunked
+	 * {@link #sendBoundedDelta} path for those peers -- correct (never a
+	 * false-positive ack), just not counted, so a caller asking for more
+	 * acks than can be tracked simply times out rather than getting a
+	 * dishonest result.
+	 *
+	 * @param value Snapshot to publish (must not be null)
+	 * @param minAcks Minimum number of peer responses to wait for (0 = don't wait at all)
+	 * @param timeoutMs Maximum time to wait for those responses
+	 * @return The announced (store-backed) value
+	 * @throws IOException If announce or root publication fails
+	 */
+	public ACell publishWithAckTarget(ACell value, int minAcks, long timeoutMs) throws IOException {
+		AnnouncedSnapshot snapshot;
+		List<CompletableFuture<Result>> ackFutures = List.of();
+		synchronized (writeLock) {
+			snapshot = announceAndPersist(value);
+			if (snapshot.hasPeers()) {
+				if (minAcks > 0) {
+					ackFutures = broadcastToPeersWithAcks(snapshot.value(), snapshot.novelty());
+				} else {
+					// No caller is waiting: send the same way processSnapshot's
+					// own default path already does -- synchronous,
+					// non-blocking trySend, still inside this lock acquisition.
+					//
+					// Deliberately NOT triggerBroadcast() (an earlier version
+					// of this method used it): that defers the send to the
+					// background propagation thread, which reprocesses the
+					// value through a *second*, redundant announceAndPersist
+					// (real disk persist, not free) and needs this same
+					// writeLock to do it. Under a tight back-to-back write
+					// loop, that pits the foreground thread (persisting row
+					// N+1) against the background thread (re-persisting row N
+					// before it can finally broadcast) for the same lock --
+					// found live 2026-08-24: acks=0 measured *slower* than
+					// acks=2 because of exactly this self-inflicted
+					// contention, despite acks=2 doing strictly more work
+					// (an actual wait for real peer responses).
+					try {
+						broadcastToPeers(snapshot.value(), snapshot.novelty());
+					} catch (RuntimeException e) {
+						log.warn("Unable to encode or queue lattice delta; periodic root sync will retry",e);
+					}
+				}
+			}
+		}
+		if (minAcks > 0 && !ackFutures.isEmpty()) {
+			awaitAcks(ackFutures, minAcks, timeoutMs);
+		}
+		return snapshot.value();
+	}
+
+	/**
+	 * Waits for at least {@code minAcks} of the given futures to complete
+	 * (successfully or exceptionally -- either way, the peer responded),
+	 * capped at {@code futures.size()}, or until {@code timeoutMs} elapses.
+	 * Never throws on timeout -- see {@link #publishWithAckTarget}'s own doc
+	 * for why a caller asking for more acks than arrive in time still gets
+	 * its announced value back rather than an error.
+	 */
+	private void awaitAcks(List<CompletableFuture<Result>> futures, int minAcks, long timeoutMs) {
+		int target = Math.min(minAcks, futures.size());
+		if (target <= 0) return;
+		java.util.concurrent.atomic.AtomicInteger responded = new java.util.concurrent.atomic.AtomicInteger();
+		CompletableFuture<Void> reached = new CompletableFuture<>();
+		for (CompletableFuture<Result> f : futures) {
+			f.whenComplete((r, e) -> {
+				if (responded.incrementAndGet() >= target) reached.complete(null);
+			});
+		}
+		try {
+			reached.get(timeoutMs, TimeUnit.MILLISECONDS);
+		} catch (Exception e) {
+			log.debug("publishWithAckTarget: only {}/{} peers responded within {}ms",
+				responded.get(), target, timeoutMs);
+		}
 	}
 
 	// ========== Broadcast Scoping ==========
@@ -822,6 +1078,104 @@ public class LatticePropagator implements Closeable {
 		peerConnection.trySend(message);
 	}
 
+	/**
+	 * Ack-tracked counterpart to {@link #broadcastToPeers}, for {@link
+	 * #publishWithAckTarget}. Sends the identical scoped/unscoped delta to
+	 * every connected peer, but via {@link Convex#requestNonBlocking(Message)}
+	 * instead of {@link Convex#trySend(Message)} so each send's completion
+	 * (success or peer-side rejection -- either way, a response) is
+	 * observable.
+	 *
+	 * <p><b>Must use {@code requestNonBlocking}, not the ordinary {@link
+	 * Convex#request(Message)}</b> -- found live: {@code request()}'s send
+	 * path uses {@code AConnection.sendMessage}, documented to block with a
+	 * bounded timeout under backpressure, and this method runs inside
+	 * {@link #writeLock} (see {@link #publishWithAckTarget}'s own call
+	 * site). A blocking send there doesn't just slow this one write down --
+	 * it holds the sole-writer lock, stalling every other write on this
+	 * propagator for as long as the block lasts. Reproduced live under a
+	 * tight single-row insert benchmark loop with {@code SET WRITE_ACKS=2}:
+	 * the run never completed. {@code requestNonBlocking} uses {@code
+	 * AConnection.trySendMessage} instead (guaranteed non-blocking,
+	 * documented as such), matching every other send in this class.
+	 *
+	 * <p>Reuses the same 4-element {@code [tag, reserved-slot, path, value]}
+	 * LATTICE_VALUE payload shape every other sender in this class uses --
+	 * {@link Message#withID} fills the reserved slot with the correlation
+	 * ID {@code requestNonBlocking()} allocates, and {@code
+	 * NodeServer.processLatticeValue} already replies once that ID is
+	 * present (see its own doc: "completion is the acknowledgement"). No
+	 * wire-format change was needed for this.
+	 *
+	 * <p>Only tracks the single-message case (the ordinary size for an
+	 * SQL-statement-sized write) for unscoped peers -- a delta too large to
+	 * fit in one message falls back to the untracked, chunked {@link
+	 * #sendBoundedDelta} for those peers specifically. Correct either way
+	 * (never a false-positive ack), just not counted; see {@link
+	 * #publishWithAckTarget}'s own doc for why that's the right failure
+	 * mode. Scoped peers are always tracked -- their update is always one
+	 * small indirect-ref message, never chunked.
+	 *
+	 * @param value Full current root snapshot (store-backed)
+	 * @param novelty Cells newly announced this call
+	 * @return One future per peer this call could track
+	 */
+	private List<CompletableFuture<Result>> broadcastToPeersWithAcks(ACell value, ArrayList<ACell> novelty) {
+		Map<AccountKey, Convex> peers = connectionManager.getConnections();
+		List<CompletableFuture<Result>> acks = new ArrayList<>();
+		List<Convex> unscoped = new ArrayList<>();
+
+		for (Map.Entry<AccountKey, Convex> entry : peers.entrySet()) {
+			Convex peerConnection = entry.getValue();
+			if (peerConnection == null || !peerConnection.isConnected()) continue;
+
+			List<ACell[]> scope = connectionManager.getPeerScope(entry.getKey());
+			if (scope.isEmpty()) {
+				unscoped.add(peerConnection);
+			} else {
+				for (ACell[] path : scope) {
+					ACell subValue = RT.getIn(value, path);
+					if (subValue == null) continue;
+					AVector<ACell> pathVector = (path.length == 0) ? Vectors.empty() : Vectors.of((Object[]) path);
+					AVector<?> scopedPayload = Vectors.create(MessageTag.LATTICE_VALUE, null, pathVector, subValue);
+					Message message = Message.create(MessageType.LATTICE_VALUE, scopedPayload, scopedPayload.getEncoding());
+					acks.add(peerConnection.requestNonBlocking(message));
+				}
+			}
+		}
+
+		if (unscoped.isEmpty()) return acks;
+
+		novelty.removeIf(ACell::isEmbedded);
+		if (!value.isEmbedded()
+				&& (novelty.isEmpty() || !novelty.get(novelty.size() - 1).equals(value))) {
+			novelty.add(value);
+		}
+		AVector<ACell> emptyPath = Vectors.empty();
+		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, null, emptyPath, value);
+		ArrayList<ACell> delta = new ArrayList<>(novelty.size()+1);
+		delta.addAll(novelty);
+		delta.add(payload);
+
+		if (Format.getDeltaEncodingLength(delta) <= maxDeltaMessageSize) {
+			Blob deltaData = Format.encodeDelta(delta, maxDeltaMessageSize);
+			Message message = Message.create(MessageType.LATTICE_VALUE, payload, deltaData);
+			for (Convex peerConnection : unscoped) {
+				acks.add(peerConnection.requestNonBlocking(message));
+			}
+			lastBroadcastTime = Utils.getCurrentTimestamp();
+			broadcastCount.incrementAndGet();
+		} else {
+			// Too large to track acks for this call -- fall back to the
+			// ordinary chunked, untracked broadcast. novelty here is already
+			// preprocessed (embedded cells stripped, value appended);
+			// sendBoundedDelta's own identical preprocessing is idempotent
+			// against that, so passing it through is safe.
+			sendBoundedDelta(unscoped, value, novelty);
+		}
+		return acks;
+	}
+
 	// ========== Root Sync ==========
 
 	/**
@@ -832,9 +1186,21 @@ public class LatticePropagator implements Closeable {
 	 * this used to) to match {@link #createRootSyncMessage}'s own "use
 	 * whatever is currently store-backed" contract, which
 	 * {@code LatticePropagatorTest} exercises directly.
+	 *
+	 * <p>Each connected peer is scheduled independently via {@link
+	 * #rootSyncState} -- called every propagation-loop cycle, but a given
+	 * peer is only actually attempted once its own {@link
+	 * PeerSyncState#dueFor} fires, so a peer that just failed backs off
+	 * (see that class's own doc) without affecting any other peer's
+	 * ordinary {@link #ROOT_SYNC_INTERVAL} cadence. An unscoped peer's
+	 * sync is decomposed per top-level entry rather than sent as one
+	 * whole-root reference (see {@link #sendUnscopedRootSync}).
+	 *
+	 * <p>Package-visible for testing (same convention as {@code
+	 * NodeServer.withinInboundSizeLimit}) -- lets a test drive a sync
+	 * attempt directly instead of waiting a real {@link #ROOT_SYNC_INTERVAL}.
 	 */
-	private void maybePerformRootSync(long currentTime) {
-		if (currentTime < lastRootSyncTime + ROOT_SYNC_INTERVAL) return;
+	void maybePerformRootSync(long currentTime) {
 		if (connectionManager.getPeers().isEmpty()) return;
 
 		ACell value = announcedCursor.get();
@@ -842,29 +1208,129 @@ public class LatticePropagator implements Closeable {
 
 		try {
 			int sent = 0;
+			boolean anyAttempted = false;
 			for (Map.Entry<AccountKey, Convex> entry : connectionManager.getConnections().entrySet()) {
+				AccountKey peerKey = entry.getKey();
 				Convex peerConnection = entry.getValue();
 				if (peerConnection == null || !peerConnection.isConnected()) continue;
 
-				List<ACell[]> scope = connectionManager.getPeerScope(entry.getKey());
+				PeerSyncState state = rootSyncState.computeIfAbsent(peerKey, k -> new PeerSyncState());
+				if (!state.dueFor(currentTime)) continue;
+				anyAttempted = true;
+
+				List<ACell[]> scope = connectionManager.getPeerScope(peerKey);
+				boolean ok;
 				if (scope.isEmpty()) {
-					sendScopedUpdate(peerConnection, ROOT_PATH, value);
+					ok = sendUnscopedRootSync(peerConnection, value);
 					sent++;
 				} else {
+					ok = true;
 					for (ACell[] path : scope) {
 						ACell subValue = RT.getIn(value, path);
 						if (subValue != null) {
-							sendScopedUpdate(peerConnection, path, subValue);
+							ok &= sendScopedUpdateTracked(peerConnection, path, subValue);
 							sent++;
 						}
 					}
 				}
+				if (ok) state.recordSuccess(currentTime);
+				else state.recordFailure(currentTime);
 			}
-			lastRootSyncTime = currentTime;
-			rootSyncCount++;
-			log.debug("Sent root sync to {} peer path(s)", sent);
+			if (anyAttempted) {
+				lastRootSyncTime = currentTime;
+				rootSyncCount++;
+				log.debug("Sent root sync to {} peer path(s)", sent);
+			}
 		} catch (Exception e) {
 			log.warn("Error during root sync broadcast", e);
+		}
+	}
+
+	/**
+	 * Sends a periodic root sync to an unscoped peer -- one wanting
+	 * everything, as opposed to a peer with a declared narrow scope (see
+	 * {@link #sendScopedUpdateTracked}, used directly for those).
+	 *
+	 * <p>Found live 2026-08-25: referencing the entire root as a single
+	 * value (the original behaviour) meant this method's own inbound-size
+	 * guard on the receiving end (see {@code NodeServer.withinInboundSizeLimit})
+	 * judged the sync by the total size of <em>everything</em> this node
+	 * hosts, not by how much had actually changed since the peer's last
+	 * successful sync -- once accumulated data across every database
+	 * exceeded the receiver's inbound limit, every single periodic sync to
+	 * that peer failed, forever, with no way to self-resolve (the size only
+	 * grows). If the root is a map (true for every real dbase deployment --
+	 * {@code ConvexDB.DATABASE_MAP_LATTICE} keys by database name), this
+	 * decomposes it into one reference per top-level entry instead of one
+	 * reference to the whole thing -- each individual database's own size
+	 * is what gets checked, not the fleet-wide total, and an unchanged
+	 * database's reference is now recognised as already fully possessed
+	 * (see that same guard's companion fix) and never rejected for size at
+	 * all.
+	 *
+	 * <p>A single database that has itself grown past {@link
+	 * #maxOutboundReferenceSize} is never referenced at all -- found live
+	 * 2026-08-25: sending the reference anyway, relying entirely on the
+	 * receiver's own post-acquisition {@code withinInboundSizeLimit} guard,
+	 * meant the receiver still had to walk its full {@code Acquiror}/
+	 * DATA_REQUEST acquisition path for an 11MB+ value before ever reaching
+	 * that check -- repeated every sync interval, this many-message,
+	 * many-times-a-second exchange coincided with a still-not-fully-
+	 * root-caused decode/framing corruption observed live on freshly
+	 * (re)established connections. Checking size here, before referencing
+	 * the data at all, means that acquisition attempt is never made in the
+	 * first place. See {@link #maxOutboundReferenceSize}'s own doc.
+	 *
+	 * @return true if every top-level entry (or the whole value, if not
+	 *         decomposable) was accepted by the peer or already known too
+	 *         large to send
+	 */
+	private boolean sendUnscopedRootSync(Convex peerConnection, ACell value) {
+		if (value instanceof AMap<?, ?> map) {
+			boolean allOk = true;
+			for (Map.Entry<?, ?> e : map.entrySet()) {
+				ACell key = (ACell) e.getKey();
+				ACell subValue = (ACell) e.getValue();
+				if (subValue == null) continue;
+				if (ACell.getMemorySize(subValue) > maxOutboundReferenceSize) {
+					log.debug("Skipping periodic root sync of {} to {}: {} bytes exceeds outbound reference limit of {}",
+						key, peerConnection, ACell.getMemorySize(subValue), maxOutboundReferenceSize);
+					allOk = false;
+					continue;
+				}
+				allOk &= sendScopedUpdateTracked(peerConnection, new ACell[]{key}, subValue);
+			}
+			return allOk;
+		}
+		return sendScopedUpdateTracked(peerConnection, ROOT_PATH, value);
+	}
+
+	/**
+	 * Ack-tracked counterpart to {@link #sendScopedUpdate}, for root sync's
+	 * per-peer success/failure tracking (see {@link PeerSyncState}). Same
+	 * indirect-ref wire shape (the receiver's own DATA_REQUEST/Acquiror
+	 * machinery resolves whatever it's actually missing), but sent via
+	 * {@link Convex#requestNonBlocking(Message)} (non-blocking send, same
+	 * reasoning as {@link #broadcastToPeersWithAcks}'s own doc -- this
+	 * runs on the propagator's single background thread, which must not
+	 * block on network I/O) and briefly, boundedly waited on -- acceptable
+	 * here specifically because this background thread has no client
+	 * connection depending on it, unlike a synchronous client-facing
+	 * publish.
+	 *
+	 * @return true if the peer responded without error inside {@link
+	 *         #ROOT_SYNC_ACK_TIMEOUT_MS}; false on any error or timeout
+	 */
+	private boolean sendScopedUpdateTracked(Convex peerConnection, ACell[] path, ACell subValue) {
+		AVector<ACell> pathVector = (path.length == 0) ? Vectors.empty() : Vectors.of((Object[]) path);
+		AVector<?> payload = Vectors.create(MessageTag.LATTICE_VALUE, null, pathVector, subValue);
+		Message message = Message.create(MessageType.LATTICE_VALUE, payload, payload.getEncoding());
+		try {
+			Result result = peerConnection.requestNonBlocking(message)
+				.get(ROOT_SYNC_ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+			return result != null && !result.isError();
+		} catch (Exception e) {
+			return false;
 		}
 	}
 

@@ -1,5 +1,10 @@
 package convex.db.psql;
 
+import convex.auth.did.DIDVerifier;
+import convex.auth.ucan.UCAN;
+import convex.auth.ucan.UCANValidator;
+import convex.core.data.AString;
+import convex.core.data.Strings;
 import convex.db.calcite.QueryLog;
 import convex.db.psql.msg.*;
 import io.netty.buffer.ByteBuf;
@@ -41,9 +46,6 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private static final java.util.regex.Pattern TIMESTAMP_OFFSET_SUFFIX =
 		java.util.regex.Pattern.compile("\\s*([+-]\\d{2}(:?\\d{2})?)$");
 
-	/** Postgres binary datetime epoch (2000-01-01T00:00:00Z), in millis since the real (1970) epoch. */
-	private static final long PG_BINARY_EPOCH_MILLIS = 946684800000L;
-
 	/**
 	 * Parses a bound TIMESTAMP parameter's wire text into a {@link Timestamp}
 	 * — see {@link #TIMESTAMP_OFFSET_SUFFIX}'s own doc for the shapes this
@@ -69,12 +71,28 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private final Function<String, Connection> connectionSupplier;
 	private final String requiredPassword;
 
+	/**
+	 * When non-null, this connection authenticates by <b>UCAN bearer token</b>
+	 * instead of a shared password: the value in the {@code PasswordMessage}
+	 * slot is treated as a JWT-encoded UCAN, verified here via {@link
+	 * UCANValidator#validateJWT} ({@code did:key} signatures + temporal
+	 * bounds + proof chain), and its issuer DID is handed to this resolver to
+	 * map to an application principal id. A null return rejects the
+	 * connection (unknown or revoked DID). When this field is null, the
+	 * existing {@link #requiredPassword}/trust behaviour is used unchanged.
+	 */
+	private final Function<String, Long> ucanPrincipalResolver;
+
 	private Connection connection;
 	private String user;
 	private String database;
 	private int processId;
 	private int secretKey;
 	private boolean authenticated = false;
+
+	/** Set once UCAN auth succeeds — the issuer DID and its resolved principal id. Null otherwise. */
+	private String principalDid;
+	private Long principalId;
 
 	/**
 	 * Tracks whether this connection is inside an explicit {@code BEGIN}
@@ -106,10 +124,30 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 * @param requiredPassword Password required for authentication, or null for trust auth
 	 */
 	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword) {
+		this(connectionSupplier, requiredPassword, null);
+	}
+
+	/**
+	 * @param ucanPrincipalResolver enables UCAN bearer-token auth — see the
+	 *        field's own javadoc. Null keeps the password/trust behaviour.
+	 */
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
+			Function<String, Long> ucanPrincipalResolver) {
 		this.connectionSupplier = connectionSupplier;
 		this.requiredPassword = requiredPassword;
+		this.ucanPrincipalResolver = ucanPrincipalResolver;
 		this.processId = processIdCounter.incrementAndGet();
 		this.secretKey = ThreadLocalRandom.current().nextInt();
+	}
+
+	/** The authenticated principal's issuer DID, or null if not UCAN-authenticated. */
+	public String getPrincipalDid() {
+		return principalDid;
+	}
+
+	/** The authenticated principal's resolved application id, or null if not UCAN-authenticated. */
+	public Long getPrincipalId() {
+		return principalId;
 	}
 
 	@Override
@@ -156,8 +194,9 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		this.user = startup.params().get("user");
 		this.database = startup.params().get("database");
 
-		if (requiredPassword != null && !requiredPassword.isEmpty()) {
-			// Request password authentication
+		if (ucanPrincipalResolver != null || (requiredPassword != null && !requiredPassword.isEmpty())) {
+			// Request the client to send credentials in the PasswordMessage
+			// slot -- a shared password, or (UCAN mode) a JWT-encoded UCAN.
 			write(ctx, AuthenticationCleartextPassword.INSTANCE);
 			ctx.flush();
 		} else {
@@ -167,12 +206,55 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void handlePassword(ChannelHandlerContext ctx, PgMessageDecoder.PasswordMessage pwd) {
+		if (ucanPrincipalResolver != null) {
+			if (authenticateUcan(pwd.password())) {
+				completeAuthentication(ctx);
+			} else {
+				write(ctx, ErrorResponse.authenticationFailed(user));
+				ctx.flush();
+				ctx.close();
+			}
+			return;
+		}
 		if (requiredPassword != null && requiredPassword.equals(pwd.password())) {
 			completeAuthentication(ctx);
 		} else {
 			write(ctx, ErrorResponse.authenticationFailed(user));
 			ctx.flush();
 			ctx.close();
+		}
+	}
+
+	/**
+	 * Verifies {@code bearerToken} as a JWT-encoded UCAN and resolves its
+	 * issuer DID to an application principal. Sets {@link #principalDid} /
+	 * {@link #principalId} on success. Never throws — any problem is a
+	 * rejected authentication.
+	 */
+	private boolean authenticateUcan(String bearerToken) {
+		try {
+			if (bearerToken == null || bearerToken.isEmpty()) return false;
+			long nowSeconds = System.currentTimeMillis() / 1000L;
+			UCAN token = UCANValidator.validateJWT(Strings.create(bearerToken), nowSeconds, DIDVerifier.CONVEX);
+			if (token == null) {
+				log.info("UCAN auth rejected: token failed verification (signature / expiry / chain)");
+				return false;
+			}
+			AString issuer = token.getIssuer();
+			String did = (issuer == null) ? null : issuer.toString();
+			if (did == null) return false;
+			Long resolved = ucanPrincipalResolver.apply(did);
+			if (resolved == null) {
+				log.info("UCAN auth rejected: DID {} not bound to any active principal", did);
+				return false;
+			}
+			this.principalDid = did;
+			this.principalId = resolved;
+			log.info("UCAN auth ok: principal {} ({})", resolved, did);
+			return true;
+		} catch (Exception e) {
+			log.warn("UCAN auth error", e);
+			return false;
 		}
 	}
 
@@ -362,16 +444,16 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void executeQuery(ChannelHandlerContext ctx, String sql) throws SQLException {
-		executeQuery(ctx, sql, true, true);
+		executeQuery(ctx, sql, true, true, null);
 	}
 
 	/**
 	 * @param includeRowDescription Whether to send a RowDescription before the
 	 *   data rows. Must be false when called from the extended-protocol Execute
-	 *   path for a portal that was already Described — Describe already sent the
-	 *   RowDescription, and sending it again desyncs pgjdbc's internal
-	 *   pendingDescribePortalQueue bookkeeping (manifests client-side as a
-	 *   NoSuchElementException in QueryExecutorImpl.processResults).
+	 *   path for a statement that already had one sent (see {@code
+	 *   describedStatements}'s own doc — resending desyncs pgjdbc's internal
+	 *   bookkeeping, manifesting client-side as a NoSuchElementException in
+	 *   QueryExecutorImpl.processResults).
 	 * @param sendTimingNotice Whether to send the "N rows in set (X sec)" /
 	 *   "Query OK, N rows affected (X sec)" NoticeResponse footer. True only
 	 *   for the simple-query path (psql, or any literal-text client) — the
@@ -379,8 +461,12 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 *   protocol caller (a bound PreparedStatement, i.e. always a program, never
 	 *   a person typing at psql) passes false: that caller has to receive and
 	 *   discard the message for zero benefit, once per row for a bulk insert.
+	 * @param resultFormats Bind's own per-column result-format request (see
+	 *   {@code DataRow.fromResultSet}'s own doc); null for the simple-query
+	 *   path, which has no Bind and is always text.
 	 */
-	private void executeQuery(ChannelHandlerContext ctx, String sql, boolean includeRowDescription, boolean sendTimingNotice) throws SQLException {
+	private void executeQuery(ChannelHandlerContext ctx, String sql, boolean includeRowDescription,
+			boolean sendTimingNotice, short[] resultFormats) throws SQLException {
 		sql = rewriteQuery(sql);
 
 		// Null means return empty result (e.g., for system catalog queries)
@@ -396,7 +482,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			if (hasResultSet) {
 				long rowCount;
 				try (ResultSet rs = stmt.getResultSet()) {
-					rowCount = sendResultSet(ctx, rs, includeRowDescription);
+					rowCount = sendResultSet(ctx, rs, includeRowDescription, resultFormats);
 				}
 				if (sendTimingNotice) {
 					write(ctx, NoticeResponse.timing(
@@ -522,6 +608,16 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private long sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean includeRowDescription) throws SQLException {
+		return sendResultSet(ctx, rs, includeRowDescription, null);
+	}
+
+	/**
+	 * @param resultFormats Bind's own per-column result-format request (see
+	 *        {@code DataRow.fromResultSet}'s own doc); null/empty for the
+	 *        simple-query path, which has no Bind and is always text.
+	 */
+	private long sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean includeRowDescription,
+			short[] resultFormats) throws SQLException {
 		ResultSetMetaData meta = rs.getMetaData();
 		int columnCount = meta.getColumnCount();
 
@@ -533,7 +629,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		// Send data rows
 		long rowCount = 0;
 		while (rs.next()) {
-			write(ctx, DataRow.fromResultSet(rs, columnCount));
+			write(ctx, DataRow.fromResultSet(rs, columnCount, meta, resultFormats));
 			rowCount++;
 		}
 
@@ -598,9 +694,42 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 */
 	private final Map<PreparedStmt, PreparedStatement> preparedStatementCache = new java.util.IdentityHashMap<>();
 
+	/**
+	 * Wire-level statements (identity-keyed, same reasoning as {@link
+	 * #preparedStatementCache}'s own doc) that have ever had a {@code
+	 * RowDescription} sent to the client — whether via an explicit {@code
+	 * Describe} message or a prior {@code Execute} that included one.
+	 *
+	 * <p>Found live 2026-08-25: the previous tracking (a plain {@code
+	 * Set<String>} of portal names, cleared and re-populated on every single
+	 * Bind/Describe/Execute cycle) assumed the client sends {@code Describe}
+	 * before every {@code Execute} it wants metadata for. Real pgjdbc clients
+	 * don't: {@code PgPreparedStatement} only describes a statement for its
+	 * first few executions (governed by pgjdbc's own {@code prepareThreshold},
+	 * default 5) — once it has the {@code RowDescription} cached client-side,
+	 * later executions of the *same* {@code PreparedStatement} object send only
+	 * Bind+Execute, no Describe at all. Against the old per-portal tracking,
+	 * that made {@code handleExecute} conclude "not described" on every one of
+	 * those later executions and resend a {@code RowDescription} the client
+	 * never asked for and wasn't expecting mid-stream — desyncing pgjdbc's own
+	 * response-message bookkeeping (surfaces client-side as {@code
+	 * java.util.NoSuchElementException} at {@code ArrayDeque.removeFirst} deep
+	 * in {@code QueryExecutorImpl.processResults}, confirmed reproducing via a
+	 * SELECT reused across 10,000 executions of one {@code PreparedStatement} —
+	 * exactly pgjdbc's own optimization path, exactly where it stops
+	 * describing). Tracking is per *statement* (persists across every
+	 * Bind/Execute cycle that reuses it, unlike a portal, which {@link
+	 * #handleBind} recreates every cycle) and, once true, stays true for that
+	 * statement's lifetime — a client that already has the shape cached is
+	 * never sent it again, matching what real clients actually expect.
+	 */
+	private final java.util.Set<PreparedStmt> describedStatements =
+		java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
 	/** Evicts and closes the cached real statement for a wire-level statement being replaced or dropped, if any. */
 	private void evictCachedStatement(PreparedStmt removed) {
 		if (removed == null) return;
+		describedStatements.remove(removed);
 		PreparedStatement cached = preparedStatementCache.remove(removed);
 		if (cached != null) {
 			try {
@@ -610,9 +739,6 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			}
 		}
 	}
-	// Portal names for which Describe already sent a RowDescription to the client
-	// — Execute must not resend it (see executeQuery's includeRowDescription doc).
-	private final java.util.Set<String> describedPortals = new java.util.HashSet<>();
 
 	private void handleParse(ChannelHandlerContext ctx, PgMessageDecoder.Parse parse) {
 		if (!authenticated) {
@@ -660,9 +786,12 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				return;
 			}
 
-			// Close existing portal with same name (PostgreSQL behavior)
+			// Close existing portal with same name (PostgreSQL behavior). Note:
+			// unlike the portal map itself, describedStatements is NOT touched
+			// here — it tracks the underlying statement, not this transient
+			// portal, and must survive across every rebind of it (see its own
+			// doc).
 			portals.remove(portalName);
-			describedPortals.remove(portalName);
 
 			// Create the portal with bound parameters
 			portals.put(portalName, new Portal(stmt, bind.paramValues(), bind.paramFormats(), bind.resultFormats()));
@@ -705,6 +834,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 					try (Statement s = connection.createStatement();
 						 ResultSet rs = s.executeQuery(metaQuery)) {
 						write(ctx, RowDescription.fromMetaData(rs.getMetaData()));
+						describedStatements.add(stmt);
 					} catch (SQLException e) {
 						// If metadata query fails, return NoData
 						write(ctx, NoData.INSTANCE);
@@ -730,7 +860,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 					try (Statement s = connection.createStatement();
 						 ResultSet rs = s.executeQuery(metaQuery)) {
 						write(ctx, RowDescription.fromMetaData(rs.getMetaData()));
-						describedPortals.add(describe.name());
+						describedStatements.add(portal.stmt());
 					} catch (SQLException e) {
 						write(ctx, NoData.INSTANCE);
 					}
@@ -770,10 +900,14 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				return;
 			}
 
-			// If Describe already sent this portal's RowDescription, Execute must not
-			// resend it — doing so desyncs pgjdbc's client-side bookkeeping.
-			boolean alreadyDescribed = describedPortals.remove(portalName);
-			executeWithParameters(ctx, portal.stmt(), portal.paramValues(), portal.paramFormats(), !alreadyDescribed);
+			// If this STATEMENT (not just this one portal instance -- see
+			// describedStatements' own doc) has ever had its RowDescription
+			// sent already, Execute must not resend it — doing so desyncs
+			// pgjdbc's client-side bookkeeping.
+			PreparedStmt stmt = portal.stmt();
+			boolean alreadyDescribed = describedStatements.contains(stmt);
+			if (!alreadyDescribed) describedStatements.add(stmt);
+			executeWithParameters(ctx, stmt, portal.paramValues(), portal.paramFormats(), !alreadyDescribed, portal.resultFormats());
 		} catch (SQLException e) {
 			if (inTransaction) transactionFailed = true;
 			log.warn("Execute error: {}", e.getMessage());
@@ -795,7 +929,8 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	/**
 	 * Execute a query with bound parameters.
 	 */
-	private void executeWithParameters(ChannelHandlerContext ctx, PreparedStmt stmt, byte[][] paramValues, short[] paramFormats, boolean includeRowDescription) throws SQLException {
+	private void executeWithParameters(ChannelHandlerContext ctx, PreparedStmt stmt, byte[][] paramValues,
+			short[] paramFormats, boolean includeRowDescription, short[] resultFormats) throws SQLException {
 		String sql = rewriteQuery(stmt.query());
 
 		if (sql == null) {
@@ -816,7 +951,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		// always a program, never a person typing at psql -- see
 		// executeQuery's own doc.
 		if (paramValues == null || paramValues.length == 0) {
-			executeQuery(ctx, sql, includeRowDescription, false);
+			executeQuery(ctx, sql, includeRowDescription, false, resultFormats);
 			return;
 		}
 
@@ -828,7 +963,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			lowerSql.contains("pg_namespace") || lowerSql.contains("pg_attribute") ||
 			lowerSql.contains("pg_tables")) {
 			String substituted = substituteParameters(sql, paramValues, paramFormats);
-			executeQuery(ctx, substituted, includeRowDescription, false);
+			executeQuery(ctx, substituted, includeRowDescription, false, resultFormats);
 			return;
 		}
 
@@ -921,7 +1056,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			boolean hasResultSet = pstmt.execute();
 			if (hasResultSet) {
 				try (ResultSet rs = pstmt.getResultSet()) {
-					sendResultSet(ctx, rs, includeRowDescription);
+					sendResultSet(ctx, rs, includeRowDescription, resultFormats);
 				}
 			} else {
 				int updateCount = pstmt.getUpdateCount();
@@ -1014,7 +1149,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			case java.sql.Types.TIMESTAMP -> {
 				if (value.length != 8) throw new SQLException("Unexpected timestamp wire width: " + value.length + " bytes");
 				long microsSincePgEpoch = buf.getLong();
-				pstmt.setTimestamp(index, new Timestamp(PG_BINARY_EPOCH_MILLIS + microsSincePgEpoch / 1000L));
+				pstmt.setTimestamp(index, new Timestamp(PgType.BINARY_EPOCH_MILLIS + microsSincePgEpoch / 1000L));
 			}
 			default ->
 				pstmt.setBytes(index, value);
@@ -1085,8 +1220,11 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		if (close.type() == 'S') {
 			evictCachedStatement(statements.remove(close.name()));
 		} else {
+			// describedStatements tracks the underlying statement, not this
+			// portal (see its own doc) -- closing a portal leaves it alone,
+			// since the statement may still be bound to other portals or
+			// rebound later.
 			portals.remove(close.name());
-			describedPortals.remove(close.name());
 		}
 
 		write(ctx, CloseComplete.INSTANCE);
@@ -1128,6 +1266,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			}
 		}
 		preparedStatementCache.clear();
+		describedStatements.clear();
 		if (connection != null) {
 			if (connection instanceof AvaticaConnection avaticaConn) {
 				QueryLog.unmarkPgwireConnection(avaticaConn.id);
