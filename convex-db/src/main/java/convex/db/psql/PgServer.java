@@ -47,7 +47,7 @@ public class PgServer {
 	private final String database;
 	private final String password;
 	private final Function<String, Connection> connectionSupplier;
-	private final Function<String, Long> ucanPrincipalResolver;
+	private final Function<String, Long> ucanEntityResolver;
 
 	private EventLoopGroup bossGroup;
 	private EventLoopGroup workerGroup;
@@ -58,7 +58,7 @@ public class PgServer {
 		this.port = builder.port;
 		this.database = builder.database;
 		this.password = builder.password;
-		this.ucanPrincipalResolver = builder.ucanPrincipalResolver;
+		this.ucanEntityResolver = builder.ucanEntityResolver;
 
 		if (builder.connectionSupplier != null) {
 			this.connectionSupplier = builder.connectionSupplier;
@@ -103,7 +103,7 @@ public class PgServer {
 					protected void initChannel(SocketChannel ch) {
 						ch.pipeline().addLast(
 							new PgMessageDecoder(),
-							new PgProtocolHandler(connectionSupplier, password, ucanPrincipalResolver)
+							new PgProtocolHandler(connectionSupplier, password, ucanEntityResolver)
 						);
 					}
 				})
@@ -229,7 +229,7 @@ public class PgServer {
 		private String database = "convex";
 		private String password = null;
 		private Function<String, Connection> connectionSupplier = null;
-		private Function<String, Long> ucanPrincipalResolver = null;
+		private Function<String, Long> ucanEntityResolver = null;
 
 		/**
 		 * Sets the port to listen on. Default is 5432.
@@ -274,8 +274,8 @@ public class PgServer {
 		 * principal id (return null to reject the connection). If not set,
 		 * the {@link #password}/trust behaviour is used.
 		 */
-		public Builder ucanPrincipalResolver(Function<String, Long> resolver) {
-			this.ucanPrincipalResolver = resolver;
+		public Builder ucanEntityResolver(Function<String, Long> resolver) {
+			this.ucanEntityResolver = resolver;
 			return this;
 		}
 

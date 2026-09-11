@@ -18,11 +18,16 @@ import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.schema.ColumnStrategy;
 import org.apache.calcite.schema.ModifiableTable;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.schema.Statistic;
 import org.apache.calcite.schema.Statistics;
 import org.apache.calcite.schema.TranslatableTable;
+import org.apache.calcite.sql.SqlFunction;
+import org.apache.calcite.sql2rel.InitializerContext;
+import org.apache.calcite.sql2rel.InitializerExpressionFactory;
+import org.apache.calcite.sql2rel.NullInitializerExpressionFactory;
 import org.apache.calcite.util.ImmutableBitSet;
 
 import convex.core.data.ACell;
@@ -41,9 +46,13 @@ import convex.db.lattice.SQLTable;
  * table scan. This ensures PK lookups use the index, not full scans.
  *
  * <p>Implements ModifiableTable for INSERT, UPDATE, DELETE operations.
+ *
+ * <p>Implements {@link InitializerExpressionFactory} solely to mark {@link
+ * SQLSchema#OWNERID_COLUMN} as {@link ColumnStrategy#STORED} — see {@link
+ * #generationStrategy}'s own doc for why.
  */
 public class ConvexTable extends AbstractQueryableTable
-		implements TranslatableTable, ModifiableTable {
+		implements TranslatableTable, ModifiableTable, InitializerExpressionFactory {
 
 	private final ConvexSchema schema;
 	private final String tableName;
@@ -277,6 +286,7 @@ public class ConvexTable extends AbstractQueryableTable
 
 	private boolean insertRow(Object[] row) {
 		if (row == null || row.length < 1) return false;
+		stampOwnerId(row);
 		ConvexColumnType[] types = getColumnTypes();
 		ACell[] cells = new ACell[row.length];
 		for (int i = 0; i < row.length; i++) {
@@ -284,6 +294,103 @@ public class ConvexTable extends AbstractQueryableTable
 			cells[i] = type.toCell(row[i]);
 		}
 		return schema.getTables().insert(tableName, Vectors.of(cells));
+	}
+
+	/**
+	 * Stamps the row's {@code OWNERID} slot (see {@link SQLSchema#OWNERID_COLUMN}
+	 * / PLAN_access_rights.md's "Ownership" section) with the connection's
+	 * resolved entity, in place — mutates {@code row} directly, since it's a
+	 * freshly-built array local to this one insert, not shared state.
+	 *
+	 * <p>A client naming {@code OWNERID} explicitly in an INSERT column list is
+	 * already rejected earlier, at SQL validation time, by Calcite itself —
+	 * {@link ColumnStrategy#STORED} (see {@link #generationStrategy}) makes
+	 * {@code INSERT INTO t (..., OWNERID) VALUES (..., v)} throw {@code
+	 * insertIntoAlwaysGenerated} before this method (or even {@link
+	 * #insertRow}) is ever reached, for any {@code v} including {@code NULL}.
+	 * The non-null check below is only a defensive backstop for any insert
+	 * path that could somehow bypass that validation, not the primary
+	 * enforcement.
+	 *
+	 * <p>No entity resolved for this connection (trust/no-password: bootstrap
+	 * self-registration, admin {@code psql}, every direct {@code jdbc:convex:}
+	 * caller) stamps {@code null} — "system-owned", per the same section.
+	 */
+	private void stampOwnerId(Object[] row) {
+		int ownerIdx = ownerIdColumnIndex();
+		if (ownerIdx < 0 || ownerIdx >= row.length) return;
+		if (row[ownerIdx] != null) {
+			throw new IllegalArgumentException(
+				"Column '" + SQLSchema.OWNERID_COLUMN + "' cannot be set directly on INSERT — "
+				+ "it is stamped automatically from the connection's authenticated entity");
+		}
+		row[ownerIdx] = convex.db.CurrentEntity.get();
+	}
+
+	/** This table's physical {@code OWNERID} column index, or -1 if not present. */
+	private int ownerIdColumnIndex() {
+		String[] columnNames = schema.getTables().getColumnNames(tableName);
+		if (columnNames == null) return -1;
+		for (int i = 0; i < columnNames.length; i++) {
+			if (SQLSchema.OWNERID_COLUMN.equalsIgnoreCase(columnNames[i])) return i;
+		}
+		return -1;
+	}
+
+	// ========== InitializerExpressionFactory (marks OWNERID as STORED) ==========
+	// Making OWNERID a Calcite ColumnStrategy#STORED column (rather than the
+	// default NULLABLE every other column here gets) does two things at once,
+	// both wanted: (1) a column-list-less "INSERT INTO t VALUES (...)" no
+	// longer needs to supply a value for it -- Calcite's own field-count
+	// validation excludes STORED/VIRTUAL columns from the implicit target row
+	// type (see SqlValidatorImpl#checkFieldCount's own "real target row type"
+	// filtering) -- so every pre-existing bare-VALUES INSERT against an
+	// already-existing table keeps working unchanged even though the table
+	// just grew a trailing column; (2) a client explicitly naming OWNERID in
+	// an INSERT column list is rejected outright at validation time
+	// ("insertIntoAlwaysGenerated"), before the row ever reaches insertRow --
+	// a stronger, earlier guarantee than the row-value check in
+	// stampOwnerId alone would give.
+	//
+	// Every other method below delegates to NullInitializerExpressionFactory
+	// (this schema declares no other generated/non-nullable columns).
+
+	@SuppressWarnings("deprecation")
+	@Override
+	public boolean isGeneratedAlways(RelOptTable table, int iColumn) {
+		switch (generationStrategy(table, iColumn)) {
+			case VIRTUAL:
+			case STORED:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	@Override
+	public ColumnStrategy generationStrategy(RelOptTable table, int iColumn) {
+		if (iColumn == ownerIdColumnIndex()) return ColumnStrategy.STORED;
+		return NullInitializerExpressionFactory.INSTANCE.generationStrategy(table, iColumn);
+	}
+
+	@Override
+	public RexNode newColumnDefaultValue(RelOptTable table, int iColumn, InitializerContext context) {
+		// STORED's "computed" value is filled in for real by stampOwnerId once
+		// the row reaches insertRow -- a NULL literal here just satisfies
+		// Calcite's own row-completion machinery in the meantime.
+		return NullInitializerExpressionFactory.INSTANCE.newColumnDefaultValue(table, iColumn, context);
+	}
+
+	@Override
+	public java.util.function.BiFunction<InitializerContext, RelNode, RelNode> postExpressionConversionHook() {
+		return NullInitializerExpressionFactory.INSTANCE.postExpressionConversionHook();
+	}
+
+	@Override
+	public RexNode newAttributeInitializer(RelDataType type, SqlFunction constructor, int iAttribute,
+			List<RexNode> constructorArgs, InitializerContext context) {
+		return NullInitializerExpressionFactory.INSTANCE
+			.newAttributeInitializer(type, constructor, iAttribute, constructorArgs, context);
 	}
 
 	private ACell toCell(Object v, int columnIndex) {

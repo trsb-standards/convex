@@ -31,7 +31,8 @@ class SQLSchemaTest {
 			new ConvexType[]{ConvexType.INTEGER, ConvexType.VARCHAR}, 1);
 
 		assertFalse(changed, "recreating with the identical column set must be a no-op");
-		assertEquals(2, schema.getColumnNames("t").length);
+		// OWNERID is auto-appended to every table -- see SQLSchema#OWNERID_COLUMN
+		assertEquals(3, schema.getColumnNames("t").length);
 	}
 
 	@Test
@@ -44,7 +45,17 @@ class SQLSchemaTest {
 			new ConvexType[]{ConvexType.INTEGER, ConvexType.VARCHAR, ConvexType.INTEGER}, 1);
 
 		assertTrue(changed);
-		assertArrayEquals(new String[]{"a", "b", "c"}, schema.getColumnNames("t"));
+		// OWNERID was already appended (trailing) by the FIRST createTable
+		// call above; physical column position is permanent/append-only (see
+		// SQLSchema#OWNERID_COLUMN's own doc), so "c" -- genuinely new on
+		// this SECOND call -- lands after it, not before. OWNERID is only
+		// guaranteed trailing for a table created via a single createTable
+		// call with its full column list (the overwhelmingly common case:
+		// every real CREATE TABLE DDL statement, and every Java-API
+		// single-call creation) -- not for a table whose schema evolves
+		// across multiple createTable calls, which this test deliberately
+		// exercises.
+		assertArrayEquals(new String[]{"a", "b", "OWNERID", "c"}, schema.getColumnNames("t"));
 	}
 
 	@Test

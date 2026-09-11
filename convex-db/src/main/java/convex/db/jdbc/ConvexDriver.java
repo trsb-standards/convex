@@ -126,6 +126,26 @@ public class ConvexDriver extends Driver {
 		if (!info.containsKey("fun")) {
 			info.setProperty("fun", "standard,mysql");
 		}
+		// LENIENT (a strict superset of DEFAULT's permissiveness -- every flag
+		// DEFAULT allows, LENIENT also allows) turns on
+		// isInsertSubsetColumnsAllowed(). Needed for OWNERID (see
+		// SQLSchema#OWNERID_COLUMN): a bare "INSERT INTO t VALUES (...)" that's
+		// exactly one column short of the table's real width is otherwise only
+		// half-fixed by marking OWNERID ColumnStrategy.STORED -- STORED alone
+		// makes checkFieldCount accept the shorter row, but a *bound parameter*
+		// ("?") in that same shorter row never gets its type inferred at all:
+		// SqlValidatorImpl#validateValues only calls inferUnknownTypes when the
+		// row's operand count matches the target field count exactly, *unless*
+		// isInsertSubsetColumnsAllowed() is on, in which case it first trims the
+		// target type down to the row's own (shorter) width -- which, since
+		// OWNERID is always the table's trailing column, is exactly the trim we
+		// want. Confirmed by reading Calcite 1.42.0's own source, not guessed;
+		// without this, a bound-parameter bare-VALUES INSERT (a very common
+		// PreparedStatement pattern) failed with a confusing "Cannot assign...
+		// from source field 'EXPR$0' of type UNKNOWN" instead of working.
+		if (!info.containsKey("conformance")) {
+			info.setProperty("conformance", "LENIENT");
+		}
 
 		// Resolve the ConvexDB instance
 		ConvexDB cdb = resolveInstance(parsed);

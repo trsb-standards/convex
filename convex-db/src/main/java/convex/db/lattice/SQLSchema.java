@@ -287,6 +287,30 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		return Blob.wrap(result);
 	}
 
+	/**
+	 * Pads {@code row} with trailing {@code null}s up to the table's current
+	 * schema width. Direct Java-API callers (every {@code dbase-meta} table
+	 * class, migration tooling, bootstrap seeding) always supply exactly as
+	 * many values as their own {@code COLUMNS} array — one short of the real
+	 * physical row width once {@link #OWNERID_COLUMN} (or any other
+	 * append-only schema-evolution column) has been added to a table after
+	 * that caller was written. Rather than require every such call site to
+	 * track schema width, a short row is padded here so it keeps working
+	 * unchanged; a caller-supplied value for a later column (e.g. explicitly
+	 * passing an owner) is preserved as-is, only genuinely missing trailing
+	 * columns are filled with {@code null}.
+	 */
+	private static AVector<ACell> padRow(AVector<ACell> row, SQLTable table) {
+		AVector<AVector<ACell>> schema = table.getSchema();
+		if (schema == null) return row;
+		long width = schema.count();
+		long have = row.count();
+		for (long i = have; i < width; i++) {
+			row = row.conj(null);
+		}
+		return row;
+	}
+
 	// ========== Table Operations ==========
 
 	/**
@@ -360,6 +384,38 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	}
 
 	/**
+	 * Reserved ownership column, auto-appended to every table by {@link
+	 * #createTable} — see PLAN_access_rights.md's "Ownership" section. A
+	 * caller-declared column of this name is rejected further up the stack
+	 * (at the DDL layer, before columns/types ever reach this method) — this
+	 * class itself only guarantees the column ends up present exactly once,
+	 * appended, never in the PK.
+	 *
+	 * <p><b>Only guaranteed to be the table's trailing (physically-last)
+	 * column for a table created via a single {@code createTable} call with
+	 * its full column list</b> — the overwhelmingly common case: every real
+	 * {@code CREATE TABLE} DDL statement, and every Java-API single-call
+	 * creation. Physical column position is permanent/append-only (see the
+	 * schema-evolution convention documented in {@code CLAUDE.md}'s
+	 * "Planned: schema evolution" section), so a table whose schema evolves
+	 * across <em>multiple</em> {@code createTable} calls — genuinely new
+	 * columns added to an already-existing table on a later call — gets
+	 * those columns appended <em>after</em> wherever {@code OWNERID} already
+	 * landed on its first call, not before. This matters specifically for a
+	 * bare, column-list-less {@code INSERT INTO t VALUES (...)}: Calcite's
+	 * {@code isInsertSubsetColumnsAllowed()} trimming (enabled via {@code
+	 * ConvexDriver}'s {@code conformance=LENIENT}) only knows how to omit
+	 * <em>trailing</em> columns from such a statement, so it only correctly
+	 * treats a value-count one short as "omitting OWNERID" when OWNERID is
+	 * genuinely last. A table that later gains a real column after OWNERID
+	 * needs an explicit column list (which matches by name, not position) for
+	 * any bare-VALUES INSERT going forward — the same general SQL limitation
+	 * any other schema evolution runs into, not something specific to this
+	 * column.
+	 */
+	public static final String OWNERID_COLUMN = "OWNERID";
+
+	/**
 	 * Creates a new table, plain/versioned/auto-increment per the flags. The
 	 * real terminus — every other {@code createTable} overload funnels down
 	 * to this one.
@@ -400,6 +456,24 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 				throw new UnsupportedOperationException(
 					"Auto-increment primary key must be INTEGER, not " + types[0].getBaseType());
 			}
+		}
+
+		// Auto-append OWNERID (nullable INTEGER, trailing, never part of the
+		// PK) unless already present -- covers both a fresh CREATE TABLE and
+		// re-running createTable against an already-existing pre-ownership
+		// table (the "append any new columns" branch below then picks it up
+		// the same way it would any other genuinely new column).
+		boolean hasOwnerId = false;
+		for (String c : columns) {
+			if (OWNERID_COLUMN.equalsIgnoreCase(c)) { hasOwnerId = true; break; }
+		}
+		if (!hasOwnerId) {
+			String[] withOwner = java.util.Arrays.copyOf(columns, columns.length + 1);
+			withOwner[columns.length] = OWNERID_COLUMN;
+			ConvexColumnType[] withOwnerTypes = java.util.Arrays.copyOf(types, types.length + 1);
+			withOwnerTypes[types.length] = ConvexColumnType.of(ConvexType.INTEGER);
+			columns = withOwner;
+			types = withOwnerTypes;
 		}
 
 		// Build full desired schema: [[name, typeName, precision, scale], ...]
@@ -569,6 +643,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 	public boolean insert(AString tableName, AVector<ACell> row) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
+		row = padRow(row, table);
 		if (AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
 			return insertAutoIncrement(table, tableName, row);
 		}
@@ -652,6 +727,11 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		if (rows == null || rows.isEmpty()) return 0;
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return 0;
+		{
+			List<AVector<ACell>> padded = new ArrayList<>(rows.size());
+			for (AVector<ACell> row : rows) padded.add(padRow(row, table));
+			rows = padded;
+		}
 		if (AutoIncrementRegistry.isAutoIncrement(schemaName, tableName)) {
 			// Auto-increment generation needs per-row atomic claim-and-retry
 			// (see insertAutoIncrement's own doc) -- doesn't fit this

@@ -77,11 +77,15 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 * slot is treated as a JWT-encoded UCAN, verified here via {@link
 	 * UCANValidator#validateJWT} ({@code did:key} signatures + temporal
 	 * bounds + proof chain), and its issuer DID is handed to this resolver to
-	 * map to an application principal id. A null return rejects the
-	 * connection (unknown or revoked DID). When this field is null, the
-	 * existing {@link #requiredPassword}/trust behaviour is used unchanged.
+	 * map to an application <b>entity</b> id (see PLAN_access_rights.md's
+	 * "entity" umbrella-principal model, `dbase` repo — deliberately called
+	 * "entity" throughout this codebase, never "principal", to avoid clashing
+	 * with Convex's own unrelated {@code Address}/account "principal"
+	 * vocabulary). A null return rejects the connection (unknown or revoked
+	 * DID). When this field is null, the existing {@link #requiredPassword}/
+	 * trust behaviour is used unchanged.
 	 */
-	private final Function<String, Long> ucanPrincipalResolver;
+	private final Function<String, Long> ucanEntityResolver;
 
 	private Connection connection;
 	private String user;
@@ -90,9 +94,9 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private int secretKey;
 	private boolean authenticated = false;
 
-	/** Set once UCAN auth succeeds — the issuer DID and its resolved principal id. Null otherwise. */
-	private String principalDid;
-	private Long principalId;
+	/** Set once UCAN auth succeeds — the issuer DID and its resolved entity id. Null otherwise. */
+	private String entityDid;
+	private Long entityId;
 
 	/**
 	 * Tracks whether this connection is inside an explicit {@code BEGIN}
@@ -128,56 +132,66 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	/**
-	 * @param ucanPrincipalResolver enables UCAN bearer-token auth — see the
+	 * @param ucanEntityResolver enables UCAN bearer-token auth — see the
 	 *        field's own javadoc. Null keeps the password/trust behaviour.
 	 */
 	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
-			Function<String, Long> ucanPrincipalResolver) {
+			Function<String, Long> ucanEntityResolver) {
 		this.connectionSupplier = connectionSupplier;
 		this.requiredPassword = requiredPassword;
-		this.ucanPrincipalResolver = ucanPrincipalResolver;
+		this.ucanEntityResolver = ucanEntityResolver;
 		this.processId = processIdCounter.incrementAndGet();
 		this.secretKey = ThreadLocalRandom.current().nextInt();
 	}
 
-	/** The authenticated principal's issuer DID, or null if not UCAN-authenticated. */
-	public String getPrincipalDid() {
-		return principalDid;
+	/** The authenticated entity's issuer DID, or null if not UCAN-authenticated. */
+	public String getEntityDid() {
+		return entityDid;
 	}
 
-	/** The authenticated principal's resolved application id, or null if not UCAN-authenticated. */
-	public Long getPrincipalId() {
-		return principalId;
+	/** The authenticated entity's resolved application id, or null if not UCAN-authenticated. */
+	public Long getEntityId() {
+		return entityId;
 	}
 
 	@Override
 	public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-		if (msg instanceof PgMessageDecoder.SSLRequest) {
-			handleSSLRequest(ctx);
-		} else if (msg instanceof PgMessageDecoder.StartupMessage startup) {
-			handleStartup(ctx, startup);
-		} else if (msg instanceof PgMessageDecoder.PasswordMessage pwd) {
-			handlePassword(ctx, pwd);
-		} else if (msg instanceof PgMessageDecoder.Query query) {
-			handleQuery(ctx, query);
-		} else if (msg instanceof PgMessageDecoder.Terminate) {
-			handleTerminate(ctx);
-		} else if (msg instanceof PgMessageDecoder.Sync) {
-			handleSync(ctx);
-		} else if (msg instanceof PgMessageDecoder.Parse parse) {
-			handleParse(ctx, parse);
-		} else if (msg instanceof PgMessageDecoder.Bind bind) {
-			handleBind(ctx, bind);
-		} else if (msg instanceof PgMessageDecoder.Describe describe) {
-			handleDescribe(ctx, describe);
-		} else if (msg instanceof PgMessageDecoder.Execute execute) {
-			handleExecute(ctx, execute);
-		} else if (msg instanceof PgMessageDecoder.Close close) {
-			handleClose(ctx, close);
-		} else if (msg instanceof PgMessageDecoder.Flush) {
-			ctx.flush();
-		} else {
-			log.warn("Unhandled message: {}", msg.getClass().getSimpleName());
+		// Scope CurrentEntity to exactly this one wire message's handling --
+		// see CurrentEntity's own javadoc for why a plain set/clear here is
+		// safe despite one event-loop thread servicing many connections over
+		// its lifetime (Netty never interleaves a second channel's message
+		// mid-handling of this one, on the same thread).
+		convex.db.CurrentEntity.set(entityId);
+		try {
+			if (msg instanceof PgMessageDecoder.SSLRequest) {
+				handleSSLRequest(ctx);
+			} else if (msg instanceof PgMessageDecoder.StartupMessage startup) {
+				handleStartup(ctx, startup);
+			} else if (msg instanceof PgMessageDecoder.PasswordMessage pwd) {
+				handlePassword(ctx, pwd);
+			} else if (msg instanceof PgMessageDecoder.Query query) {
+				handleQuery(ctx, query);
+			} else if (msg instanceof PgMessageDecoder.Terminate) {
+				handleTerminate(ctx);
+			} else if (msg instanceof PgMessageDecoder.Sync) {
+				handleSync(ctx);
+			} else if (msg instanceof PgMessageDecoder.Parse parse) {
+				handleParse(ctx, parse);
+			} else if (msg instanceof PgMessageDecoder.Bind bind) {
+				handleBind(ctx, bind);
+			} else if (msg instanceof PgMessageDecoder.Describe describe) {
+				handleDescribe(ctx, describe);
+			} else if (msg instanceof PgMessageDecoder.Execute execute) {
+				handleExecute(ctx, execute);
+			} else if (msg instanceof PgMessageDecoder.Close close) {
+				handleClose(ctx, close);
+			} else if (msg instanceof PgMessageDecoder.Flush) {
+				ctx.flush();
+			} else {
+				log.warn("Unhandled message: {}", msg.getClass().getSimpleName());
+			}
+		} finally {
+			convex.db.CurrentEntity.clear();
 		}
 	}
 
@@ -194,7 +208,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		this.user = startup.params().get("user");
 		this.database = startup.params().get("database");
 
-		if (ucanPrincipalResolver != null || (requiredPassword != null && !requiredPassword.isEmpty())) {
+		if (ucanEntityResolver != null || (requiredPassword != null && !requiredPassword.isEmpty())) {
 			// Request the client to send credentials in the PasswordMessage
 			// slot -- a shared password, or (UCAN mode) a JWT-encoded UCAN.
 			write(ctx, AuthenticationCleartextPassword.INSTANCE);
@@ -206,7 +220,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void handlePassword(ChannelHandlerContext ctx, PgMessageDecoder.PasswordMessage pwd) {
-		if (ucanPrincipalResolver != null) {
+		if (ucanEntityResolver != null) {
 			if (authenticateUcan(pwd.password())) {
 				completeAuthentication(ctx);
 			} else {
@@ -227,8 +241,8 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 	/**
 	 * Verifies {@code bearerToken} as a JWT-encoded UCAN and resolves its
-	 * issuer DID to an application principal. Sets {@link #principalDid} /
-	 * {@link #principalId} on success. Never throws — any problem is a
+	 * issuer DID to an application entity. Sets {@link #entityDid} /
+	 * {@link #entityId} on success. Never throws — any problem is a
 	 * rejected authentication.
 	 */
 	private boolean authenticateUcan(String bearerToken) {
@@ -243,14 +257,14 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			AString issuer = token.getIssuer();
 			String did = (issuer == null) ? null : issuer.toString();
 			if (did == null) return false;
-			Long resolved = ucanPrincipalResolver.apply(did);
+			Long resolved = ucanEntityResolver.apply(did);
 			if (resolved == null) {
-				log.info("UCAN auth rejected: DID {} not bound to any active principal", did);
+				log.info("UCAN auth rejected: DID {} not bound to any active entity", did);
 				return false;
 			}
-			this.principalDid = did;
-			this.principalId = resolved;
-			log.info("UCAN auth ok: principal {} ({})", resolved, did);
+			this.entityDid = did;
+			this.entityId = resolved;
+			log.info("UCAN auth ok: entity {} ({})", resolved, did);
 			return true;
 		} catch (Exception e) {
 			log.warn("UCAN auth error", e);

@@ -33,6 +33,7 @@ import org.apache.calcite.util.Util;
 import convex.core.data.Strings;
 import convex.db.ConvexDB;
 import convex.db.lattice.SQLDatabase;
+import convex.db.lattice.SQLSchema;
 
 import static java.util.Objects.requireNonNull;
 import static org.apache.calcite.util.Static.RESOURCE;
@@ -326,14 +327,28 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 		SqlValidator validator = new ContextSqlValidator(context, true);
 
 		for (SqlNode node : create.columnList) {
+			String declaredName;
 			if (node instanceof SqlColumnDeclaration col) {
-				columnNames.add(col.name.getSimple());
+				declaredName = col.name.getSimple();
 				RelDataType relType = col.dataType.deriveType(validator, true);
 				columnTypes.add(ConvexColumnType.fromRelDataType(relType));
 			} else if (node instanceof SqlIdentifier id) {
-				columnNames.add(id.getSimple());
+				declaredName = id.getSimple();
 				columnTypes.add(ConvexColumnType.of(ConvexType.ANY));
+			} else {
+				continue;
 			}
+			// OWNERID is a reserved, auto-appended ownership column (see
+			// SQLSchema#OWNERID_COLUMN / PLAN_access_rights.md) -- a client
+			// declaring its own would either collide with or be silently
+			// shadowed by the real one, so reject outright rather than let
+			// either happen quietly.
+			if (SQLSchema.OWNERID_COLUMN.equalsIgnoreCase(declaredName)) {
+				throw new IllegalArgumentException(
+					"Column name '" + declaredName + "' is reserved (auto-appended ownership column) "
+					+ "and cannot be declared explicitly");
+			}
+			columnNames.add(declaredName);
 		}
 
 		// Find the ConvexSchema and create the table in the lattice

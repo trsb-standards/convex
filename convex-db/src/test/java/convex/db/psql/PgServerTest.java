@@ -333,7 +333,7 @@ public class PgServerTest {
 
 		PgServer ucanServer = PgServer.builder()
 			.port(0).database(dbName)
-			.ucanPrincipalResolver(d -> d.equals(did) ? 42L : null)
+			.ucanEntityResolver(d -> d.equals(did) ? 42L : null)
 			.build();
 		ucanServer.start();
 		try (Socket socket = new Socket("localhost", ucanServer.getPort())) {
@@ -363,7 +363,7 @@ public class PgServerTest {
 
 		PgServer ucanServer = PgServer.builder()
 			.port(0).database(dbName)
-			.ucanPrincipalResolver(d -> null) // nothing is bound
+			.ucanEntityResolver(d -> null) // nothing is bound
 			.build();
 		ucanServer.start();
 		try {

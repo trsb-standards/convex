@@ -257,7 +257,9 @@ public class VersionedSQLSchemaTest {
 		List<AVector<ACell>> history = schema.getHistory(TBL, pk(1));
 		AVector<ACell> vals = VersionedSQLTable.getHistoryValues(history.get(0));
 		assertNotNull(vals);
-		assertEquals(inserted, vals);
+		// SQLSchema#insert pads a short row (this test's own 3-column literal)
+		// with a trailing null for OWNERID -- see SQLSchema#OWNERID_COLUMN.
+		assertEquals(inserted.conj(null), vals);
 	}
 
 	@Test

@@ -61,6 +61,22 @@ public class ConvexSchema extends AbstractSchema {
 		return true; // Allow DDL modifications
 	}
 
+	/**
+	 * Functions visible unqualified from this schema — just {@code
+	 * current_entity()} for now. See {@link ConvexFunctions}'s own doc for why
+	 * this is registered identically on every {@code ConvexSchema} instance
+	 * rather than on one central root schema. {@link AbstractSchema}'s own
+	 * {@code getFunctionNames()}/{@code getFunctions(String)} are {@code
+	 * final} and delegate here.
+	 */
+	@Override
+	protected com.google.common.collect.Multimap<String, org.apache.calcite.schema.Function> getFunctionMultimap() {
+		com.google.common.collect.ImmutableMultimap.Builder<String, org.apache.calcite.schema.Function> builder =
+			com.google.common.collect.ImmutableMultimap.builder();
+		builder.put(ConvexFunctions.CURRENT_ENTITY_NAME, ConvexFunctions.CURRENT_ENTITY_FUNCTION);
+		return builder.build();
+	}
+
 	@Override
 	protected Map<String, Table> getTableMap() {
 		Map<String, Table> tableMap = new HashMap<>();
