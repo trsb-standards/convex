@@ -9,6 +9,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 
 import convex.core.data.ABlob;
 import convex.core.data.ACell;
+import convex.core.data.prim.CVMBigInteger;
 import convex.core.data.prim.CVMLong;
 import convex.core.lang.RT;
 import convex.db.calcite.convention.ConvexEnumerable;
@@ -107,9 +108,30 @@ public class ConvexResultConverter {
 
 	/**
 	 * Converts a CVM cell to a Java object for JDBC consumption.
+	 *
+	 * <p>{@link CVMBigInteger} is special-cased to {@code Long} (via {@link
+	 * CVMBigInteger#longValue()}, narrowing/wrapping on overflow same as any
+	 * Java numeric narrowing conversion) rather than the {@code BigInteger}
+	 * {@link RT#jvm} would otherwise return — {@link
+	 * convex.db.calcite.ConvexType#BIGINT} is this driver's only mapping
+	 * that ever produces a {@code CVMBigInteger} cell, and Calcite's own
+	 * generated code for a {@code BIGINT}-typed field always expects a
+	 * boxed {@code Long}, never {@code BigInteger} (that's Calcite's
+	 * internal representation for arbitrary-precision {@code DECIMAL}, a
+	 * different SQL type). Found live 2026-09: {@code SUM(BIGINT)} over
+	 * enough rows to overflow a {@code long} correctly widens internally to
+	 * {@code CVMBigInteger} — a genuine, expected value — but ANSI SQL still
+	 * declares {@code SUM(BIGINT)}'s own result type as plain {@code
+	 * BIGINT}, so Calcite's generated cast (matching that declared type,
+	 * same reasoning {@link #cellToJavaTyped} already documents for {@code
+	 * CVMLong}) threw {@code ClassCastException: BigInteger cannot be cast
+	 * to Long} before this fix — every {@code BigInteger} value this driver
+	 * could ever surface here overflowed for exactly this reason, never an
+	 * intentional arbitrary-precision result the caller wanted preserved.
 	 */
 	public static Object cellToJava(ACell cell) {
 		if (cell == null) return null;
+		if (cell instanceof CVMBigInteger bi) return bi.longValue();
 		if (cell instanceof ABlob blob) return blob.getBytes();
 		return RT.jvm(cell);
 	}
@@ -127,6 +149,11 @@ public class ConvexResultConverter {
 				default -> l.longValue();
 			};
 		}
+		// See cellToJava's own doc for why CVMBigInteger always narrows to
+		// Long here regardless of sqlTypeOrdinal -- BIGINT is this driver's
+		// only source of a CVMBigInteger cell, and Calcite represents that
+		// SQL type as Long throughout its generated code, never BigInteger.
+		if (cell instanceof CVMBigInteger bi) return bi.longValue();
 		if (cell instanceof ABlob blob) return blob.getBytes();
 		return RT.jvm(cell);
 	}

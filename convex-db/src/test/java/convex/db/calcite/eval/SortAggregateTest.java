@@ -271,4 +271,33 @@ class SortAggregateTest {
 			assertFalse(rs.next()); // category 3 has only 1 item
 		}
 	}
+
+	/**
+	 * Regression test for a live bug (found 2026-09): {@code SUM(BIGINT)}
+	 * over enough rows to overflow a 64-bit {@code long} correctly widens
+	 * internally to a {@code CVMBigInteger}, but ANSI SQL (and Calcite's own
+	 * generated code) still declares {@code SUM(BIGINT)}'s result type as
+	 * plain {@code BIGINT} — before {@code ConvexResultConverter} started
+	 * narrowing a {@code CVMBigInteger} result to {@code Long}, this threw
+	 * {@code ClassCastException: BigInteger cannot be cast to Long} instead
+	 * of returning a (necessarily truncated/wrapped, same as any narrowing
+	 * numeric conversion) {@code BIGINT} value.
+	 */
+	@Test
+	void testSumBigintOverflowDoesNotThrowClassCastException() throws Exception {
+		try (Statement stmt = conn.createStatement()) {
+			stmt.execute("CREATE TABLE big_vals (id INTEGER, v BIGINT)");
+			stmt.execute("INSERT INTO big_vals VALUES (1, " + Long.MAX_VALUE + ")");
+			stmt.execute("INSERT INTO big_vals VALUES (2, " + Long.MAX_VALUE + ")");
+			stmt.execute("INSERT INTO big_vals VALUES (3, " + Long.MAX_VALUE + ")");
+		}
+		java.math.BigInteger expected = java.math.BigInteger.valueOf(Long.MAX_VALUE)
+			.multiply(java.math.BigInteger.valueOf(3)); // genuinely > Long.MAX_VALUE
+		try (Statement stmt = conn.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT SUM(v) FROM big_vals")) {
+			assertTrue(rs.next());
+			assertEquals(expected.longValue(), rs.getLong(1));
+			assertFalse(rs.next());
+		}
+	}
 }
