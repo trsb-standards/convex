@@ -198,6 +198,27 @@ public class ConvexMeta extends CalciteMetaImpl {
 	private static final Pattern SET_WRITE_ACKS = Pattern.compile(
 		"(?i)SET\\s+WRITE_ACKS\\s*=\\s*(\\d+)\\s*");
 
+	// TRANSFER <DB|SCHEMA|OT> <target> TO <entityid> -- the ownership-
+	// transfer verb (see ConvexDdlExecutor.onTransfer's own doc for the full
+	// design). Same regex-interception shape as REPLICATE DB, and the same
+	// "quotes optional around a bare word/id token" convention -- a target
+	// name with characters outside \w (spaces, dots) needs the numeric id
+	// form instead, same limitation REPLICATE DB/SCHEMA already have.
+	private static final Pattern TRANSFER_DB = Pattern.compile(
+		"(?i)TRANSFER\\s+DB\\s+['\"]?(\\w+)['\"]?\\s+TO\\s+(\\d+)\\s*");
+	private static final Pattern TRANSFER_SCHEMA = Pattern.compile(
+		"(?i)TRANSFER\\s+SCHEMA\\s+['\"]?(\\w+)['\"]?\\s+TO\\s+(\\d+)\\s*");
+	private static final Pattern TRANSFER_OT = Pattern.compile(
+		"(?i)TRANSFER\\s+OT\\s+['\"]?(\\w+)['\"]?\\s+TO\\s+(\\d+)\\s*");
+	// TRANSFER OTROWS FROM <ot> WHERE <predicate> TO <entityid> -- the
+	// predicate itself is opaque here (captured raw, handed to the handler,
+	// which runs it as a real SELECT ... WHERE <predicate>), so this pattern
+	// only needs to find where the predicate ends: the LAST " TO <digits>"
+	// in the statement (reluctant match up to that, DOTALL so a predicate
+	// spanning a literal newline still works).
+	private static final Pattern TRANSFER_OTROWS = Pattern.compile(
+		"(?i)TRANSFER\\s+OTROWS\\s+FROM\\s+['\"]?(\\w+)['\"]?\\s+WHERE\\s+(.+)\\s+TO\\s+(\\d+)\\s*", Pattern.DOTALL);
+
 	/**
 	 * {@inheritDoc}
 	 *
@@ -339,6 +360,50 @@ public class ConvexMeta extends CalciteMetaImpl {
 			m = SET_WRITE_ACKS.matcher(sql.trim());
 			if (m.matches()) {
 				writeAcks = Integer.parseInt(m.group(1));
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
+
+			m = TRANSFER_DB.matcher(sql.trim());
+			if (m.matches()) {
+				ConvexDdlExecutor.fireTransfer(new ConvexDdlExecutor.TransferRequest(
+					ConvexDdlExecutor.TransferKind.DB, m.group(1), null,
+					Integer.parseInt(m.group(2)), getSchemaName()));
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
+
+			m = TRANSFER_SCHEMA.matcher(sql.trim());
+			if (m.matches()) {
+				ConvexDdlExecutor.fireTransfer(new ConvexDdlExecutor.TransferRequest(
+					ConvexDdlExecutor.TransferKind.SCHEMA, m.group(1), null,
+					Integer.parseInt(m.group(2)), getSchemaName()));
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
+
+			// TRANSFER_OT must be checked before it could ever wrongly match
+			// text meant for TRANSFER_OTROWS -- it can't: "OTROWS" right
+			// after "OT" fails TRANSFER_OT's own \s+ requirement, so the two
+			// patterns never collide regardless of check order.
+			m = TRANSFER_OT.matcher(sql.trim());
+			if (m.matches()) {
+				ConvexDdlExecutor.fireTransfer(new ConvexDdlExecutor.TransferRequest(
+					ConvexDdlExecutor.TransferKind.OT, m.group(1), null,
+					Integer.parseInt(m.group(2)), getSchemaName()));
+				rowCount = 0L;
+				return new ExecuteResult(Collections.singletonList(
+						MetaResultSet.count(h.connectionId, h.id, 0L)));
+			}
+
+			m = TRANSFER_OTROWS.matcher(sql.trim());
+			if (m.matches()) {
+				ConvexDdlExecutor.fireTransfer(new ConvexDdlExecutor.TransferRequest(
+					ConvexDdlExecutor.TransferKind.OTROWS, m.group(1), m.group(2),
+					Integer.parseInt(m.group(3)), getSchemaName()));
 				rowCount = 0L;
 				return new ExecuteResult(Collections.singletonList(
 						MetaResultSet.count(h.connectionId, h.id, 0L)));

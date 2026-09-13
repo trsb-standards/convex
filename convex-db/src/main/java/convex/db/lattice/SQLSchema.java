@@ -499,6 +499,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 			if (autoIncrement) {
 				AutoIncrementRegistry.markAutoIncrement(schemaName, name);
 			}
+			maybeAutoIndexOwnerId(name);
 			return true;
 		}
 
@@ -531,7 +532,36 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		final AVector<AVector<ACell>> finalSchema = (AVector<AVector<ACell>>) combinedSchema;
 		ALatticeCursor<AVector<ACell>> tableCursor = cursor.path(name);
 		tableCursor.updateAndGet(state -> state.assoc(SQLTable.POS_SCHEMA, finalSchema));
+		maybeAutoIndexOwnerId(name);
 		return true;
+	}
+
+	/**
+	 * Schema names excluded from the auto-created {@link #OWNERID_COLUMN}
+	 * secondary index (see {@link #maybeAutoIndexOwnerId}) — system/catalog
+	 * schemas where {@code OWNERID} is always NULL/ROOT-owned by convention,
+	 * not a real per-tenant filter column. See PLAN_access_rights.md's
+	 * "Ownership" section ("auto-created only on owner-filtered tables ...
+	 * meta/perf system tables get the column (NULL) but no index").
+	 */
+	private static final java.util.Set<String> NO_OWNER_INDEX_SCHEMAS = java.util.Set.of("meta", "perf");
+
+	/**
+	 * Auto-creates a secondary index on {@link #OWNERID_COLUMN}, unless this
+	 * schema is {@link #NO_OWNER_INDEX_SCHEMAS} or the index already exists.
+	 * Called at both {@link #createTable} return points that actually wrote
+	 * a schema change (fresh creation, and the "table already existed,
+	 * appended new columns" branch — including the very first time an
+	 * already-existing pre-ownership table gains {@code OWNERID}) — never on
+	 * the "no new columns, no-op" path, since nothing changed there.
+	 */
+	private void maybeAutoIndexOwnerId(AString tableName) {
+		String schemaNameStr = (schemaName != null) ? schemaName.toString() : "";
+		if (NO_OWNER_INDEX_SCHEMAS.contains(schemaNameStr.toLowerCase())) return;
+		AString ownerIdCol = Strings.create(OWNERID_COLUMN);
+		if (!hasIndex(tableName, ownerIdCol)) {
+			createIndex(tableName, ownerIdCol);
+		}
 	}
 
 	/** Drops a table by creating a tombstone. */

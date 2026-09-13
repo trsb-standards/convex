@@ -214,6 +214,66 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 		callback.accept(new SchemaReplication(dbName, schemaName));
 	}
 
+	/** The 4 {@code TRANSFER} target kinds — see {@link #onTransfer}'s own doc. */
+	public enum TransferKind { DB, SCHEMA, OT, OTROWS }
+
+	/**
+	 * A {@code TRANSFER} request, made via one of the four regex-intercepted
+	 * forms (see {@link #onTransfer}). {@code target} is the raw text the
+	 * caller typed for the DB/SCHEMA/OT/OTROWS-source identifier — a name or
+	 * a numeric id, resolution is entirely the handler's business (this
+	 * class has no catalog knowledge at all). {@code predicate} is non-null
+	 * only for {@link TransferKind#OTROWS} (the raw {@code WHERE} clause
+	 * text). {@code callerSchemaName} is this connection's own current
+	 * default schema — needed by the handler to resolve an unqualified
+	 * {@code OT}/{@code OTROWS} target name (which schema it lives in isn't
+	 * otherwise recoverable from the statement text alone, mirroring how an
+	 * unqualified {@code CREATE INDEX} already resolves against the
+	 * connection's current schema).
+	 *
+	 * @param kind which of the four TRANSFER forms this is
+	 * @param target the DB/SCHEMA/OT identifier (name or numeric id), as typed
+	 * @param predicate the raw WHERE-clause text (OTROWS only, else null)
+	 * @param targetEntityId the entity to transfer ownership to
+	 * @param callerSchemaName this connection's current default schema
+	 */
+	public record TransferRequest(TransferKind kind, String target, String predicate,
+			int targetEntityId, String callerSchemaName) {}
+
+	/**
+	 * Handler for the {@code TRANSFER} statement family:
+	 * <pre>
+	 * TRANSFER DB      &lt;dbname|dbid&gt;          TO &lt;entityid&gt;
+	 * TRANSFER SCHEMA  &lt;schemaname|schemaid&gt;  TO &lt;entityid&gt;
+	 * TRANSFER OT      &lt;otname|otid&gt;          TO &lt;entityid&gt;
+	 * TRANSFER OTROWS  FROM &lt;otname|otid&gt; WHERE &lt;predicate&gt; TO &lt;entityid&gt;
+	 * </pre>
+	 * Regex-intercepted in {@code ConvexMeta}, same pattern as {@code
+	 * REPLICATE DB}/{@code REGISTER PEER} — see PLAN_access_rights.md's
+	 * "TRANSFER" section (`dbase` repo) for the full design: a plain {@code
+	 * UPDATE ... SET OWNERID} is rejected elsewhere (see {@code
+	 * SQLSchema#OWNERID_COLUMN}'s own doc) — this is the only path that
+	 * changes ownership. Same non-swallowing behaviour as {@link
+	 * #onReplicateDb} — this IS the operation, not a post-hoc refresh, so a
+	 * failure (including an authorization failure — the caller doesn't own
+	 * the target) must be visible to the client as a real query error.
+	 */
+	public static volatile Consumer<TransferRequest> onTransfer;
+
+	/**
+	 * Invokes {@link #onTransfer}, letting any exception it throws propagate
+	 * to the caller.
+	 *
+	 * @throws IllegalStateException if no handler is registered
+	 */
+	public static void fireTransfer(TransferRequest request) {
+		Consumer<TransferRequest> callback = onTransfer;
+		if (callback == null) {
+			throw new IllegalStateException("TRANSFER is not supported in this environment (no handler registered)");
+		}
+		callback.accept(request);
+	}
+
 	public static final SqlParserImplFactory PARSER_FACTORY =
 		new SqlParserImplFactory() {
 			@Override public SqlAbstractParserImpl getParser(Reader stream) {
