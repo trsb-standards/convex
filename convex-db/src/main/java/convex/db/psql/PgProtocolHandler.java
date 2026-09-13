@@ -5,12 +5,15 @@ import convex.auth.ucan.UCAN;
 import convex.auth.ucan.UCANValidator;
 import convex.core.data.AString;
 import convex.core.data.Strings;
+import convex.db.calcite.BatchSyncDeferral;
 import convex.db.calcite.QueryLog;
 import convex.db.psql.msg.*;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import org.apache.calcite.avatica.AvaticaConnection;
+import org.apache.calcite.jdbc.ConvexMeta;
+import org.apache.calcite.jdbc.ConvexMetaAccess;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -88,6 +91,8 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private final Function<String, Long> ucanEntityResolver;
 
 	private Connection connection;
+	/** This connection's Avatica connection id, set alongside {@link #connection} once known — see {@link BatchSyncDeferral}. Null until {@link #completeAuthentication}. */
+	private String avaticaConnectionId;
 	private String user;
 	private String database;
 	private int processId;
@@ -286,6 +291,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			// non-Avatica Connection is a legitimate possibility here.
 			if (connection instanceof AvaticaConnection avaticaConn) {
 				QueryLog.markPgwireConnection(avaticaConn.id);
+				avaticaConnectionId = avaticaConn.id;
 			}
 		} catch (Exception e) {
 			log.error("Failed to get connection", e);
@@ -1067,6 +1073,16 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			// reading a terminal. Sending it per row was pure waste on a
 			// bulk insert: the client has to receive and discard a message
 			// with zero value to it. See executeQuery's own doc.
+			//
+			// Opens (or extends) a deferred-sync window for this connection --
+			// see BatchSyncDeferral's own doc: without this, ConvexMeta synced
+			// (announce+persist+broadcast) after EVERY row of a JDBC batch,
+			// giving executeBatch() zero throughput benefit over an unbatched
+			// loop. handleSync (the wire protocol's own pipeline-flush point,
+			// always sent after however many Binds+Executes the client
+			// pipelined) closes the window and performs one real sync if
+			// anything was dirty.
+			BatchSyncDeferral.begin(avaticaConnectionId);
 			boolean hasResultSet = pstmt.execute();
 			if (hasResultSet) {
 				try (ResultSet rs = pstmt.getResultSet()) {
@@ -1255,6 +1271,16 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void handleSync(ChannelHandlerContext ctx) {
+		// The wire protocol's own pipeline-flush point -- closes out
+		// whatever deferred-sync window executeWithParameters opened (see
+		// BatchSyncDeferral's own doc), performing exactly one real sync if
+		// anything was actually written since the last Sync. A no-op for a
+		// connection that never opened one (e.g. the simple-query path, or a
+		// read-only pipeline).
+		ConvexMeta meta = ConvexMetaAccess.metaOf(connection);
+		if (meta != null) {
+			meta.flushDeferredSync(avaticaConnectionId);
+		}
 		write(ctx, currentReadyState());
 		ctx.flush();
 	}
@@ -1285,6 +1311,13 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			if (connection instanceof AvaticaConnection avaticaConn) {
 				QueryLog.unmarkPgwireConnection(avaticaConn.id);
 			}
+			// Discards, not flushes -- a connection tearing down (client
+			// disconnect, error) mid-pipeline never sent the final Sync that
+			// would normally trigger flushDeferredSync; whatever was pending
+			// is abandoned along with the connection itself, same as any
+			// other in-flight work at teardown. See BatchSyncDeferral's own
+			// doc.
+			BatchSyncDeferral.discard(avaticaConnectionId);
 			try {
 				connection.close();
 			} catch (SQLException e) {

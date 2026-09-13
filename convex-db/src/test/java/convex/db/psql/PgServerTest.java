@@ -557,6 +557,56 @@ public class PgServerTest {
 	}
 
 	/**
+	 * Regression test for a live bug (found 2026-09-13, tracing a benchmark
+	 * that looked hung): {@code executeWithParameters} calls a real internal
+	 * {@code PreparedStatement#execute()} once per {@code Bind+Execute} —
+	 * including every row of a JDBC {@code PreparedStatement#executeBatch()}
+	 * — and {@code ConvexMeta} used to sync (announce+persist+broadcast)
+	 * after every one of those, unconditionally, giving batching zero
+	 * server-side throughput benefit (measured live: 100,000 rows at ~237
+	 * rows/sec, indistinguishable from an unbatched loop). Fixed by
+	 * deferring the sync from every {@code Execute} to the next {@code
+	 * Sync} (see {@code BatchSyncDeferral}'s own doc) — a real {@code
+	 * PreparedStatement#addBatch()}/{@code executeBatch()} pipelines N
+	 * Binds+Executes then one Sync, so this proves the deferred sync still
+	 * lands correctly (every row present, no drops/corruption) and is
+	 * actually visible afterward with no further action needed on this
+	 * connection.
+	 */
+	@Test
+	public void testJdbcExecuteBatchAllRowsLandAndAreVisibleAfterTheBatch() throws Exception {
+		ConvexColumnType[] types = {
+			ConvexColumnType.of(ConvexType.INTEGER), // id
+			ConvexColumnType.varchar(50),            // name
+		};
+		db.tables().createTable("batched", new String[]{"id", "name"}, types);
+
+		String url = "jdbc:postgresql://localhost:" + server.getPort() + "/" + dbName + "?user=testuser";
+		int rowCount = 200;
+		try (Connection conn = DriverManager.getConnection(url);
+			 java.sql.PreparedStatement ps = conn.prepareStatement("INSERT INTO batched (id, name) VALUES (?, ?)")) {
+			for (int i = 0; i < rowCount; i++) {
+				ps.setInt(1, i);
+				ps.setString(2, "row-" + i);
+				ps.addBatch();
+			}
+			int[] counts = ps.executeBatch();
+			assertEquals(rowCount, counts.length);
+			for (int c : counts) assertEquals(1, c);
+		}
+
+		// A fresh connection, with no other statement on it to incidentally
+		// trigger a sync of its own -- proves the batch's own Sync already
+		// made the writes visible, not something else.
+		try (Connection conn = DriverManager.getConnection(url);
+			 Statement stmt = conn.createStatement();
+			 ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM batched")) {
+			assertTrue(rs.next());
+			assertEquals(rowCount, rs.getInt(1));
+		}
+	}
+
+	/**
 	 * Found live 2026-08-25: a SELECT {@code PreparedStatement} reused across
 	 * many executions crashed the real pgjdbc client with {@code
 	 * java.util.NoSuchElementException} at {@code ArrayDeque.removeFirst} deep

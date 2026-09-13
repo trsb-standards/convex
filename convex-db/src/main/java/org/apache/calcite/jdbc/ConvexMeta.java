@@ -15,6 +15,7 @@ import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.server.CalciteServerStatement;
 
 import convex.db.ConvexDB;
+import convex.db.calcite.BatchSyncDeferral;
 import convex.db.calcite.ConvexDdlExecutor;
 import convex.db.calcite.ConvexSchema;
 import convex.db.calcite.QueryLog;
@@ -426,7 +427,7 @@ public class ConvexMeta extends CalciteMetaImpl {
 			}
 
 			ExecuteResult result = super.prepareAndExecute(h, effectiveSql, maxRowCount, maxRowsInFirstFrame, callback);
-			syncIfAutoCommit(trimmedUpper.startsWith("SELECT"));
+			syncIfAutoCommit(trimmedUpper.startsWith("SELECT"), h.connectionId);
 			rowCount = rowCountOf(result);
 			return result;
 		} catch (NoSuchStatementException e) {
@@ -460,7 +461,7 @@ public class ConvexMeta extends CalciteMetaImpl {
 		String sql = signatureSql(h);
 		try {
 			ExecuteResult result = super.execute(h, parameterValues, maxRowsInFirstFrame);
-			syncIfAutoCommit(sql != null && sql.trim().toUpperCase().startsWith("SELECT"));
+			syncIfAutoCommit(sql != null && sql.trim().toUpperCase().startsWith("SELECT"), h.connectionId);
 			rowCount = rowCountOf(result);
 			return result;
 		} catch (NoSuchStatementException e) {
@@ -575,9 +576,42 @@ public class ConvexMeta extends CalciteMetaImpl {
 	 *        a {@code SELECT}) -- skips configuring an ack target
 	 *        regardless of {@link #writeAcks}, since a read never has
 	 *        anything for a peer to acknowledge.
+	 * @param connectionId this statement's Avatica connection id (see
+	 *        {@link BatchSyncDeferral}) -- null-safe, since some call
+	 *        shapes (e.g. a bare local test not going through a real
+	 *        {@code StatementHandle}) may not have one.
 	 */
-	private void syncIfAutoCommit(boolean isQuery) {
+	private void syncIfAutoCommit(boolean isQuery, String connectionId) {
 		if (!autoCommit) return;
+		// See BatchSyncDeferral's own doc: PgProtocolHandler.executeWithParameters
+		// opens a deferred-sync window around every bound-PreparedStatement
+		// Execute in a pg-wire extended-protocol pipeline (including every
+		// row of a JDBC executeBatch()) -- while one is open for this
+		// connection, just record whether a write happened and skip the
+		// real sync; PgProtocolHandler#handleSync (the wire protocol's own
+		// pipeline-flush point) triggers exactly one real sync afterward via
+		// flushDeferredSync, instead of one per row.
+		if (BatchSyncDeferral.isDeferring(connectionId)) {
+			if (!isQuery) BatchSyncDeferral.markDirty(connectionId);
+			return;
+		}
+		doSync(isQuery);
+	}
+
+	/**
+	 * Flushes a deferred batch sync for {@code connectionId} if one is owed
+	 * -- called from {@code PgProtocolHandler#handleSync} via {@code
+	 * ConvexMetaAccess}. A no-op if nothing was dirty (a read-only pipeline,
+	 * or no deferred window was ever open for this connection).
+	 */
+	public void flushDeferredSync(String connectionId) {
+		if (BatchSyncDeferral.end(connectionId)) {
+			doSync(false);
+		}
+	}
+
+	/** The actual sync-performing logic, shared by the immediate and deferred-flush paths. */
+	private void doSync(boolean isQuery) {
 		boolean ackTargetSet = !isQuery && writeAcks >= 0;
 		if (ackTargetSet) {
 			NodeServer.setNextSyncAckTarget(writeAcks, WRITE_ACKS_TIMEOUT_MS);
