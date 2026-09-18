@@ -243,6 +243,39 @@ public class PgServerTest {
 	}
 
 	@Test
+	public void testCastSyntax() throws IOException {
+		try (Socket socket = new Socket("localhost", server.getPort())) {
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+
+			sendStartupMessage(out, dbName, "testuser");
+			skipToReadyForQuery(in);
+
+			// ::int4 must strip as a whole cast, not leave a stray '4' on the column name
+			sendQuery(out, "SELECT id::int4 FROM users WHERE id = 1");
+			// TDC + our fork's own timing NoticeResponse ('N', added 2026-08-05 --
+			// upstream has no equivalent) + ReadyForQuery
+			assertEquals("TDCNZ", readMessageTypes(in));
+		}
+	}
+
+	@Test
+	public void testTildeInLiteral() throws IOException {
+		try (Socket socket = new Socket("localhost", server.getPort())) {
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+
+			sendStartupMessage(out, dbName, "testuser");
+			skipToReadyForQuery(in);
+
+			// A '~' inside a string literal is data, not a regex operator
+			sendQuery(out, "SELECT name FROM users WHERE email <> '~/nobody'");
+			// TDDC + our fork's own timing NoticeResponse ('N') + ReadyForQuery
+			assertEquals("TDDCNZ", readMessageTypes(in));
+		}
+	}
+
+	@Test
 	public void testPasswordAuthentication() throws Exception {
 		// Stop the trust-auth server
 		server.stop();
@@ -783,6 +816,18 @@ public class PgServerTest {
 		out.write(pwdBytes);
 		out.writeByte(0);
 		out.flush();
+	}
+
+	/** Reads messages up to and including ReadyForQuery, returning their type bytes in order */
+	private String readMessageTypes(DataInputStream in) throws IOException {
+		StringBuilder types = new StringBuilder();
+		while (true) {
+			byte type = in.readByte();
+			int length = in.readInt();
+			in.readFully(new byte[length - 4]);
+			types.append((char) type);
+			if (type == 'Z') return types.toString();
+		}
 	}
 
 	private void skipToReadyForQuery(DataInputStream in) throws IOException {
