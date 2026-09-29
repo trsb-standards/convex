@@ -6,6 +6,7 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.ssl.SslContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,6 +49,8 @@ public class PgServer {
 	private final String password;
 	private final Function<String, Connection> connectionSupplier;
 	private final Function<String, Long> ucanEntityResolver;
+	private final SslContext sslContext;
+	private final boolean allowPlaintext;
 
 	private EventLoopGroup bossGroup;
 	private EventLoopGroup workerGroup;
@@ -59,6 +62,8 @@ public class PgServer {
 		this.database = builder.database;
 		this.password = builder.password;
 		this.ucanEntityResolver = builder.ucanEntityResolver;
+		this.sslContext = builder.sslContext;
+		this.allowPlaintext = builder.allowPlaintext;
 
 		if (builder.connectionSupplier != null) {
 			this.connectionSupplier = builder.connectionSupplier;
@@ -103,7 +108,7 @@ public class PgServer {
 					protected void initChannel(SocketChannel ch) {
 						ch.pipeline().addLast(
 							new PgMessageDecoder(),
-							new PgProtocolHandler(connectionSupplier, password, ucanEntityResolver)
+							new PgProtocolHandler(connectionSupplier, password, ucanEntityResolver, sslContext, allowPlaintext)
 						);
 					}
 				})
@@ -230,6 +235,8 @@ public class PgServer {
 		private String password = null;
 		private Function<String, Connection> connectionSupplier = null;
 		private Function<String, Long> ucanEntityResolver = null;
+		private SslContext sslContext = null;
+		private boolean allowPlaintext = false;
 
 		/**
 		 * Sets the port to listen on. Default is 5432.
@@ -276,6 +283,29 @@ public class PgServer {
 		 */
 		public Builder ucanEntityResolver(Function<String, Long> resolver) {
 			this.ucanEntityResolver = resolver;
+			return this;
+		}
+
+		/**
+		 * Offers TLS on this connection — a client's {@code SSLRequest} gets
+		 * {@code 'S'} instead of {@code 'N'}, and the connection upgrades in
+		 * place. See {@link TlsSupport#buildServerSslContext}. Null (the
+		 * default) means no TLS support at all.
+		 */
+		public Builder sslContext(SslContext sslContext) {
+			this.sslContext = sslContext;
+			return this;
+		}
+
+		/**
+		 * When {@link #sslContext} is set, allows a connection that never
+		 * sends {@code SSLRequest} to proceed in plaintext anyway. Off by
+		 * default — once TLS is configured, a client that skips negotiating
+		 * it is refused, mirroring PostgreSQL's own {@code hostssl}/
+		 * {@code ssl=on}. Has no effect when {@link #sslContext} is null.
+		 */
+		public Builder allowPlaintext(boolean allowPlaintext) {
+			this.allowPlaintext = allowPlaintext;
 			return this;
 		}
 

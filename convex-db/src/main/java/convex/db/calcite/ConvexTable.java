@@ -3,6 +3,7 @@ package convex.db.calcite;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.calcite.adapter.java.AbstractQueryableTable;
 import org.apache.calcite.linq4j.Enumerable;
@@ -169,7 +170,47 @@ public class ConvexTable extends AbstractQueryableTable
 
 	// ========== DML Operations (called from generated code) ==========
 
+	/**
+	 * Schemas that reject a direct SQL write (INSERT/UPDATE/DELETE) from any
+	 * connection that resolved to a real, non-ROOT entity — see {@link
+	 * #checkWriteAllowed()}. Round C of `PLAN_access_rights.md` (`dbase`
+	 * repo): catalog data in these schemas is meant to be written only
+	 * through purpose-built handler statements (e.g. a future {@code LINK
+	 * DID}/{@code REVOKE DID}) that can verify a signature/capability first
+	 * — those handlers call the Java API ({@code SQLSchema}) directly and
+	 * never go through this class, so they are unaffected by this guard.
+	 * {@code SELECT} is untouched; only the three DML entry points below
+	 * check this.
+	 */
+	private static final Set<String> PROTECTED_SCHEMAS = Set.of("auth");
+
+	/**
+	 * Sentinel entity id for the system/admin ROOT entity — an admin
+	 * override for {@link #PROTECTED_SCHEMAS}, mirroring the identical
+	 * override in {@code DbaseServer}'s {@code TRANSFER} authorization
+	 * check. Duplicated here (not imported) because {@code convex-db} has
+	 * no dependency on {@code dbase-meta}, where the real constant lives:
+	 * {@code dbase.meta.auth.Entity.ROOT_ENTITYID}. Must stay in sync with
+	 * that value if it ever changes.
+	 */
+	private static final long ROOT_ENTITY_ID = 0L;
+
+	/**
+	 * Rejects a DML statement against a {@link #PROTECTED_SCHEMAS} schema
+	 * unless the connection is trust (no UCAN token — {@link
+	 * convex.db.CurrentEntity#get()} is null) or resolved to {@link
+	 * #ROOT_ENTITY_ID}. Called once per statement, not per row.
+	 */
+	private void checkWriteAllowed() {
+		if (!PROTECTED_SCHEMAS.contains(schema.getName())) return;
+		Long entityId = convex.db.CurrentEntity.get();
+		if (entityId == null || entityId == ROOT_ENTITY_ID) return;
+		throw new RuntimeException("Direct writes to protected schema '" + schema.getName() +
+			"' are not permitted; use the appropriate handler statement instead.");
+	}
+
 	public long executeInsert(Enumerable<?> input) {
+		checkWriteAllowed();
 		try {
 			long count = 0;
 			for (Object value : input) {
@@ -185,6 +226,7 @@ public class ConvexTable extends AbstractQueryableTable
 	}
 
 	public long executeUpdate(Enumerable<?> input, int columnCount, int[] updateIndices) {
+		checkWriteAllowed();
 		try {
 			boolean pkBeingUpdated = false;
 			for (int idx : updateIndices) {
@@ -238,7 +280,7 @@ public class ConvexTable extends AbstractQueryableTable
 					}
 					schema.getTables().deleteByKey(tableName, oldPk);
 				}
-				if (insertRow(updatedRow)) {
+				if (insertRow(updatedRow, false)) {
 					count++;
 				}
 			}
@@ -249,6 +291,7 @@ public class ConvexTable extends AbstractQueryableTable
 	}
 
 	public long executeDelete(Enumerable<?> input) {
+		checkWriteAllowed();
 		try {
 			long count = 0;
 			for (Object value : input) {
@@ -284,9 +327,27 @@ public class ConvexTable extends AbstractQueryableTable
 		return new RuntimeException(message, e);
 	}
 
+	/** Genuine new row (INSERT) — stamps {@code OWNERID} from the current entity. */
 	private boolean insertRow(Object[] row) {
+		return insertRow(row, true);
+	}
+
+	/**
+	 * @param stampOwner true for a genuine new row (INSERT); false for the
+	 *        upsert-in-place path inside {@link #executeUpdate} — an UPDATE
+	 *        never changes ownership (that's what {@code TRANSFER} is for),
+	 *        and {@code updatedRow}'s {@code OWNERID} slot already carries
+	 *        over the target row's real, already-stamped value from the old
+	 *        row it was copied from. Re-stamping there would both be wrong
+	 *        (silently reassigning ownership to whoever ran the UPDATE) and
+	 *        throw outright, since {@link #stampOwnerId} rejects a non-null
+	 *        incoming value as a client trying to set it directly — found
+	 *        live while building Round C's {@code PROTECTED_SCHEMAS} tests:
+	 *        any UPDATE against a row an entity actually owns hit this.
+	 */
+	private boolean insertRow(Object[] row, boolean stampOwner) {
 		if (row == null || row.length < 1) return false;
-		stampOwnerId(row);
+		if (stampOwner) stampOwnerId(row);
 		ConvexColumnType[] types = getColumnTypes();
 		ACell[] cells = new ACell[row.length];
 		for (int i = 0; i < row.length; i++) {

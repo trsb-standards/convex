@@ -11,6 +11,7 @@ import convex.db.psql.msg.*;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.ssl.SslContext;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.jdbc.ConvexMeta;
 import org.apache.calcite.jdbc.ConvexMetaAccess;
@@ -134,6 +135,20 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private boolean inTransaction = false;
 	private boolean transactionFailed = false;
 
+	/** TLS context to offer on {@code SSLRequest}, or null to always answer {@code 'N'}. See {@link TlsSupport}. */
+	private final SslContext sslContext;
+	/**
+	 * When {@link #sslContext} is non-null and this is false (the default),
+	 * a connection that never sends {@code SSLRequest} at all -- goes
+	 * straight to a plaintext {@code StartupMessage} -- is refused, not
+	 * silently accepted in plaintext. Mirrors PostgreSQL's own
+	 * {@code hostssl}/{@code ssl=on}. Ignored when {@link #sslContext} is
+	 * null, since nothing else would work in that case.
+	 */
+	private final boolean allowPlaintext;
+	/** Set once {@link #handleSSLRequest} has upgraded this channel. */
+	private boolean tlsNegotiated = false;
+
 	/**
 	 * Creates a handler that uses the given connection supplier.
 	 *
@@ -150,9 +165,22 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 */
 	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
 			Function<String, Long> ucanEntityResolver) {
+		this(connectionSupplier, requiredPassword, ucanEntityResolver, null, false);
+	}
+
+	/**
+	 * @param sslContext see {@link #sslContext}'s own doc. Null disables
+	 *        TLS entirely (every {@code SSLRequest} answered {@code 'N'}),
+	 *        matching every pre-existing caller/test unchanged.
+	 * @param allowPlaintext see {@link #allowPlaintext}'s own doc.
+	 */
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
+			Function<String, Long> ucanEntityResolver, SslContext sslContext, boolean allowPlaintext) {
 		this.connectionSupplier = connectionSupplier;
 		this.requiredPassword = requiredPassword;
 		this.ucanEntityResolver = ucanEntityResolver;
+		this.sslContext = sslContext;
+		this.allowPlaintext = allowPlaintext;
 		this.processId = processIdCounter.incrementAndGet();
 		this.secretKey = ThreadLocalRandom.current().nextInt();
 	}
@@ -209,13 +237,43 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void handleSSLRequest(ChannelHandlerContext ctx) {
-		// Respond with 'N' - we don't support SSL
+		if (sslContext == null) {
+			ByteBuf buf = ctx.alloc().buffer(1);
+			buf.writeByte('N');
+			ctx.writeAndFlush(buf);
+			return;
+		}
+		// Reply 'S', then upgrade in place: PG-wire's SSLRequest/'S' exchange
+		// is a plaintext STARTTLS-style negotiation -- everything from here
+		// on is a normal TLS handshake on the same socket. The SslHandler
+		// must go at the very front of the pipeline (ahead of
+		// PgMessageDecoder) so it decrypts inbound bytes before anything
+		// else sees them.
 		ByteBuf buf = ctx.alloc().buffer(1);
-		buf.writeByte('N');
+		buf.writeByte('S');
 		ctx.writeAndFlush(buf);
+		ctx.pipeline().addFirst("ssl", sslContext.newHandler(ctx.alloc()));
+		tlsNegotiated = true;
 	}
 
 	private void handleStartup(ChannelHandlerContext ctx, PgMessageDecoder.StartupMessage startup) {
+		// A StartupMessage arriving without a prior SSLRequest means this
+		// client never negotiated TLS at all -- reject outright when TLS is
+		// configured and plaintext isn't explicitly allowed, mirroring
+		// PostgreSQL's own hostssl/ssl=on. A client that *did* negotiate
+		// TLS reaches this normally, decrypted, with tlsNegotiated already
+		// true from handleSSLRequest.
+		if (sslContext != null && !allowPlaintext && !tlsNegotiated) {
+			write(ctx, ErrorResponse.builder()
+				.severity("FATAL")
+				.code("08004")
+				.message("SSL/TLS required")
+				.build());
+			ctx.flush();
+			ctx.close();
+			return;
+		}
+
 		log.debug("Startup: version={}.{}, params={}", startup.majorVersion(), startup.minorVersion(), startup.params());
 
 		this.user = startup.params().get("user");

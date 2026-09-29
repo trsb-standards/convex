@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import convex.db.ConvexDB;
 import convex.db.calcite.ConvexColumnType;
@@ -841,6 +842,107 @@ public class PgServerTest {
 				byte[] content = new byte[length - 4];
 				in.readFully(content);
 			}
+		}
+	}
+
+	/**
+	 * Tests for TLS on PG-wire (default-on — see {@code dbase}'s
+	 * {@code PLAN_access_rights.md}, "TLS on PG-wire"). Each test builds
+	 * its own throwaway CA + leaf cert via {@link TlsSupport} in a
+	 * {@code @TempDir}, rather than sharing the class's own trust-mode
+	 * {@link #server}.
+	 */
+	@TempDir
+	java.io.File tlsCertDir;
+
+	@Test
+	public void testTlsConnectionSucceedsWithValidCertificate() throws Exception {
+		io.netty.handler.ssl.SslContext sslContext = TlsSupport.buildServerSslContext(
+			new java.io.File(tlsCertDir, "ca.crt"), new java.io.File(tlsCertDir, "ca.key"),
+			new java.io.File(tlsCertDir, "node.crt"), new java.io.File(tlsCertDir, "node.key"),
+			"localhost");
+		PgServer tlsServer = PgServer.builder()
+			.port(0)
+			.database(dbName)
+			.sslContext(sslContext)
+			.build();
+		tlsServer.start();
+		try {
+			// sslmode=require negotiates TLS; NonValidatingFactory skips trust
+			// verification of the throwaway self-signed-CA-issued cert -- the
+			// point of this test is that the handshake and query succeed once
+			// negotiated, not exercising real client-side trust (that's an
+			// operator/app deployment concern, not this server's own logic).
+			String url = "jdbc:postgresql://localhost:" + tlsServer.getPort() + "/" + dbName
+				+ "?user=testuser&sslmode=require&sslfactory=org.postgresql.ssl.NonValidatingFactory";
+			try (Connection conn = DriverManager.getConnection(url);
+				 Statement stmt = conn.createStatement();
+				 ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM users")) {
+				assertTrue(rs.next());
+				assertEquals(2, rs.getInt(1));
+			}
+		} finally {
+			tlsServer.stop();
+		}
+	}
+
+	@Test
+	public void testPlaintextRejectedWhenTlsRequiredByDefault() throws Exception {
+		io.netty.handler.ssl.SslContext sslContext = TlsSupport.buildServerSslContext(
+			new java.io.File(tlsCertDir, "ca.crt"), new java.io.File(tlsCertDir, "ca.key"),
+			new java.io.File(tlsCertDir, "node.crt"), new java.io.File(tlsCertDir, "node.key"),
+			"localhost");
+		// allowPlaintext defaults to false -- a connection that skips
+		// SSLRequest entirely must be refused, not silently accepted.
+		PgServer tlsServer = PgServer.builder()
+			.port(0)
+			.database(dbName)
+			.sslContext(sslContext)
+			.build();
+		tlsServer.start();
+		try (Socket socket = new Socket("localhost", tlsServer.getPort())) {
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+
+			// Go straight to StartupMessage, skipping SSLRequest entirely --
+			// exactly what an old/misconfigured client that never negotiates
+			// TLS at all would do.
+			sendStartupMessage(out, dbName, "testuser");
+
+			byte type = in.readByte();
+			assertEquals('E', type, "expected ErrorResponse for a connection that skipped SSLRequest");
+			int length = in.readInt();
+			in.readFully(new byte[length - 4]);
+
+			// The server closes the connection after the error -- further
+			// reads hit end-of-stream rather than a ReadyForQuery.
+			assertEquals(-1, in.read());
+		} finally {
+			tlsServer.stop();
+		}
+	}
+
+	@Test
+	public void testPlaintextAllowedWhenExplicitlyPermitted() throws Exception {
+		io.netty.handler.ssl.SslContext sslContext = TlsSupport.buildServerSslContext(
+			new java.io.File(tlsCertDir, "ca.crt"), new java.io.File(tlsCertDir, "ca.key"),
+			new java.io.File(tlsCertDir, "node.crt"), new java.io.File(tlsCertDir, "node.key"),
+			"localhost");
+		PgServer tlsServer = PgServer.builder()
+			.port(0)
+			.database(dbName)
+			.sslContext(sslContext)
+			.allowPlaintext(true)
+			.build();
+		tlsServer.start();
+		try (Socket socket = new Socket("localhost", tlsServer.getPort())) {
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+
+			sendStartupMessage(out, dbName, "testuser");
+			skipToReadyForQuery(in);
+		} finally {
+			tlsServer.stop();
 		}
 	}
 }
