@@ -63,6 +63,7 @@ import convex.lattice.generic.IndexLattice;
  *   <li>{@link #CT_INSERT} = 1</li>
  *   <li>{@link #CT_UPDATE} = 2</li>
  *   <li>{@link #CT_DELETE} = 3</li>
+ *   <li>{@link #CT_BACKFILL} = 4</li>
  * </ul>
  *
  * <p>Deduplication: writes are skipped if the incoming values are identical to the
@@ -82,6 +83,15 @@ public class VersionedSQLTable extends SQLTable {
 	public static final long CT_UPDATE = 2;
 	/** Change type: row was deleted. */
 	public static final long CT_DELETE = 3;
+	/**
+	 * Change type: row was present at {@code ALTER TABLE ... VERSIONED}
+	 * conversion time, recorded as a synthetic baseline entry rather than a
+	 * genuine observed insert — see {@link SQLSchema#convertToVersioned}.
+	 * Deliberately distinct from {@link #CT_INSERT} so a backfilled "this
+	 * existed when we started tracking" entry can never be mistaken for a
+	 * real insert event when auditing/debugging history.
+	 */
+	public static final long CT_BACKFILL = 4;
 
 	/**
 	 * HLC-style monotonic write-sequence counter for history-key ordering —

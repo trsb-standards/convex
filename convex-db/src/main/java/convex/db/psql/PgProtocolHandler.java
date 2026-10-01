@@ -99,6 +99,19 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 */
 	private final Function<String, Long> ucanEntityResolver;
 
+	/**
+	 * Resolves an already-resolved {@link #entityId} to the display label
+	 * reported as {@code session_authorization} (see {@link
+	 * #sessionAuthorizationLabel}) — e.g. {@code "SELF"} for a natural
+	 * person's own login, {@code "Entity 10 Acme Corp"} for anything else.
+	 * Deliberately pluggable rather than hardcoded here: this class has no
+	 * notion of entity {@code KIND}/name (that's {@code dbase}'s {@code
+	 * auth.entity} business logic, not a concept {@code convex-db} owns).
+	 * Null, or a null/blank return from it, falls back to a bare {@code
+	 * "Entity <id>"}.
+	 */
+	private final Function<Long, String> entitySessionLabelResolver;
+
 	private Connection connection;
 	/** This connection's Avatica connection id, set alongside {@link #connection} once known — see {@link BatchSyncDeferral}. Null until {@link #completeAuthentication}. */
 	private String avaticaConnectionId;
@@ -176,9 +189,17 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 */
 	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
 			Function<String, Long> ucanEntityResolver, SslContext sslContext, boolean allowPlaintext) {
+		this(connectionSupplier, requiredPassword, ucanEntityResolver, null, sslContext, allowPlaintext);
+	}
+
+	/** @param entitySessionLabelResolver see {@link #entitySessionLabelResolver}'s own doc. Null uses the bare-id fallback. */
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
+			Function<String, Long> ucanEntityResolver, Function<Long, String> entitySessionLabelResolver,
+			SslContext sslContext, boolean allowPlaintext) {
 		this.connectionSupplier = connectionSupplier;
 		this.requiredPassword = requiredPassword;
 		this.ucanEntityResolver = ucanEntityResolver;
+		this.entitySessionLabelResolver = entitySessionLabelResolver;
 		this.sslContext = sslContext;
 		this.allowPlaintext = allowPlaintext;
 		this.processId = processIdCounter.incrementAndGet();
@@ -193,6 +214,39 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	/** The authenticated entity's resolved application id, or null if not UCAN-authenticated. */
 	public Long getEntityId() {
 		return entityId;
+	}
+
+	/**
+	 * {@code "SELF"} when this connection isn't acting as a distinct
+	 * non-person entity — a trust/no-password connection (admin, bootstrap, a
+	 * direct {@code jdbc:convex:} caller), or a UCAN login that {@link
+	 * #entitySessionLabelResolver} reports as a natural person acting as
+	 * themselves — or that resolver's own label (typically {@code "Entity
+	 * <id> <name>"}) for anything else, e.g. a legal person/company account
+	 * or a server agent. There is deliberately no third option: nothing in
+	 * this system lets a connection act <em>as</em> some other entity (no
+	 * delegation/"acting on behalf of" exists yet — see {@code
+	 * PLAN_access_rights.md}'s deferred {@code Power}/{@code
+	 * Authorityclosure}), so a login is always either nobody-in-particular
+	 * (trust) or exactly the one entity it authenticated as.
+	 *
+	 * <p>Reported to the client as the {@code session_authorization}
+	 * parameter (see {@link #completeAuthentication}) so an ordinary,
+	 * unmodified {@code psql} shows it automatically via the standard {@code
+	 * %n} prompt escape, which {@code psql}'s own docs describe as tracking
+	 * {@code session_authorization} server-side, not just the connect-time
+	 * username. No {@code dbase}-specific client config needed beyond a
+	 * {@code PROMPT1} that includes {@code %n}, e.g. {@code \set PROMPT1
+	 * '%M:%>/%/ %n%# '} — giving {@code "localhost:5434/meta SELF>"} or
+	 * {@code "localhost:5434/meta Entity 42 Acme Corp>"}.
+	 */
+	private String sessionAuthorizationLabel() {
+		if (entityId == null) return "SELF";
+		if (entitySessionLabelResolver != null) {
+			String label = entitySessionLabelResolver.apply(entityId);
+			if (label != null && !label.isBlank()) return label;
+		}
+		return "Entity " + entityId;
 	}
 
 	@Override
@@ -377,6 +431,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		write(ctx, ParameterStatus.timeZone("UTC"));
 		write(ctx, ParameterStatus.integerDatetimes(true));
 		write(ctx, new ParameterStatus("standard_conforming_strings", "on"));
+		write(ctx, new ParameterStatus("session_authorization", sessionAuthorizationLabel()));
 
 		// Send backend key data
 		write(ctx, new BackendKeyData(processId, secretKey));

@@ -49,6 +49,7 @@ public class PgServer {
 	private final String password;
 	private final Function<String, Connection> connectionSupplier;
 	private final Function<String, Long> ucanEntityResolver;
+	private final Function<Long, String> entitySessionLabelResolver;
 	private final SslContext sslContext;
 	private final boolean allowPlaintext;
 
@@ -62,6 +63,7 @@ public class PgServer {
 		this.database = builder.database;
 		this.password = builder.password;
 		this.ucanEntityResolver = builder.ucanEntityResolver;
+		this.entitySessionLabelResolver = builder.entitySessionLabelResolver;
 		this.sslContext = builder.sslContext;
 		this.allowPlaintext = builder.allowPlaintext;
 
@@ -108,7 +110,8 @@ public class PgServer {
 					protected void initChannel(SocketChannel ch) {
 						ch.pipeline().addLast(
 							new PgMessageDecoder(),
-							new PgProtocolHandler(connectionSupplier, password, ucanEntityResolver, sslContext, allowPlaintext)
+							new PgProtocolHandler(connectionSupplier, password, ucanEntityResolver,
+								entitySessionLabelResolver, sslContext, allowPlaintext)
 						);
 					}
 				})
@@ -235,6 +238,7 @@ public class PgServer {
 		private String password = null;
 		private Function<String, Connection> connectionSupplier = null;
 		private Function<String, Long> ucanEntityResolver = null;
+		private Function<Long, String> entitySessionLabelResolver = null;
 		private SslContext sslContext = null;
 		private boolean allowPlaintext = false;
 
@@ -283,6 +287,20 @@ public class PgServer {
 		 */
 		public Builder ucanEntityResolver(Function<String, Long> resolver) {
 			this.ucanEntityResolver = resolver;
+			return this;
+		}
+
+		/**
+		 * Resolves a UCAN-resolved entity id to the display label reported as
+		 * {@code session_authorization} (see {@link
+		 * PgProtocolHandler#sessionAuthorizationLabel}) — e.g. {@code "SELF"}
+		 * for a natural person's own login, {@code "Entity 10 Acme Corp"} for
+		 * anything else. If not set (or it returns null/blank), a bare
+		 * {@code "Entity <id>"} is used. Has no effect on a trust connection
+		 * (no entity id to resolve), which is always {@code "SELF"}.
+		 */
+		public Builder entitySessionLabelResolver(Function<Long, String> resolver) {
+			this.entitySessionLabelResolver = resolver;
 			return this;
 		}
 

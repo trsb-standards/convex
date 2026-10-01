@@ -579,7 +579,7 @@ public class ConvexDriverTest {
 	 * (nothing backfilled) and start populating only from the next write.
 	 */
 	@Test
-	public void testAlterTableVersionedConvertsInPlaceWithNoBackfill() throws Exception {
+	public void testAlterTableVersionedConvertsInPlaceAndBackfillsCurrentRows() throws Exception {
 		ConvexDB cdb = ConvexDB.create();
 		cdb.database("alter_versioned_test").tables();
 		cdb.register("alter_versioned_test");
@@ -605,16 +605,62 @@ public class ConvexDriverTest {
 				assertEquals("alpha", rs.getString("name"));
 			}
 
-			// No history backfilled for the pre-conversion insert.
-			assertTrue(tables.getHistory("T", CVMLong.create(1L)).isEmpty());
+			// The pre-conversion row is backfilled as one CT_BACKFILL history
+			// entry (distinct from CT_INSERT, so it's never mistaken for a
+			// genuinely observed insert) as of conversion time -- see
+			// SQLSchema.convertToVersioned's own doc for why this reverses
+			// the earlier "no backfill" design (raised live 2026-10-01: a
+			// user converting a table specifically to debug/track changes
+			// wants the starting state captured too, not just future deltas
+			// against an invisible baseline).
+			List<AVector<ACell>> backfilled = tables.getHistory("T", CVMLong.create(1L));
+			assertEquals(1, backfilled.size());
+			assertEquals(convex.db.lattice.VersionedSQLTable.CT_BACKFILL,
+				((CVMLong) backfilled.get(0).get(2)).longValue());
 
-			// A write from this point onward IS tracked -- a plain non-pk
-			// UPDATE upserts in place (see the comment in the sibling
-			// CREATE TABLE VERSIONED test above), so this is 1 entry.
+			// A write from this point onward IS tracked on top of the
+			// backfill -- a plain non-pk UPDATE upserts in place (see the
+			// comment in the sibling CREATE TABLE VERSIONED test above), so
+			// this adds 1 more entry.
 			stmt.executeUpdate("UPDATE t SET name = 'alpha-v2' WHERE id = 1");
-			assertEquals(1, tables.getHistory("T", CVMLong.create(1L)).size());
+			assertEquals(2, tables.getHistory("T", CVMLong.create(1L)).size());
 		} finally {
 			cdb.unregister("alter_versioned_test");
+		}
+	}
+
+	/**
+	 * Regression test for the live bug reported 2026-09-30: {@code ALTER
+	 * TABLE ot VERSIONED} against a table created via the direct Java API
+	 * (e.g. dbase-meta's own catalog tables, stored exactly as given --
+	 * lowercase) failed with {@code Table "OT" not found}, because this
+	 * regex-intercepted statement used to blindly uppercase the captured
+	 * table name to match Calcite's own unquoted-identifier normalization --
+	 * correct for a table created via ordinary SQL DDL, but wrong for one
+	 * that was never Calcite-normalized in the first place.
+	 */
+	@Test
+	public void testAlterTableVersionedResolvesALowercaseJavaApiCreatedTableNameCaseInsensitively() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		cdb.database("alter_versioned_lowercase_test").tables();
+		cdb.register("alter_versioned_lowercase_test");
+
+		try {
+			SQLSchema tables = cdb.database("alter_versioned_lowercase_test").tables();
+			// Mirrors dbase-meta's own catalog tables: created via the
+			// direct Java API, never through Calcite -- stored exactly as
+			// given ("ot"), not uppercased.
+			tables.createTable("ot", new String[]{"ID"}, new convex.db.calcite.ConvexType[]{convex.db.calcite.ConvexType.INTEGER}, 1);
+
+			try (Connection conn = DriverManager.getConnection("jdbc:convex:database=alter_versioned_lowercase_test");
+					Statement stmt = conn.createStatement()) {
+				stmt.executeUpdate("ALTER TABLE ot VERSIONED");
+			}
+
+			assertTrue(TableVersionRegistry.isVersioned(
+				Strings.create("alter_versioned_lowercase_test"), Strings.create("ot")));
+		} finally {
+			cdb.unregister("alter_versioned_lowercase_test");
 		}
 	}
 
@@ -812,6 +858,53 @@ public class ConvexDriverTest {
 			}
 		} finally {
 			cdb.unregister("history_suffix_test");
+		}
+	}
+
+	/**
+	 * Regression test for the live bug reported 2026-10-01: a history entry
+	 * recorded before a column was later appended to the table (schema
+	 * evolution is append-only -- see CLAUDE.md's "Planned: schema
+	 * evolution" section; {@code OWNERID}'s own auto-append is one real
+	 * example) threw {@code IndexOutOfBoundsException} reading {@code
+	 * t_HISTORY}, instead of treating the missing trailing column as null --
+	 * the same tolerance an ordinary (non-history) row already gets.
+	 */
+	@Test
+	public void testHistorySuffixTableToleratesEntriesRecordedBeforeANewColumnWasAdded() throws Exception {
+		ConvexDB cdb = ConvexDB.create();
+		SQLSchema tables = cdb.database("history_schema_growth_test").tables();
+		cdb.register("history_schema_growth_test");
+
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:database=history_schema_growth_test");
+				Statement stmt = conn.createStatement()) {
+			stmt.executeUpdate("CREATE TABLE t (id INTEGER, name VARCHAR(50)) VERSIONED");
+			stmt.executeUpdate("INSERT INTO t VALUES (1, 'alpha')");
+
+			// Append a new column after this history entry already exists --
+			// via the direct Java API, matching how createTable's own "table
+			// already exists, append new columns" branch is actually
+			// triggered in production (e.g. OWNERID's auto-append). Column
+			// names must match Calcite's own uppercase normalization of the
+			// original DDL's unquoted identifiers, or ID/NAME would be
+			// treated as new (case-sensitive name match) and duplicated.
+			tables.createTable("T", new String[]{"ID", "NAME", "EXTRA"},
+				new convex.db.calcite.ConvexColumnType[]{
+					convex.db.calcite.ConvexColumnType.of(convex.db.calcite.ConvexType.INTEGER),
+					convex.db.calcite.ConvexColumnType.of(convex.db.calcite.ConvexType.VARCHAR),
+					convex.db.calcite.ConvexColumnType.of(convex.db.calcite.ConvexType.VARCHAR)},
+				1);
+
+			try (ResultSet rs = stmt.executeQuery("SELECT ID, NAME, EXTRA, CHANGETYPE FROM t_HISTORY ORDER BY WRITESEQ")) {
+				assertTrue(rs.next());
+				assertEquals(1, rs.getInt("ID"));
+				assertEquals("alpha", rs.getString("NAME"));
+				assertNull(rs.getString("EXTRA"));
+				assertEquals("INSERT", rs.getString("CHANGETYPE"));
+				assertFalse(rs.next());
+			}
+		} finally {
+			cdb.unregister("history_schema_growth_test");
 		}
 	}
 

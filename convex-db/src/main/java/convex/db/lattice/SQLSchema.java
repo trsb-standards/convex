@@ -898,9 +898,35 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 
 	/**
 	 * Converts an existing plain table to versioned (row-history-tracked) in
-	 * place. Prospective-only: existing live rows are preserved unchanged,
-	 * but no history is backfilled for writes that happened before this call
-	 * — only writes from this point onward are tracked.
+	 * place. Existing live rows are preserved unchanged, and each one is
+	 * also backfilled into history as a {@link VersionedSQLTable#CT_BACKFILL}
+	 * entry (fresh {@link VersionedSQLTable#nextHistorySeq()} value, as of
+	 * conversion time) -- so {@code _HISTORY}/{@code AS OF} queries see the
+	 * table's full current contents from the moment of conversion onward,
+	 * not just writes that happen to land after it. This is a deliberate
+	 * reversal of this method's earlier "prospective-only" behaviour: a user
+	 * converting a table specifically to debug/track changes going forward
+	 * still wants the starting state captured, not just future deltas
+	 * relative to an invisible baseline. True pre-conversion history (writes
+	 * that happened before this call) is still unrecoverable -- it was never
+	 * tracked -- only the current snapshot can be backfilled. A distinct
+	 * change type (rather than reusing {@code CT_INSERT}) keeps a backfilled
+	 * "this existed when we started tracking" entry from ever being mistaken
+	 * for a genuinely observed insert event when auditing history.
+	 *
+	 * <p>The whole read-existing-rows-then-build-history step runs inside a
+	 * single {@link ALatticeCursor#updateAndGet} (same pattern every other
+	 * mutation in {@link VersionedSQLTable} already uses) rather than a
+	 * separate read followed by an unconditional {@code set} -- the earlier,
+	 * non-atomic version of this method could silently lose a write that
+	 * raced the conversion (landed between the read and the set). This
+	 * matters here specifically because a table like {@code otcol} is
+	 * rewritten by {@code MetaPopulator} on essentially every DDL event, so
+	 * a concurrent write during conversion is a real, not theoretical, risk.
+	 * {@code updateAndGet} retries the whole computation against the latest
+	 * state on CAS contention, so no concurrent write is ever lost -- the
+	 * only side effect of a retry is a handful of burned (unused)
+	 * {@code nextHistorySeq()} values, which is harmless.
 	 *
 	 * @return true if converted (or already versioned); false if the table doesn't exist
 	 */
@@ -908,6 +934,7 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 		return convertToVersioned(Strings.create(tableName));
 	}
 
+	@SuppressWarnings("unchecked")
 	public boolean convertToVersioned(AString tableName) {
 		SQLTable table = getLiveTable(tableName);
 		if (table == null) return false;
@@ -919,21 +946,40 @@ public class SQLSchema extends ALatticeComponent<Index<AString, AVector<ACell>>>
 				"Cannot convert a composite-PK table to versioned (pkCount=" + pkCount + ")");
 		}
 
-		// Positions 0-3 (schema, rows, utime, liveCount) are identical
-		// between SQLTable and VersionedSQLTable -- carry them over
-		// directly, so existing live rows survive the conversion unchanged.
-		// Position 4 differs (blockVec for plain, history for versioned) --
-		// start it empty, per the locked-in prospective-only semantics.
-		AVector<ACell> state = table.getState();
-		AVector<ACell> versionedState = Vectors.of(
-			state.get(SQLTable.POS_SCHEMA),
-			state.get(SQLTable.POS_ROWS),
-			state.get(SQLTable.POS_UTIME),
-			state.get(SQLTable.POS_LIVE_COUNT),
-			Index.EMPTY);
-
 		ALatticeCursor<AVector<ACell>> tableCursor = cursor.path(tableName);
-		tableCursor.set(versionedState);
+		tableCursor.updateAndGet(state -> {
+			// Positions 0-3 (schema, rows, utime, liveCount) are identical
+			// between SQLTable and VersionedSQLTable -- carry them over
+			// directly from THIS callback's own state parameter (not any
+			// snapshot read before entering updateAndGet), so existing live
+			// rows -- and any concurrent write racing this conversion --
+			// survive correctly. Position 4 differs (blockVec for plain,
+			// history for versioned) -- backfilled below with one
+			// CT_BACKFILL entry per currently-live row.
+			Index<ABlob, ACell> rows = (Index<ABlob, ACell>) state.get(SQLTable.POS_ROWS);
+			Index<ABlob, AVector<ACell>>[] historyHolder =
+				new Index[]{(Index<ABlob, AVector<ACell>>) Index.EMPTY};
+			if (rows != null) {
+				rows.forEach((bk, block) -> {
+					if (!RowBlock.isBlock(block)) return;
+					RowBlock.forEach(block, (pk, row) -> {
+						if (!SQLRow.isLive(row)) return;
+						long writeSeq = VersionedSQLTable.nextHistorySeq();
+						historyHolder[0] = historyHolder[0].assoc(
+							HistoryKey.of(pk, writeSeq),
+							Vectors.of(SQLRow.encodeValues(SQLRow.getValues(row)),
+								CVMLong.create(writeSeq), CVMLong.create(VersionedSQLTable.CT_BACKFILL)));
+					});
+				});
+			}
+
+			return Vectors.of(
+				state.get(SQLTable.POS_SCHEMA),
+				state.get(SQLTable.POS_ROWS),
+				state.get(SQLTable.POS_UTIME),
+				state.get(SQLTable.POS_LIVE_COUNT),
+				historyHolder[0]);
+		});
 		TableVersionRegistry.markVersioned(schemaName, tableName);
 		return true;
 	}

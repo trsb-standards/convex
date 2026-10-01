@@ -4,10 +4,13 @@ import java.io.Reader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.calcite.avatica.Meta.ExecuteResult;
+import org.apache.calcite.avatica.Meta.StatementHandle;
 import org.apache.calcite.jdbc.CalcitePrepare;
 import org.apache.calcite.jdbc.CalciteSchema;
 import org.apache.calcite.rel.type.RelDataType;
@@ -109,6 +112,62 @@ public class ConvexDdlExecutor extends DdlExecutorImpl {
 			LOG.warn("onDdlExecuted callback failed", e);
 		}
 	}
+
+	/**
+	 * One argument bundle passed to {@link #rawSqlInterceptor} — everything
+	 * an embedder needs to recognize and fully handle its own SQL extensions
+	 * without needing access to any Calcite/Avatica connection internals.
+	 * {@code defaultSchemaName} is {@code ConvexMeta}'s own {@code
+	 * getSchemaName()} (the connection's current default schema) — genuine
+	 * per-connection state an embedder can't otherwise recover, since
+	 * {@link convex.db.ConvexDB#lookup} is a plain, connection-independent
+	 * process-wide registry lookup by name.
+	 */
+	public record RawSqlRequest(StatementHandle statementHandle, String sql, String defaultSchemaName) {}
+
+	/**
+	 * What a {@link #rawSqlInterceptor} decided to do with one {@link
+	 * RawSqlRequest}. An embedder that recognizes the statement returns
+	 * exactly one of these; returning {@code null} from the interceptor
+	 * itself (not from this type) means "not mine" — see the field's own
+	 * doc.
+	 */
+	public sealed interface RawSqlAction {
+		/**
+		 * Hand this SQL (typically a rewritten, literal query — e.g. a
+		 * generated {@code SELECT '...' AS "..."} — never the original
+		 * extension syntax, which Calcite's real parser can't read) to
+		 * convex-db's own engine instead of the original statement text.
+		 * Still passes through the existing {@code VERSIONED}/{@code
+		 * AUTOINCREMENT} suffix checks and {@code super.prepareAndExecute}
+		 * fallthrough unchanged.
+		 */
+		record Rewrite(String sql) implements RawSqlAction {}
+
+		/** Fully handled already -- use this result as-is, run nothing else. */
+		record Done(ExecuteResult result) implements RawSqlAction {}
+	}
+
+	/**
+	 * A generic pre-interception hook, checked FIRST in {@link
+	 * org.apache.calcite.jdbc.ConvexMeta#prepareAndExecute}/{@code execute}
+	 * -- before any of convex-db's own regex-intercepted statements below.
+	 * Lets an embedder (e.g. dbase) recognize and fully handle its own SQL
+	 * extensions (its own {@code REPLICATE}/{@code TRANSFER}/{@code
+	 * GRANT}/{@code SHARE}/{@code SHOW CREATE TABLE}, ...) using its own
+	 * vocabulary and catalog classes entirely in its own code, with
+	 * convex-db knowing nothing about their names or semantics -- see
+	 * dbase's own {@code PLAN_convexdb_dbase_split.md} for the reasoning.
+	 * Convex-db itself never registers anything here; this is purely a seam
+	 * for an embedder to use. Returning {@code null} means "not mine" --
+	 * the request falls through to convex-db's own handling completely
+	 * unchanged. There's exactly one callback slot (not a list), matching
+	 * {@link #onDdlExecuted}'s own single-embedded-caller-in-practice
+	 * reasoning; an embedder wanting several independent statement handlers
+	 * composes them into one {@code Function} itself before assigning it
+	 * here.
+	 */
+	public static volatile Function<RawSqlRequest, RawSqlAction> rawSqlInterceptor;
 
 	/**
 	 * Handler for the {@code REPLICATE DB "name"} statement (regex-intercepted

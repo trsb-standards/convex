@@ -420,6 +420,108 @@ public class PgServerTest {
 	}
 
 	@Test
+	public void testSessionAuthorizationReportsSelfOnATrustConnection() throws Exception {
+		try (Socket socket = new Socket("localhost", server.getPort())) {
+			socket.setSoTimeout(5000);
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+			sendStartupMessage(out, dbName, "testuser");
+			assertEquals('R', in.readByte());
+			in.readInt();
+			assertEquals(0, in.readInt()); // trust: AuthenticationOk immediately, no password round trip
+			java.util.Map<String, String> statuses = collectParameterStatuses(in);
+			assertEquals("SELF", statuses.get("session_authorization"));
+		}
+	}
+
+	@Test
+	public void testSessionAuthorizationReportsTheResolvedEntityIdOverUcan() throws Exception {
+		server.stop();
+		convex.core.crypto.AKeyPair kp = convex.core.crypto.AKeyPair.generate();
+		String did = convex.auth.did.DID.forKey(kp.getAccountKey()).toString();
+		convex.core.data.AString jwt = convex.auth.ucan.UCAN.createJWT(kp, kp.getAccountKey(),
+			System.currentTimeMillis() / 1000L + 3600, convex.core.data.Vectors.empty(), null);
+
+		PgServer ucanServer = PgServer.builder()
+			.port(0).database(dbName)
+			.ucanEntityResolver(d -> d.equals(did) ? 42L : null)
+			.build();
+		ucanServer.start();
+		try (Socket socket = new Socket("localhost", ucanServer.getPort())) {
+			socket.setSoTimeout(5000);
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+			sendStartupMessage(out, dbName, "testuser");
+			assertEquals('R', in.readByte());
+			in.readInt();
+			assertEquals(3, in.readInt()); // CleartextPassword requested
+			sendPassword(out, jwt.toString());
+			assertEquals('R', in.readByte());
+			in.readInt();
+			assertEquals(0, in.readInt()); // AuthenticationOk
+			java.util.Map<String, String> statuses = collectParameterStatuses(in);
+			assertEquals("Entity 42", statuses.get("session_authorization"));
+		} finally {
+			ucanServer.stop();
+		}
+	}
+
+	@Test
+	public void testEntitySessionLabelResolverOverridesTheBareEntityIdLabel() throws Exception {
+		server.stop();
+		convex.core.crypto.AKeyPair personKp = convex.core.crypto.AKeyPair.generate();
+		String personDid = convex.auth.did.DID.forKey(personKp.getAccountKey()).toString();
+		convex.core.crypto.AKeyPair companyKp = convex.core.crypto.AKeyPair.generate();
+		String companyDid = convex.auth.did.DID.forKey(companyKp.getAccountKey()).toString();
+
+		// A resolver mirroring dbase's real rule: a natural person (id 4) is
+		// SELF; anything else (id 10, a company account) gets an enriched
+		// label. An id with no mapping here (id 99) falls through to null,
+		// proving the bare "Entity <id>" fallback still applies per-id, not
+		// just when no resolver is configured at all.
+		PgServer ucanServer = PgServer.builder()
+			.port(0).database(dbName)
+			.ucanEntityResolver(d -> {
+				if (d.equals(personDid)) return 4L;
+				if (d.equals(companyDid)) return 10L;
+				return null;
+			})
+			.entitySessionLabelResolver(id -> switch (id.intValue()) {
+				case 4 -> "SELF";
+				case 10 -> "Entity 10 Acme Corp";
+				default -> null;
+			})
+			.build();
+		ucanServer.start();
+		try {
+			assertEquals("SELF", sessionAuthorizationFor(ucanServer, personKp, personDid));
+			assertEquals("Entity 10 Acme Corp", sessionAuthorizationFor(ucanServer, companyKp, companyDid));
+		} finally {
+			ucanServer.stop();
+		}
+	}
+
+	private String sessionAuthorizationFor(PgServer ucanServer, convex.core.crypto.AKeyPair kp, String did)
+			throws Exception {
+		convex.core.data.AString jwt = convex.auth.ucan.UCAN.createJWT(kp, kp.getAccountKey(),
+			System.currentTimeMillis() / 1000L + 3600, convex.core.data.Vectors.empty(), null);
+		try (Socket socket = new Socket("localhost", ucanServer.getPort())) {
+			socket.setSoTimeout(5000);
+			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+			DataInputStream in = new DataInputStream(socket.getInputStream());
+			sendStartupMessage(out, dbName, "testuser");
+			assertEquals('R', in.readByte());
+			in.readInt();
+			assertEquals(3, in.readInt());
+			sendPassword(out, jwt.toString());
+			assertEquals('R', in.readByte());
+			in.readInt();
+			assertEquals(0, in.readInt());
+			return collectParameterStatuses(in).get("session_authorization");
+		}
+	}
+
+	@Test
 	public void testEmptyQuery() throws IOException {
 		try (Socket socket = new Socket("localhost", server.getPort())) {
 			DataOutputStream out = new DataOutputStream(socket.getOutputStream());
@@ -841,6 +943,23 @@ public class PgServerTest {
 			} else {
 				byte[] content = new byte[length - 4];
 				in.readFully(content);
+			}
+		}
+	}
+
+	/** Reads messages up to ReadyForQuery, collecting every ParameterStatus ('S') name/value pair seen. */
+	private java.util.Map<String, String> collectParameterStatuses(DataInputStream in) throws IOException {
+		java.util.Map<String, String> statuses = new java.util.HashMap<>();
+		while (true) {
+			byte type = in.readByte();
+			int length = in.readInt();
+			byte[] content = new byte[length - 4];
+			in.readFully(content);
+			if (type == 'Z') return statuses; // ReadyForQuery
+			if (type == 'S') {
+				String s = new String(content, StandardCharsets.UTF_8);
+				int nul = s.indexOf('\0');
+				statuses.put(s.substring(0, nul), s.substring(nul + 1, s.length() - 1));
 			}
 		}
 	}

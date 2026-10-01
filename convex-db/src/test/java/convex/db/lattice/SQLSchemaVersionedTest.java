@@ -46,7 +46,7 @@ class SQLSchemaVersionedTest {
     }
 
     @Test
-    void convertToVersionedPreservesExistingRowsWithNoBackfilledHistory() {
+    void convertToVersionedBackfillsCurrentRowsIntoHistory() {
         SQLSchema schema = SQLSchema.create();
         schema.createTable("t", new String[]{"id", "name"}, false);
         schema.insert("t", Vectors.of(CVMLong.create(1L), "alpha"));
@@ -59,13 +59,44 @@ class SQLSchemaVersionedTest {
         assertEquals("alpha", schema.selectByKey("t", CVMLong.create(1L)).get(1).toString());
         assertEquals("beta", schema.selectByKey("t", CVMLong.create(2L)).get(1).toString());
 
-        // No history was backfilled for the pre-conversion writes.
-        assertTrue(schema.getHistory("t", CVMLong.create(1L)).isEmpty());
+        // Each currently-live row is backfilled as a CT_BACKFILL entry (not
+        // CT_INSERT -- distinct on purpose, so it's never mistaken for a
+        // genuinely observed insert event) as of conversion time -- true
+        // pre-conversion history (writes that happened before this call)
+        // was never tracked and stays unrecoverable, but the current
+        // snapshot is captured so AS-OF/_HISTORY queries see full current
+        // contents from this point.
+        List<AVector<ACell>> history1 = schema.getHistory("t", CVMLong.create(1L));
+        assertEquals(1, history1.size(), "the live row should be backfilled as one history entry");
+        assertEquals(VersionedSQLTable.CT_BACKFILL,
+            ((convex.core.data.prim.CVMLong) history1.get(0).get(2)).longValue());
+        assertEquals("alpha", VersionedSQLTable.getHistoryValues(history1.get(0)).get(1).toString());
 
-        // A write from this point onward IS tracked.
+        List<AVector<ACell>> history2 = schema.getHistory("t", CVMLong.create(2L));
+        assertEquals(1, history2.size());
+        assertEquals("beta", VersionedSQLTable.getHistoryValues(history2.get(0)).get(1).toString());
+
+        // A write from this point onward is tracked on top of the backfill.
         schema.insert("t", Vectors.of(CVMLong.create(1L), "alpha-v2"));
         List<AVector<ACell>> history = schema.getHistory("t", CVMLong.create(1L));
-        assertEquals(1, history.size(), "only the post-conversion write should be recorded");
+        assertEquals(2, history.size(), "the backfilled insert plus the post-conversion update");
+    }
+
+    @Test
+    void convertToVersionedBackfillOnlyIncludesLiveRowsNotDeletedOnes() {
+        SQLSchema schema = SQLSchema.create();
+        schema.createTable("t", new String[]{"id", "name"}, false);
+        schema.insert("t", Vectors.of(CVMLong.create(1L), "alpha"));
+        schema.insert("t", Vectors.of(CVMLong.create(2L), "beta"));
+        schema.deleteByKey("t", CVMLong.create(2L));
+
+        assertTrue(schema.convertToVersioned("t"));
+
+        // The still-live row is backfilled.
+        assertEquals(1, schema.getHistory("t", CVMLong.create(1L)).size());
+        // The already-deleted row has nothing to backfill -- it wasn't
+        // live at conversion time, so there's no "current entry" for it.
+        assertTrue(schema.getHistory("t", CVMLong.create(2L)).isEmpty());
     }
 
     @Test

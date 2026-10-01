@@ -102,7 +102,17 @@ public class ConvexHistoryTable extends AbstractTable implements ScannableTable 
 		Object[] row = new Object[columnCount + 3];
 		AVector<ACell> values = VersionedSQLTable.getHistoryValues(entry);
 		if (values != null) {
-			for (int i = 0; i < columnCount; i++) {
+			// A history entry recorded before a column was later appended
+			// (schema evolution is append-only -- see CLAUDE.md's "Planned:
+			// schema evolution" section) is shorter than today's columnCount.
+			// Only decode what the entry actually has; trailing new columns
+			// stay null, the same "old rows return null for new columns"
+			// tolerance already established for plain (non-history) rows --
+			// found live 2026-10-01: an unbounded loop up to columnCount
+			// threw IndexOutOfBoundsException reading a pre-OWNERID-column
+			// history entry on `db` once OWNERID was later auto-appended.
+			int available = (int) Math.min(columnCount, values.count());
+			for (int i = 0; i < available; i++) {
 				row[i] = ConvexResultConverter.cellToJavaTyped(values.get(i), sqlTypeOrdinals[i]);
 			}
 		} else if (columnCount > 0) {
@@ -147,6 +157,7 @@ public class ConvexHistoryTable extends AbstractTable implements ScannableTable 
 		if (ct == VersionedSQLTable.CT_INSERT) return "INSERT";
 		if (ct == VersionedSQLTable.CT_UPDATE) return "UPDATE";
 		if (ct == VersionedSQLTable.CT_DELETE) return "DELETE";
+		if (ct == VersionedSQLTable.CT_BACKFILL) return "BACKFILL";
 		return "?";
 	}
 }

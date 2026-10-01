@@ -1,6 +1,7 @@
 package org.apache.calcite.jdbc;
 
 import java.util.Collections;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -244,6 +245,24 @@ public class ConvexMeta extends CalciteMetaImpl {
 		Long rowCount = null;
 		String errorMessage = null;
 		try {
+			// Checked FIRST, before any of convex-db's own regex-intercepted
+			// statements below -- lets an embedder (dbase) recognize and fully
+			// handle its own SQL extensions in its own code. See
+			// ConvexDdlExecutor.rawSqlInterceptor's own doc.
+			Function<ConvexDdlExecutor.RawSqlRequest, ConvexDdlExecutor.RawSqlAction> interceptor
+				= ConvexDdlExecutor.rawSqlInterceptor;
+			if (interceptor != null) {
+				ConvexDdlExecutor.RawSqlAction action = interceptor.apply(
+					new ConvexDdlExecutor.RawSqlRequest(h, sql, getSchemaName()));
+				if (action instanceof ConvexDdlExecutor.RawSqlAction.Done done) {
+					rowCount = rowCountOf(done.result());
+					return done.result();
+				}
+				if (action instanceof ConvexDdlExecutor.RawSqlAction.Rewrite rewrite) {
+					sql = rewrite.sql();
+				}
+			}
+
 			Matcher m = CREATE_INDEX.matcher(sql.trim());
 			if (m.matches()) {
 				boolean ifNotExists = m.group(1) != null;
@@ -311,19 +330,23 @@ public class ConvexMeta extends CalciteMetaImpl {
 			m = ALTER_TABLE_VERSIONED.matcher(sql.trim());
 			if (m.matches()) {
 				String schemaName = (m.group(1) != null) ? m.group(1) : getSchemaName();
-				// Unlike CREATE TABLE (which goes through Calcite's real
-				// parser and gets its identifiers normalized), this whole
-				// statement is regex-intercepted -- the captured table name
-				// is exactly as the caller typed it. Uppercase to match
-				// Calcite's own unquoted-identifier normalization (this
-				// connection defaults to caseSensitive=false), or a table
-				// created via ordinary "CREATE TABLE t (...)" (stored as
-				// "T") would never be found by "ALTER TABLE t VERSIONED".
-				String tableName = m.group(2).toUpperCase();
 				ConvexSchema schema = findConvexSchema(schemaName);
 				if (schema == null) {
 					throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
 				}
+				// Resolved case-insensitively against what's actually stored
+				// -- found live 2026-09-30: unlike CREATE TABLE (which goes
+				// through Calcite's real parser and gets its identifiers
+				// normalized), this whole statement is regex-intercepted, so
+				// the captured table name is exactly as the caller typed it.
+				// A table created via ordinary "CREATE TABLE t (...)" is
+				// stored uppercase ("T") by Calcite's own normalization, but
+				// one created via a direct Java API call (e.g. dbase-meta's
+				// own catalog tables) is stored exactly as given, often
+				// lowercase -- blindly uppercasing the requested name (the
+				// previous fix here) only covers the first case, and fails
+				// outright ("Table 'OT' not found") for the second.
+				String tableName = resolveActualTableName(schema, m.group(2));
 				// convertToVersioned returns false (no-op) if the table
 				// doesn't exist in this schema -- found live 2026-08-09: a
 				// caller connected to the wrong schema (e.g. "meta" instead
@@ -342,12 +365,12 @@ public class ConvexMeta extends CalciteMetaImpl {
 			m = ALTER_TABLE_AUTOINCREMENT.matcher(sql.trim());
 			if (m.matches()) {
 				String schemaName = (m.group(1) != null) ? m.group(1) : getSchemaName();
-				// Same uppercase-normalization reasoning as ALTER_TABLE_VERSIONED above.
-				String tableName = m.group(2).toUpperCase();
 				ConvexSchema schema = findConvexSchema(schemaName);
 				if (schema == null) {
 					throw new IllegalStateException("Schema \"" + schemaName + "\" not found");
 				}
+				// Same case-insensitive resolution as ALTER_TABLE_VERSIONED above.
+				String tableName = resolveActualTableName(schema, m.group(2));
 				if (!schema.getTables().convertToAutoIncrement(tableName)) {
 					throw new IllegalStateException(
 						"Table \"" + tableName + "\" not found in schema \"" + schemaName + "\"");
@@ -460,6 +483,26 @@ public class ConvexMeta extends CalciteMetaImpl {
 		String errorMessage = null;
 		String sql = signatureSql(h);
 		try {
+			// Same seam as prepareAndExecute's own, but only the Done action
+			// makes sense here -- this statement was already prepared against
+			// its original text, so there's no fresh-parse step left to
+			// rewrite into. A Rewrite action is silently ignored (falls
+			// through to the ordinary super.execute below) rather than
+			// treated as an error, since an embedder's handler may
+			// legitimately not distinguish the two call sites.
+			if (sql != null) {
+				Function<ConvexDdlExecutor.RawSqlRequest, ConvexDdlExecutor.RawSqlAction> interceptor
+					= ConvexDdlExecutor.rawSqlInterceptor;
+				if (interceptor != null) {
+					ConvexDdlExecutor.RawSqlAction action = interceptor.apply(
+						new ConvexDdlExecutor.RawSqlRequest(h, sql, getSchemaName()));
+					if (action instanceof ConvexDdlExecutor.RawSqlAction.Done done) {
+						rowCount = rowCountOf(done.result());
+						return done.result();
+					}
+				}
+			}
+
 			ExecuteResult result = super.execute(h, parameterValues, maxRowsInFirstFrame);
 			syncIfAutoCommit(sql != null && sql.trim().toUpperCase().startsWith("SELECT"), h.connectionId);
 			rowCount = rowCountOf(result);
@@ -768,5 +811,21 @@ public class ConvexMeta extends CalciteMetaImpl {
 			// ignore
 		}
 		return null;
+	}
+
+	/**
+	 * Resolves a regex-captured (never Calcite-normalized) table name
+	 * against what's actually stored, case-insensitively — a table created
+	 * via ordinary SQL DDL is stored uppercase, but one created via a direct
+	 * Java API call (e.g. dbase-meta's own catalog tables) is stored exactly
+	 * as given. Falls back to the requested name verbatim if nothing
+	 * matches, so the caller's own "table not found" error still names what
+	 * was actually typed.
+	 */
+	private static String resolveActualTableName(ConvexSchema schema, String requested) {
+		for (String actual : schema.getTables().getTableNames()) {
+			if (actual.equalsIgnoreCase(requested)) return actual;
+		}
+		return requested.toUpperCase();
 	}
 }
