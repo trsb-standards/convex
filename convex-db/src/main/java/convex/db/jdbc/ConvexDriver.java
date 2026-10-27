@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Properties;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.calcite.avatica.AvaticaConnection;
@@ -19,6 +20,7 @@ import org.apache.calcite.schema.SchemaPlus;
 
 import convex.core.store.AStore;
 import convex.db.ConvexDB;
+import convex.db.SchemaView;
 import convex.db.calcite.ConvexSchema;
 import convex.db.calcite.ConvexSchemaFactory;
 import convex.db.calcite.ConvexLogicalTableModifyRule;
@@ -103,13 +105,8 @@ public class ConvexDriver extends Driver {
 		return PREFIX;
 	}
 
-	@Override
-	public Connection connect(String url, Properties info) throws SQLException {
-		if (!acceptsURL(url)) return null;
-
-		// Parse the URL into mode + identifier + params
-		ParsedURL parsed = parseURL(url, info);
-
+	/** Calcite settings every Convex connection uses unless the caller chose otherwise. */
+	private void applyDefaults(Properties info) {
 		// Set Calcite defaults
 		if (!info.containsKey("caseSensitive")) {
 			info.setProperty("caseSensitive", "false");
@@ -117,6 +114,45 @@ public class ConvexDriver extends Driver {
 		if (!info.containsKey("parserFactory")) {
 			info.setProperty("parserFactory", "convex.db.calcite.ConvexDdlExecutor#PARSER_FACTORY");
 		}
+		// Calcite's plain "standard" function library only has a strictly
+		// binary CONCAT (ANSI CONCAT(a, b)) -- adding "mysql" pulls in
+		// SqlLibraryOperatorTable's N-ary CONCAT(a, b, c, ...) alongside it,
+		// without removing anything standard already provides. Found live:
+		// CONCAT(a, b, c) failed SQL validation entirely ("No match found
+		// for function signature") before this, not just at execution time.
+		if (!info.containsKey("fun")) {
+			info.setProperty("fun", "standard,mysql");
+		}
+		// LENIENT (a strict superset of DEFAULT's permissiveness -- every flag
+		// DEFAULT allows, LENIENT also allows) turns on
+		// isInsertSubsetColumnsAllowed(). Needed for OWNERID (see
+		// SQLSchema#OWNERID_COLUMN): a bare "INSERT INTO t VALUES (...)" that's
+		// exactly one column short of the table's real width is otherwise only
+		// half-fixed by marking OWNERID ColumnStrategy.STORED -- STORED alone
+		// makes checkFieldCount accept the shorter row, but a *bound parameter*
+		// ("?") in that same shorter row never gets its type inferred at all:
+		// SqlValidatorImpl#validateValues only calls inferUnknownTypes when the
+		// row's operand count matches the target field count exactly, *unless*
+		// isInsertSubsetColumnsAllowed() is on, in which case it first trims the
+		// target type down to the row's own (shorter) width -- which, since
+		// OWNERID is always the table's trailing column, is exactly the trim we
+		// want. Confirmed by reading Calcite 1.42.0's own source, not guessed;
+		// without this, a bound-parameter bare-VALUES INSERT (a very common
+		// PreparedStatement pattern) failed with a confusing "Cannot assign...
+		// from source field 'EXPR$0' of type UNKNOWN" instead of working.
+		if (!info.containsKey("conformance")) {
+			info.setProperty("conformance", "LENIENT");
+		}
+	}
+
+	@Override
+	public Connection connect(String url, Properties info) throws SQLException {
+		if (!acceptsURL(url)) return null;
+
+		// Parse the URL into mode + identifier + params
+		ParsedURL parsed = parseURL(url, info);
+
+		applyDefaults(info);
 
 		// Resolve the ConvexDB instance
 		ConvexDB cdb = resolveInstance(parsed);
@@ -133,11 +169,81 @@ public class ConvexDriver extends Driver {
 			SQLDatabase db = cdb.database(parsed.database);
 			ConvexSchema schema = new ConvexSchema(db, parsed.database);
 			SchemaPlus rootSchema = calciteConn.getRootSchema();
-			rootSchema.add(parsed.database, schema);
+			// Calcite's own CalciteSchema wrapper caches table/subschema
+			// lookups by default, on top of whatever caching (none) our own
+			// ConvexSchema.getTableMap() does -- meaning a table added live to
+			// an underlying SQLDatabase (e.g. via a live REPLICATE DB or
+			// CREATE TABLE on a DIFFERENT, already-open connection) would
+			// silently stay invisible to THIS connection until it happened to
+			// get closed and reopened. Disabled here since ConvexSchema's own
+			// lookups are already cheap/live (a HashMap-backed getTableNames()
+			// call, not a real remote or expensive query) — Calcite's cache
+			// buys nothing for this schema implementation and costs
+			// correctness. Found live 2026-08-07: a REPLICATE DB run on an
+			// already-open psql session left the new table unqueryable in
+			// that same session even though the data had genuinely arrived
+			// and a fresh connection saw it immediately.
+			rootSchema.add(parsed.database, schema).setCacheEnabled(false);
 			calciteConn.setSchema(parsed.database);
+
+			// Also mount every other currently-registered database as a
+			// sibling, so a qualified reference like "otherdb.table" resolves
+			// regardless of which database this connection is scoped to —
+			// not just the one hardcoded sibling a caller (e.g. PgServer)
+			// might otherwise mount by hand. Each gets its own registered
+			// ConvexDB instance (not necessarily this connection's cdb).
+			for (String otherName : ConvexDB.getRegisteredNames()) {
+				if (otherName.equals(parsed.database)) continue;
+				ConvexDB otherCdb = ConvexDB.lookup(otherName);
+				if (otherCdb == null) continue;
+				rootSchema.add(otherName, new ConvexSchema(otherCdb.database(otherName), otherName))
+					.setCacheEnabled(false);
+			}
 		}
 
 		return conn;
+	}
+
+	// ========== Connections bound to a schema view ==========
+
+	/** The view of each open view-bound connection; an entry goes away with its connection. */
+	private static final Map<Connection, SchemaView> VIEWS =
+		java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+	/** The view the given connection was opened with, or null. */
+	public static SchemaView viewOf(Connection conn) {
+		return VIEWS.get(conn);
+	}
+
+	/**
+	 * Opens a connection that sees exactly the schemas of the given view, and
+	 * resolves every lookup by schema name through it (see {@link SchemaView}).
+	 * This is how a connection into an owner tree is made: nothing is read from
+	 * the process-wide name registry.
+	 *
+	 * @param view Schemas visible to the connection
+	 * @return JDBC Connection
+	 */
+	public static Connection connect(SchemaView view) throws SQLException {
+		Properties info = new Properties();
+		ConvexDriver driver = new ConvexDriver();
+		driver.applyDefaults(info);
+		Connection conn = driver.connectCalcite(PREFIX + "view", info);
+		if (!(conn instanceof CalciteConnection calciteConn)) {
+			throw new SQLException("Failed to create connection");
+		}
+		VIEWS.put(conn, view);
+		SchemaPlus rootSchema = calciteConn.getRootSchema();
+		for (Map.Entry<String, SQLDatabase> e : view.snapshot().entrySet()) {
+			// See connect(String, Properties) on why the schema cache is disabled.
+			rootSchema.add(e.getKey(), new ConvexSchema(e.getValue(), e.getKey())).setCacheEnabled(false);
+		}
+		if (view.defaultSchema() != null) calciteConn.setSchema(view.defaultSchema());
+		return conn;
+	}
+
+	private Connection connectCalcite(String url, Properties info) throws SQLException {
+		return super.connect(url, info);
 	}
 
 	/**

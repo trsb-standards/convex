@@ -116,6 +116,25 @@ public class ConvexAggregate extends Aggregate implements ConvexRel {
 		SqlKind kind = aggCall.getAggregation().getKind();
 		List<Integer> argList = aggCall.getArgList();
 
+		// FILTER (WHERE ...) — Calcite also synthesizes this when lifting a
+		// CASE WHEN cond THEN expr END out of an aggregate argument (e.g.
+		// MAX(CASE WHEN cond THEN expr END) becomes MAX(expr) FILTER (WHERE
+		// cond) in the plan), so this isn't only reached via explicit SQL
+		// FILTER syntax — two side-by-side conditional aggregates like
+		// MAX(CASE WHEN a THEN x END), MAX(CASE WHEN b THEN x END) both
+		// silently aggregated over every row (ignoring which branch each
+		// belonged to) before this filter was applied.
+		if (aggCall.hasFilter()) {
+			int filterIndex = aggCall.filterArg;
+			List<ACell[]> filtered = new ArrayList<>();
+			for (ACell[] row : rows) {
+				if (filterIndex < row.length && RT.bool(row[filterIndex])) {
+					filtered.add(row);
+				}
+			}
+			rows = filtered;
+		}
+
 		// Get column index (-1 for COUNT(*))
 		int colIndex = argList.isEmpty() ? -1 : argList.get(0);
 
@@ -125,8 +144,29 @@ public class ConvexAggregate extends Aggregate implements ConvexRel {
 			case MIN -> computeMin(rows, colIndex);
 			case MAX -> computeMax(rows, colIndex);
 			case AVG -> computeAvg(rows, colIndex, aggCall.getType());
+			case SINGLE_VALUE -> computeSingleValue(rows, colIndex);
 			default -> throw new UnsupportedOperationException("Aggregate not supported: " + kind);
 		};
+	}
+
+	/**
+	 * SINGLE_VALUE — synthesized by Calcite around a scalar subquery (e.g.
+	 * {@code WHERE x = (SELECT y FROM t WHERE ...)}) to enforce SQL's "must
+	 * return at most one row" cardinality rule. Zero rows is a legitimate
+	 * scalar subquery result (NULL); more than one row is a genuine runtime
+	 * cardinality violation and must be reported as an error, not silently
+	 * resolved by picking one row — that would make a real data problem
+	 * (subquery not actually selective enough) look like a correct result.
+	 */
+	private ACell computeSingleValue(List<ACell[]> rows, int colIndex) {
+		if (rows.isEmpty()) {
+			return null;
+		}
+		if (rows.size() > 1) {
+			throw new IllegalStateException("Scalar subquery returned more than one row (" + rows.size() + ")");
+		}
+		ACell[] row = rows.get(0);
+		return colIndex < row.length ? row[colIndex] : null;
 	}
 
 	/**

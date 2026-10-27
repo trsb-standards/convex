@@ -6,6 +6,7 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.ssl.SslContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,7 +14,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * PostgreSQL wire protocol server backed by Convex SQL.
@@ -46,7 +47,12 @@ public class PgServer {
 	private int port;
 	private final String database;
 	private final String password;
-	private final Supplier<Connection> connectionSupplier;
+	private final Function<String, Connection> connectionSupplier;
+	private final Function<String, Long> ucanEntityResolver;
+	private final java.util.function.Predicate<String> guestStatementFilter;
+	private final Function<Long, String> entitySessionLabelResolver;
+	private final SslContext sslContext;
+	private final boolean allowPlaintext;
 
 	private EventLoopGroup bossGroup;
 	private EventLoopGroup workerGroup;
@@ -57,16 +63,25 @@ public class PgServer {
 		this.port = builder.port;
 		this.database = builder.database;
 		this.password = builder.password;
+		this.ucanEntityResolver = builder.ucanEntityResolver;
+		this.guestStatementFilter = builder.guestStatementFilter;
+		this.entitySessionLabelResolver = builder.entitySessionLabelResolver;
+		this.sslContext = builder.sslContext;
+		this.allowPlaintext = builder.allowPlaintext;
 
 		if (builder.connectionSupplier != null) {
 			this.connectionSupplier = builder.connectionSupplier;
 		} else {
-			// Default: connect via Convex JDBC driver
-			this.connectionSupplier = () -> {
+			// Default: connect via Convex JDBC driver, honouring whichever
+			// database the connecting client actually requested (falling back
+			// to the server's configured default if the client didn't specify
+			// one — StartupMessage's "database" param is technically optional).
+			this.connectionSupplier = requestedDb -> {
+				String dbName = (requestedDb != null) ? requestedDb : database;
 				try {
-					return DriverManager.getConnection("jdbc:convex:database=" + database);
+					return DriverManager.getConnection("jdbc:convex:database=" + dbName);
 				} catch (SQLException e) {
-					throw new RuntimeException("Failed to connect to database: " + database, e);
+					throw new RuntimeException("Failed to connect to database: " + dbName, e);
 				}
 			};
 		}
@@ -97,7 +112,9 @@ public class PgServer {
 					protected void initChannel(SocketChannel ch) {
 						ch.pipeline().addLast(
 							new PgMessageDecoder(),
-							new PgProtocolHandler(connectionSupplier, password)
+							new PgProtocolHandler(connectionSupplier, password, ucanEntityResolver,
+								entitySessionLabelResolver, sslContext, allowPlaintext)
+								.guestStatementFilter(guestStatementFilter)
 						);
 					}
 				})
@@ -105,20 +122,17 @@ public class PgServer {
 				.option(ChannelOption.SO_REUSEADDR, true)
 				.childOption(ChannelOption.SO_KEEPALIVE, true)
 				.childOption(ChannelOption.TCP_NODELAY, true)
-				// Netty's default allocator on recent versions is the newer
-				// "adaptive" one, whose chunk-release path can throw
-				// NoClassDefFoundError: io/netty/buffer/FreeChunkEvent on
-				// first use under some classloading setups (e.g. a shaded/
-				// relocated jar) — a first-load failure the JVM then
-				// permanently caches, silently abandoning whatever buffer
-				// that worker thread was mid-write on. The practical symptom
-				// is a client hanging forever on an otherwise-ordinary query,
-				// with nothing but that one log line (easy to miss, often on
-				// an unrelated-looking thread) to explain it.
-				// PooledByteBufAllocator is the older, extremely well-tested
-				// allocator used across most production Netty deployments
-				// for years — pin to it explicitly rather than relying on
-				// Netty's own default.
+				// Netty's default allocator on this version is the newer
+				// "adaptive" one, whose chunk-release path throws
+				// NoClassDefFoundError: io/netty/buffer/FreeChunkEvent under
+				// this shaded jar (a first-load classloading failure that the
+				// JVM then permanently caches, silently abandoning whatever
+				// buffer that worker thread was mid-write on — the actual
+				// cause of a client hanging forever on an otherwise-ordinary
+				// query, found live 2026-08-04). PooledByteBufAllocator is
+				// the older, extremely well-tested allocator used across
+				// most production Netty deployments for years — pin to it
+				// explicitly rather than relying on Netty's own default.
 				.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
 
 			ChannelFuture f = b.bind(port).sync();
@@ -144,6 +158,17 @@ public class PgServer {
 	 */
 	public void startAndWait() throws InterruptedException {
 		start();
+		awaitClose();
+	}
+
+	/**
+	 * Blocks until the server closes. Split out from {@link #startAndWait}
+	 * so a caller can do something between "actually accepting connections"
+	 * and "block forever" — e.g. dbase.DbaseServer marking its own node
+	 * RUNNING only once the bind has genuinely succeeded, not just once
+	 * {@code start()} was called.
+	 */
+	public void awaitClose() throws InterruptedException {
 		serverChannel.closeFuture().sync();
 	}
 
@@ -214,7 +239,12 @@ public class PgServer {
 		private int port = 5432;
 		private String database = "convex";
 		private String password = null;
-		private Supplier<Connection> connectionSupplier = null;
+		private Function<String, Connection> connectionSupplier = null;
+		private Function<String, Long> ucanEntityResolver = null;
+		private java.util.function.Predicate<String> guestStatementFilter = null;
+		private Function<Long, String> entitySessionLabelResolver = null;
+		private SslContext sslContext = null;
+		private boolean allowPlaintext = false;
 
 		/**
 		 * Sets the port to listen on. Default is 5432.
@@ -241,11 +271,76 @@ public class PgServer {
 		}
 
 		/**
-		 * Sets a custom connection supplier. If not set, connections are
-		 * obtained via the Convex JDBC driver.
+		 * Sets a custom connection supplier, invoked with the database name the
+		 * connecting client actually requested (from the startup message's
+		 * "database" parameter). If not set, connections are obtained via the
+		 * Convex JDBC driver against that requested database name.
 		 */
-		public Builder connectionSupplier(Supplier<Connection> supplier) {
+		public Builder connectionSupplier(Function<String, Connection> supplier) {
 			this.connectionSupplier = supplier;
+			return this;
+		}
+
+		/**
+		 * Enables UCAN bearer-token authentication: the client sends a
+		 * JWT-encoded UCAN in the password slot; the server verifies it
+		 * ({@code did:key} signature + temporal bounds + proof chain) and
+		 * calls this function with the issuer DID to resolve an application
+		 * principal id (return null to reject the connection). If not set,
+		 * the {@link #password}/trust behaviour is used.
+		 */
+		public Builder ucanEntityResolver(Function<String, Long> resolver) {
+			this.ucanEntityResolver = resolver;
+			return this;
+		}
+
+		/**
+		 * Lets a DID that is NOT bound to an entity connect as a guest
+		 * (see convex.db.CurrentEntity#GUEST_ENTITY_ID), able to run only
+		 * the statements this filter accepts -- e.g. the one procedure
+		 * through which somebody asks to be admitted. Without a filter
+		 * (the default) an unbound DID is refused at authentication, as
+		 * before. Only meaningful together with {@link #ucanEntityResolver}.
+		 */
+		public Builder guestStatementFilter(java.util.function.Predicate<String> filter) {
+			this.guestStatementFilter = filter;
+			return this;
+		}
+
+		/**
+		 * Resolves a UCAN-resolved entity id to the display label reported as
+		 * {@code session_authorization} (see {@link
+		 * PgProtocolHandler#sessionAuthorizationLabel}) — e.g. {@code "SELF"}
+		 * for a natural person's own login, {@code "Entity 10 Acme Corp"} for
+		 * anything else. If not set (or it returns null/blank), a bare
+		 * {@code "Entity <id>"} is used. Has no effect on a trust connection
+		 * (no entity id to resolve), which is always {@code "SELF"}.
+		 */
+		public Builder entitySessionLabelResolver(Function<Long, String> resolver) {
+			this.entitySessionLabelResolver = resolver;
+			return this;
+		}
+
+		/**
+		 * Offers TLS on this connection — a client's {@code SSLRequest} gets
+		 * {@code 'S'} instead of {@code 'N'}, and the connection upgrades in
+		 * place. See {@link TlsSupport#buildServerSslContext}. Null (the
+		 * default) means no TLS support at all.
+		 */
+		public Builder sslContext(SslContext sslContext) {
+			this.sslContext = sslContext;
+			return this;
+		}
+
+		/**
+		 * When {@link #sslContext} is set, allows a connection that never
+		 * sends {@code SSLRequest} to proceed in plaintext anyway. Off by
+		 * default — once TLS is configured, a client that skips negotiating
+		 * it is refused, mirroring PostgreSQL's own {@code hostssl}/
+		 * {@code ssl=on}. Has no effect when {@link #sslContext} is null.
+		 */
+		public Builder allowPlaintext(boolean allowPlaintext) {
+			this.allowPlaintext = allowPlaintext;
 			return this;
 		}
 

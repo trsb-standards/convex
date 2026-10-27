@@ -185,4 +185,46 @@ public class ConvexExpressionEvaluatorTest {
 		assertEquals(CVMBool.TRUE, ConvexExpressionEvaluator.evaluate(isNull, rowWithNull, rowType));
 		assertEquals(CVMBool.FALSE, ConvexExpressionEvaluator.evaluate(isNull, rowWithValue, rowType));
 	}
+
+	/**
+	 * Was previously an unhandled default case ("Operator not supported:
+	 * IS_TRUE") — Calcite synthesizes IS_TRUE when it lifts a
+	 * CASE WHEN cond THEN expr END out of an aggregate argument (e.g.
+	 * MAX(CASE WHEN cond THEN expr END)), so this can be reached even
+	 * though no query text ever spells "IS TRUE" directly. The NULL case
+	 * for IS_FALSE/IS_NOT_FALSE is the one asymmetry worth pinning down:
+	 * NULL IS FALSE must be FALSE, not the negation of "NULL IS TRUE".
+	 */
+	@Test
+	void testIsTrueAndIsFalseFamily() {
+		RelDataType rowType = typeFactory.builder().add("x", SqlTypeName.BOOLEAN).build();
+		RexNode inputRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.BOOLEAN), 0);
+
+		RexNode isTrue = rexBuilder.makeCall(org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_TRUE, inputRef);
+		RexNode isNotTrue = rexBuilder.makeCall(org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_NOT_TRUE, inputRef);
+		RexNode isFalse = rexBuilder.makeCall(org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_FALSE, inputRef);
+		RexNode isNotFalse = rexBuilder.makeCall(org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_NOT_FALSE, inputRef);
+
+		ACell[] rowTrue = new ACell[]{CVMBool.TRUE};
+		ACell[] rowFalse = new ACell[]{CVMBool.FALSE};
+		ACell[] rowNull = new ACell[]{null};
+
+		assertEquals(CVMBool.TRUE, ConvexExpressionEvaluator.evaluate(isTrue, rowTrue, rowType));
+		assertEquals(CVMBool.FALSE, ConvexExpressionEvaluator.evaluate(isTrue, rowFalse, rowType));
+		assertEquals(CVMBool.FALSE, ConvexExpressionEvaluator.evaluate(isTrue, rowNull, rowType));
+
+		assertEquals(CVMBool.FALSE, ConvexExpressionEvaluator.evaluate(isNotTrue, rowTrue, rowType));
+		assertEquals(CVMBool.TRUE, ConvexExpressionEvaluator.evaluate(isNotTrue, rowFalse, rowType));
+		assertEquals(CVMBool.TRUE, ConvexExpressionEvaluator.evaluate(isNotTrue, rowNull, rowType));
+
+		assertEquals(CVMBool.FALSE, ConvexExpressionEvaluator.evaluate(isFalse, rowTrue, rowType));
+		assertEquals(CVMBool.TRUE, ConvexExpressionEvaluator.evaluate(isFalse, rowFalse, rowType));
+		assertEquals(CVMBool.FALSE, ConvexExpressionEvaluator.evaluate(isFalse, rowNull, rowType),
+			"NULL IS FALSE must be FALSE, not TRUE");
+
+		assertEquals(CVMBool.TRUE, ConvexExpressionEvaluator.evaluate(isNotFalse, rowTrue, rowType));
+		assertEquals(CVMBool.FALSE, ConvexExpressionEvaluator.evaluate(isNotFalse, rowFalse, rowType));
+		assertEquals(CVMBool.TRUE, ConvexExpressionEvaluator.evaluate(isNotFalse, rowNull, rowType),
+			"NULL IS NOT FALSE must be TRUE");
+	}
 }

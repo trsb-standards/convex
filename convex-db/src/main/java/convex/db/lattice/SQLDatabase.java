@@ -14,6 +14,7 @@ import convex.lattice.ALatticeComponent;
 import convex.lattice.LatticeContext;
 import convex.lattice.cursor.ALatticeCursor;
 import convex.lattice.cursor.Cursors;
+import convex.lattice.generic.KeyedLattice;
 import convex.lattice.generic.OwnerLattice;
 
 /**
@@ -52,6 +53,8 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 		OWNER_LATTICE = OwnerLattice.create(ConvexDB.DATABASE_MAP_LATTICE);
 
 	private final AString dbName;
+	/** See {@link SQLSchema#getRegistryKey()}. */
+	private final AString registryKey;
 	private final AKeyPair keyPair;
 	private final ACell ownerKey;
 
@@ -63,8 +66,15 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 	private SQLDatabase(ALatticeComponent<?> parent,
 			ALatticeCursor<Index<Keyword, ACell>> cursor,
 			AString dbName, AKeyPair keyPair, ACell ownerKey) {
+		this(parent,cursor,dbName,dbName,keyPair,ownerKey);
+	}
+
+	private SQLDatabase(ALatticeComponent<?> parent,
+			ALatticeCursor<Index<Keyword, ACell>> cursor,
+			AString dbName, AString registryKey, AKeyPair keyPair, ACell ownerKey) {
 		super(parent,cursor);
 		this.dbName = dbName;
+		this.registryKey = registryKey;
 		this.keyPair = keyPair;
 		this.ownerKey = ownerKey;
 	}
@@ -91,9 +101,16 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 	 * @return New SQLDatabase instance
 	 */
 	public static SQLDatabase create(String name, AKeyPair keyPair, ACell ownerKey) {
+		AString dbName = Strings.create(name);
+		// Built against this database's own name, not the generic placeholder
+		// ConvexDB.DATABASE_LATTICE — TableVersionRegistry disambiguates
+		// same-named tables by schema name, so a standalone database needs
+		// its own real name here, not a shared placeholder every standalone
+		// database would otherwise collide on.
 		ALatticeCursor<Index<Keyword, ACell>> cursor =
-			Cursors.createLattice(ConvexDB.DATABASE_LATTICE);
-		return new SQLDatabase(cursor, Strings.create(name), keyPair, ownerKey);
+			Cursors.createLattice(KeyedLattice.create(
+				ConvexDB.KEY_TABLES, new HybridTableStoreLattice(dbName)));
+		return new SQLDatabase(cursor, dbName, keyPair, ownerKey);
 	}
 
 	/**
@@ -128,7 +145,7 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 		if (cursor.get()==null) {
 			cursor.set(ConvexDB.DATABASE_LATTICE.zero());
 		}
-		return new SQLDatabase(parent,cursor,dbName,null,null);
+		return new SQLDatabase(parent,cursor,dbName,Strings.create(parent.scope()+name),null,null);
 	}
 
 	/**
@@ -140,7 +157,7 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 	 * @return Forked SQLDatabase instance
 	 */
 	public SQLDatabase fork() {
-		return new SQLDatabase(parent(),cursor.fork(),dbName,keyPair,ownerKey);
+		return new SQLDatabase(parent(),cursor.fork(),dbName,registryKey,keyPair,ownerKey);
 	}
 
 	/**
@@ -149,7 +166,7 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 	 * @return SQLSchema instance for this database
 	 */
 	public SQLSchema tables() {
-		return new SQLSchema(this,cursor.path(ConvexDB.KEY_TABLES));
+		return new SQLSchema(this, cursor.path(ConvexDB.KEY_TABLES), dbName, registryKey);
 	}
 
 	/**
@@ -159,6 +176,11 @@ public class SQLDatabase extends ALatticeComponent<Index<Keyword, ACell>> {
 	 */
 	public AString getName() {
 		return dbName;
+	}
+
+	/** The ConvexDB this schema belongs to, or null for one that stands alone. */
+	public ConvexDB convexDB() {
+		return (parent() instanceof ConvexDB cdb) ? cdb : null;
 	}
 
 	/**

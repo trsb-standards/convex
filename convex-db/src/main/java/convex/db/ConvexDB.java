@@ -10,15 +10,18 @@ import convex.core.data.AString;
 import convex.core.data.Index;
 import convex.core.data.Keyword;
 import convex.core.store.AStore;
+import convex.core.data.Strings;
 import convex.db.jdbc.ConvexDriver;
+import convex.db.lattice.HybridDatabaseMapLattice;
+import convex.db.lattice.HybridTableStoreLattice;
 import convex.db.lattice.SQLDatabase;
-import convex.db.lattice.TableStoreLattice;
+import convex.lattice.ALattice;
 import convex.lattice.ALatticeComponent;
 import convex.lattice.RootComponent;
 import convex.lattice.cursor.ALatticeCursor;
 import convex.lattice.cursor.Cursors;
 import convex.lattice.generic.KeyedLattice;
-import convex.lattice.generic.MapLattice;
+import convex.node.NodeConfig;
 import convex.node.NodeServer;
 
 /**
@@ -31,10 +34,15 @@ import convex.node.NodeServer;
  *
  * <p>Lattice structure:
  * <pre>
- * ConvexDB (MapLattice: db-name → database-state)
- *   └─ SQLDatabase (KeyedLattice: :tables → TableStoreLattice)
+ * ConvexDB (HybridDatabaseMapLattice: schema-name → schema-state)
+ *   └─ SQLDatabase (KeyedLattice: :tables → HybridTableStoreLattice, per schema name)
  *        └─ SQLSchema / SQLTable / SQLRow
  * </pre>
+ *
+ * <p>The map and table-store levels use {@code Hybrid*} lattices, not the
+ * homogeneous {@code MapLattice}/{@code IndexLattice}-backed {@code
+ * TableStoreLattice}, so each table can independently be plain or versioned
+ * (row-history-tracked) — see {@link convex.db.lattice.TableVersionRegistry}.
  *
  * <p>Usage:
  * <pre>
@@ -67,17 +75,26 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	public static final Keyword KEY_TABLES = Keyword.intern("tables");
 
 	/**
-	 * The lattice type for a single database.
-	 * Structure: KeyedLattice { :tables → TableStoreLattice }
+	 * A generic, schema-name-agnostic single-database lattice, kept only for
+	 * its {@link ALattice#zero()} value (used by {@code SQLDatabase.connect()}
+	 * when initializing a not-yet-populated schema slot — zero() doesn't
+	 * consult {@code TableVersionRegistry}, so it's the same regardless of
+	 * schema name). Real table creation/merge goes through {@code
+	 * HybridDatabaseMapLattice}/{@code HybridTableStoreLattice} instead, which
+	 * is schema-name-aware — this constant is NOT what tables actually get
+	 * created against.
 	 */
 	public static final KeyedLattice DATABASE_LATTICE =
-		KeyedLattice.create(KEY_TABLES, TableStoreLattice.INSTANCE);
+		KeyedLattice.create(KEY_TABLES, new HybridTableStoreLattice(Strings.create("")));
 
 	/**
-	 * The lattice type for the database map (db name → database state).
+	 * The lattice type for the database map (schema name → schema state).
+	 * {@link HybridDatabaseMapLattice}, not the homogeneous {@code MapLattice}
+	 * — see that class's javadoc for why (each schema needs its own {@code
+	 * HybridTableStoreLattice} bound to its own name).
 	 */
-	public static final MapLattice<AString, Index<Keyword, ACell>>
-		DATABASE_MAP_LATTICE = MapLattice.create(DATABASE_LATTICE);
+	public static final ALattice<AHashMap<AString, Index<Keyword, ACell>>>
+		DATABASE_MAP_LATTICE = HybridDatabaseMapLattice.INSTANCE;
 
 	// ========== Named instance registry ==========
 
@@ -91,7 +108,26 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	 * @return The ConvexDB instance that contains the named database, or null
 	 */
 	public static ConvexDB lookup(String dbName) {
+		SchemaView view = SchemaView.current();
+		if (view != null) {
+			SQLDatabase db = view.database(dbName);
+			return (db == null) ? null : db.convexDB();
+		}
 		return registry.get(dbName);
+	}
+
+	/**
+	 * Returns the names of every database currently registered for JDBC/PG
+	 * access, across all ConvexDB instances in this JVM — e.g. so a new
+	 * connection can mount every reachable sibling database up front, not
+	 * just its own.
+	 *
+	 * @return An immutable snapshot of registered database names
+	 */
+	public static java.util.Set<String> getRegisteredNames() {
+		SchemaView view = SchemaView.current();
+		if (view != null) return view.names();
+		return java.util.Set.copyOf(registry.keySet());
 	}
 
 	/**
@@ -101,20 +137,41 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	 * @return The SQLDatabase, or null if not registered
 	 */
 	public static SQLDatabase lookupDatabase(String dbName) {
+		SchemaView view = SchemaView.current();
+		if (view != null) return view.database(dbName);
 		ConvexDB cdb = registry.get(dbName);
 		return (cdb != null) ? cdb.database(dbName) : null;
 	}
 
 	// ========== Instance ==========
 
+	/**
+	 * Prefix that tells this schema map apart from another one holding the same
+	 * schema names -- empty for a ConvexDB that stands alone, {@code "<owner>/<db>/"}
+	 * for one db of one owner inside an owner tree (see {@code OwnerTree}).
+	 */
+	private final String scope;
+
 	private ConvexDB(ALatticeCursor<AHashMap<AString, Index<Keyword, ACell>>> cursor) {
-		this(null,cursor);
+		this(null,cursor,"");
 	}
 
 	private ConvexDB(
 			ALatticeComponent<AHashMap<AString, Index<Keyword, ACell>>> parent,
 			ALatticeCursor<AHashMap<AString, Index<Keyword, ACell>>> cursor) {
+		this(parent,cursor,"");
+	}
+
+	private ConvexDB(
+			ALatticeComponent<AHashMap<AString, Index<Keyword, ACell>>> parent,
+			ALatticeCursor<AHashMap<AString, Index<Keyword, ACell>>> cursor, String scope) {
 		super(parent,cursor);
+		this.scope = scope;
+	}
+
+	/** See the {@code scope} field. */
+	public String scope() {
+		return scope;
 	}
 
 	/**
@@ -139,6 +196,19 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	 */
 	public static ConvexDB connect(ALatticeCursor<?> parent) {
 		return new ConvexDB(parent.path());
+	}
+
+	/**
+	 * Connects to the schema map of one db of one owner inside an owner tree.
+	 * The cursor must already point at that schema map, and its lattice must
+	 * have been built for the same scope ({@code OwnerTree} does both).
+	 *
+	 * @param schemaMap Cursor at the schema-map level
+	 * @param scope Prefix identifying this schema map, see {@link #scope()}
+	 * @return ConvexDB connected to the cursor chain
+	 */
+	public static ConvexDB connect(ALatticeCursor<?> schemaMap, String scope) {
+		return new ConvexDB(null,schemaMap.path(),scope);
 	}
 
 	/**
@@ -176,7 +246,7 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	 * @return NodeServer configured for SQL database lattice (local-only, no network)
 	 */
 	public static NodeServer<AHashMap<AString, Index<Keyword, ACell>>> createNodeServer(AStore store) {
-		return new NodeServer<>(DATABASE_MAP_LATTICE,store);
+		return new NodeServer<>(DATABASE_MAP_LATTICE, store, NodeConfig.port(-1));
 	}
 
 	/**
@@ -200,6 +270,13 @@ public class ConvexDB extends ALatticeComponent<AHashMap<AString, Index<Keyword,
 	 * @return This ConvexDB instance, for chaining
 	 */
 	public ConvexDB register(String dbName) {
+		SchemaView view = SchemaView.current();
+		if (view != null) {
+			// Inside a connection of an owner tree a schema name is only meaningful to
+			// that connection, so it joins the connection's view, not the process-wide map.
+			view.add(dbName, this);
+			return this;
+		}
 		registry.put(dbName, this);
 		return this;
 	}

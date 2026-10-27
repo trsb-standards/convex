@@ -1,9 +1,20 @@
 package convex.db.psql;
 
+import convex.auth.did.DIDVerifier;
+import convex.auth.ucan.UCAN;
+import convex.auth.ucan.UCANValidator;
+import convex.core.data.AString;
+import convex.core.data.Strings;
+import convex.db.calcite.BatchSyncDeferral;
+import convex.db.calcite.QueryLog;
 import convex.db.psql.msg.*;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.ssl.SslContext;
+import org.apache.calcite.avatica.AvaticaConnection;
+import org.apache.calcite.jdbc.ConvexMeta;
+import org.apache.calcite.jdbc.ConvexMetaAccess;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,7 +22,7 @@ import java.sql.*;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Supplier;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 /**
@@ -22,6 +33,46 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private static final Logger log = LoggerFactory.getLogger(PgProtocolHandler.class);
 	private static final AtomicInteger processIdCounter = new AtomicInteger(1000);
 
+	/**
+	 * Matches an optional trailing zone offset on a bound TIMESTAMP
+	 * parameter's wire text ({@code +HH}, {@code +HH:mm}, or the negative
+	 * forms) — PGJDBC's own {@code TimestampUtils} appends this only when the
+	 * client bound via the calendar-aware {@code setTimestamp(idx, ts, cal)}
+	 * overload (targeting a TIMESTAMPTZ-flavoured column); a plain
+	 * {@code setTimestamp(idx, ts)} bind never has one. Confirmed live: the
+	 * offset can appear directly after a full {@code HH:mm:ss[.f]} time
+	 * portion with no separating space ({@code "2018-08-01 00:00:00+00"}),
+	 * or after a bare date with one ({@code "2021-09-20 +00"}) — a bound
+	 * {@code java.sql.Date} value (source column has no time component at
+	 * all) has no time portion to attach the offset to. Handling both shapes
+	 * by stripping the offset first, rather than encoding a single rigid
+	 * pattern, is deliberate.
+	 */
+	private static final java.util.regex.Pattern TIMESTAMP_OFFSET_SUFFIX =
+		java.util.regex.Pattern.compile("\\s*([+-]\\d{2}(:?\\d{2})?)$");
+
+	/**
+	 * Parses a bound TIMESTAMP parameter's wire text into a {@link Timestamp}
+	 * — see {@link #TIMESTAMP_OFFSET_SUFFIX}'s own doc for the shapes this
+	 * has to tolerate.
+	 */
+	private static Timestamp parseTimestampText(String strValue) {
+		String s = strValue.trim();
+		java.util.regex.Matcher m = TIMESTAMP_OFFSET_SUFFIX.matcher(s);
+		String offset = null;
+		if (m.find()) {
+			offset = m.group(1);
+			if (offset.length() == 3) offset = offset + ":00"; // "+00" -> "+00:00"
+			s = s.substring(0, m.start());
+		}
+		java.time.LocalDateTime ldt = s.indexOf(' ') < 0
+			? java.time.LocalDate.parse(s).atStartOfDay()
+			: java.time.LocalDateTime.parse(s.replace(' ', 'T'));
+		return offset == null
+			? Timestamp.valueOf(ldt)
+			: Timestamp.from(ldt.atOffset(java.time.ZoneOffset.of(offset)).toInstant());
+	}
+
 	/** Single-quoted literals and double-quoted identifiers, with doubled-quote escapes */
 	private static final Pattern QUOTED = Pattern.compile("'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"");
 
@@ -29,75 +80,282 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	private static final Pattern CAST = Pattern.compile(
 		"(?i)::(?:integer|int4|int8|int|bigint|text|varchar|regclass|oid)\\b");
 
-	private final Supplier<Connection> connectionSupplier;
+	private final Function<String, Connection> connectionSupplier;
 	private final String requiredPassword;
 
+	/**
+	 * When non-null, this connection authenticates by <b>UCAN bearer token</b>
+	 * instead of a shared password: the value in the {@code PasswordMessage}
+	 * slot is treated as a JWT-encoded UCAN, verified here via {@link
+	 * UCANValidator#validateJWT} ({@code did:key} signatures + temporal
+	 * bounds + proof chain), and its issuer DID is handed to this resolver to
+	 * map to an application <b>entity</b> id (see PLAN_access_rights.md's
+	 * "entity" umbrella-principal model, `dbase` repo — deliberately called
+	 * "entity" throughout this codebase, never "principal", to avoid clashing
+	 * with Convex's own unrelated {@code Address}/account "principal"
+	 * vocabulary). A null return rejects the connection (unknown or revoked
+	 * DID). When this field is null, the existing {@link #requiredPassword}/
+	 * trust behaviour is used unchanged.
+	 */
+	private final Function<String, Long> ucanEntityResolver;
+
+	/**
+	 * Resolves an already-resolved {@link #entityId} to the display label
+	 * reported as {@code session_authorization} (see {@link
+	 * #sessionAuthorizationLabel}) — e.g. {@code "SELF"} for a natural
+	 * person's own login, {@code "Entity 10 Acme Corp"} for anything else.
+	 * Deliberately pluggable rather than hardcoded here: this class has no
+	 * notion of entity {@code KIND}/name (that's {@code dbase}'s {@code
+	 * auth.entity} business logic, not a concept {@code convex-db} owns).
+	 * Null, or a null/blank return from it, falls back to a bare {@code
+	 * "Entity <id>"}.
+	 */
+	private final Function<Long, String> entitySessionLabelResolver;
+
 	private Connection connection;
+	/** This connection's Avatica connection id, set alongside {@link #connection} once known — see {@link BatchSyncDeferral}. Null until {@link #completeAuthentication}. */
+	private String avaticaConnectionId;
 	private String user;
 	private String database;
 	private int processId;
 	private int secretKey;
 	private boolean authenticated = false;
 
+	/** Set once UCAN auth succeeds — the issuer DID and its resolved entity id. Null otherwise. */
+	private String entityDid;
+	private Long entityId;
+	/** Accepts the statements a guest (unbound DID) may run; null = guests are refused at authentication. */
+	private java.util.function.Predicate<String> guestStatementFilter;
+
+	/** See PgServer.Builder#guestStatementFilter. Returns this, for chaining at construction. */
+	PgProtocolHandler guestStatementFilter(java.util.function.Predicate<String> filter) {
+		this.guestStatementFilter = filter;
+		return this;
+	}
+
+	private boolean isGuest() {
+		return entityId != null && entityId == convex.db.CurrentEntity.GUEST_ENTITY_ID;
+	}
+
+	/** The reason a guest may not run {@code sql}, or null if it may (or this is no guest). */
+	private String guestRefusal(String sql) {
+		if (!isGuest()) return null;
+		if (guestStatementFilter != null && guestStatementFilter.test(sql)) return null;
+		return "Not permitted: this identity is not bound to an entity yet";
+	}
+
+	/**
+	 * Tracks whether this connection is inside an explicit {@code BEGIN}
+	 * block, and whether a statement inside it has failed -- mirrors the
+	 * transaction-status byte real PostgreSQL reports in every {@code
+	 * ReadyForQuery} message ({@link ReadyForQuery#IDLE}/{@link
+	 * ReadyForQuery#IN_TRANSACTION}/{@link ReadyForQuery#FAILED_TRANSACTION}).
+	 *
+	 * <p>Needed because {@code BEGIN}/{@code COMMIT}/{@code ROLLBACK} arrive
+	 * as plain wire-text SQL (PostgreSQL's wire protocol has no dedicated
+	 * message for transaction control -- pgjdbc's own {@code
+	 * setAutoCommit(false)}/{@code commit()}/{@code rollback()} just send
+	 * these three literal strings via the ordinary simple-query path), which
+	 * {@link #handleQuery} must intercept and translate onto the backing
+	 * {@link #connection}'s real {@code setAutoCommit}/{@code commit}/{@code
+	 * rollback} -- {@code ConvexMeta} already implements the actual fork/sync
+	 * transaction semantics behind those calls, this class only bridges wire
+	 * text to them. Without also reporting the right status byte back,
+	 * pgjdbc's own client-side transaction-state tracking desyncs from
+	 * reality even once the translation itself works.
+	 */
+	private boolean inTransaction = false;
+	private boolean transactionFailed = false;
+
+	/** TLS context to offer on {@code SSLRequest}, or null to always answer {@code 'N'}. See {@link TlsSupport}. */
+	private final SslContext sslContext;
+	/**
+	 * When {@link #sslContext} is non-null and this is false (the default),
+	 * a connection that never sends {@code SSLRequest} at all -- goes
+	 * straight to a plaintext {@code StartupMessage} -- is refused, not
+	 * silently accepted in plaintext. Mirrors PostgreSQL's own
+	 * {@code hostssl}/{@code ssl=on}. Ignored when {@link #sslContext} is
+	 * null, since nothing else would work in that case.
+	 */
+	private final boolean allowPlaintext;
+	/** Set once {@link #handleSSLRequest} has upgraded this channel. */
+	private boolean tlsNegotiated = false;
+
 	/**
 	 * Creates a handler that uses the given connection supplier.
 	 *
-	 * @param connectionSupplier Supplies JDBC connections for query execution
+	 * @param connectionSupplier Supplies JDBC connections for query execution, given the client's requested database name
 	 * @param requiredPassword Password required for authentication, or null for trust auth
 	 */
-	public PgProtocolHandler(Supplier<Connection> connectionSupplier, String requiredPassword) {
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword) {
+		this(connectionSupplier, requiredPassword, null);
+	}
+
+	/**
+	 * @param ucanEntityResolver enables UCAN bearer-token auth — see the
+	 *        field's own javadoc. Null keeps the password/trust behaviour.
+	 */
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
+			Function<String, Long> ucanEntityResolver) {
+		this(connectionSupplier, requiredPassword, ucanEntityResolver, null, false);
+	}
+
+	/**
+	 * @param sslContext see {@link #sslContext}'s own doc. Null disables
+	 *        TLS entirely (every {@code SSLRequest} answered {@code 'N'}),
+	 *        matching every pre-existing caller/test unchanged.
+	 * @param allowPlaintext see {@link #allowPlaintext}'s own doc.
+	 */
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
+			Function<String, Long> ucanEntityResolver, SslContext sslContext, boolean allowPlaintext) {
+		this(connectionSupplier, requiredPassword, ucanEntityResolver, null, sslContext, allowPlaintext);
+	}
+
+	/** @param entitySessionLabelResolver see {@link #entitySessionLabelResolver}'s own doc. Null uses the bare-id fallback. */
+	public PgProtocolHandler(Function<String, Connection> connectionSupplier, String requiredPassword,
+			Function<String, Long> ucanEntityResolver, Function<Long, String> entitySessionLabelResolver,
+			SslContext sslContext, boolean allowPlaintext) {
 		this.connectionSupplier = connectionSupplier;
 		this.requiredPassword = requiredPassword;
+		this.ucanEntityResolver = ucanEntityResolver;
+		this.entitySessionLabelResolver = entitySessionLabelResolver;
+		this.sslContext = sslContext;
+		this.allowPlaintext = allowPlaintext;
 		this.processId = processIdCounter.incrementAndGet();
 		this.secretKey = ThreadLocalRandom.current().nextInt();
 	}
 
+	/** The authenticated entity's issuer DID, or null if not UCAN-authenticated. */
+	public String getEntityDid() {
+		return entityDid;
+	}
+
+	/** The authenticated entity's resolved application id, or null if not UCAN-authenticated. */
+	public Long getEntityId() {
+		return entityId;
+	}
+
+	/**
+	 * {@code "SELF"} when this connection isn't acting as a distinct
+	 * non-person entity — a trust/no-password connection (admin, bootstrap, a
+	 * direct {@code jdbc:convex:} caller), or a UCAN login that {@link
+	 * #entitySessionLabelResolver} reports as a natural person acting as
+	 * themselves — or that resolver's own label (typically {@code "Entity
+	 * <id> <name>"}) for anything else, e.g. a legal person/company account
+	 * or a server agent. There is deliberately no third option: nothing in
+	 * this system lets a connection act <em>as</em> some other entity (no
+	 * delegation/"acting on behalf of" exists yet — see {@code
+	 * PLAN_access_rights.md}'s deferred {@code Power}/{@code
+	 * Authorityclosure}), so a login is always either nobody-in-particular
+	 * (trust) or exactly the one entity it authenticated as.
+	 *
+	 * <p>Reported to the client as the {@code session_authorization}
+	 * parameter (see {@link #completeAuthentication}) so an ordinary,
+	 * unmodified {@code psql} shows it automatically via the standard {@code
+	 * %n} prompt escape, which {@code psql}'s own docs describe as tracking
+	 * {@code session_authorization} server-side, not just the connect-time
+	 * username. No {@code dbase}-specific client config needed beyond a
+	 * {@code PROMPT1} that includes {@code %n}, e.g. {@code \set PROMPT1
+	 * '%M:%>/%/ %n%# '} — giving {@code "localhost:5434/meta SELF>"} or
+	 * {@code "localhost:5434/meta Entity 42 Acme Corp>"}.
+	 */
+	private String sessionAuthorizationLabel() {
+		if (entityId == null) return "SELF";
+		if (entitySessionLabelResolver != null) {
+			String label = entitySessionLabelResolver.apply(entityId);
+			if (label != null && !label.isBlank()) return label;
+		}
+		return "Entity " + entityId;
+	}
+
 	@Override
 	public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-		if (msg instanceof PgMessageDecoder.SSLRequest) {
-			handleSSLRequest(ctx);
-		} else if (msg instanceof PgMessageDecoder.StartupMessage startup) {
-			handleStartup(ctx, startup);
-		} else if (msg instanceof PgMessageDecoder.PasswordMessage pwd) {
-			handlePassword(ctx, pwd);
-		} else if (msg instanceof PgMessageDecoder.Query query) {
-			handleQuery(ctx, query);
-		} else if (msg instanceof PgMessageDecoder.Terminate) {
-			handleTerminate(ctx);
-		} else if (msg instanceof PgMessageDecoder.Sync) {
-			handleSync(ctx);
-		} else if (msg instanceof PgMessageDecoder.Parse parse) {
-			handleParse(ctx, parse);
-		} else if (msg instanceof PgMessageDecoder.Bind bind) {
-			handleBind(ctx, bind);
-		} else if (msg instanceof PgMessageDecoder.Describe describe) {
-			handleDescribe(ctx, describe);
-		} else if (msg instanceof PgMessageDecoder.Execute execute) {
-			handleExecute(ctx, execute);
-		} else if (msg instanceof PgMessageDecoder.Close close) {
-			handleClose(ctx, close);
-		} else if (msg instanceof PgMessageDecoder.Flush) {
-			ctx.flush();
-		} else {
-			log.warn("Unhandled message: {}", msg.getClass().getSimpleName());
+		// Scope CurrentEntity to exactly this one wire message's handling --
+		// see CurrentEntity's own javadoc for why a plain set/clear here is
+		// safe despite one event-loop thread servicing many connections over
+		// its lifetime (Netty never interleaves a second channel's message
+		// mid-handling of this one, on the same thread).
+		convex.db.CurrentEntity.set(entityId);
+		convex.db.CurrentEntity.setDid(entityDid);
+		try {
+			if (msg instanceof PgMessageDecoder.SSLRequest) {
+				handleSSLRequest(ctx);
+			} else if (msg instanceof PgMessageDecoder.StartupMessage startup) {
+				handleStartup(ctx, startup);
+			} else if (msg instanceof PgMessageDecoder.PasswordMessage pwd) {
+				handlePassword(ctx, pwd);
+			} else if (msg instanceof PgMessageDecoder.Query query) {
+				handleQuery(ctx, query);
+			} else if (msg instanceof PgMessageDecoder.Terminate) {
+				handleTerminate(ctx);
+			} else if (msg instanceof PgMessageDecoder.Sync) {
+				handleSync(ctx);
+			} else if (msg instanceof PgMessageDecoder.Parse parse) {
+				handleParse(ctx, parse);
+			} else if (msg instanceof PgMessageDecoder.Bind bind) {
+				handleBind(ctx, bind);
+			} else if (msg instanceof PgMessageDecoder.Describe describe) {
+				handleDescribe(ctx, describe);
+			} else if (msg instanceof PgMessageDecoder.Execute execute) {
+				handleExecute(ctx, execute);
+			} else if (msg instanceof PgMessageDecoder.Close close) {
+				handleClose(ctx, close);
+			} else if (msg instanceof PgMessageDecoder.Flush) {
+				ctx.flush();
+			} else {
+				log.warn("Unhandled message: {}", msg.getClass().getSimpleName());
+			}
+		} finally {
+			convex.db.CurrentEntity.clear();
 		}
 	}
 
 	private void handleSSLRequest(ChannelHandlerContext ctx) {
-		// Respond with 'N' - we don't support SSL
+		if (sslContext == null) {
+			ByteBuf buf = ctx.alloc().buffer(1);
+			buf.writeByte('N');
+			ctx.writeAndFlush(buf);
+			return;
+		}
+		// Reply 'S', then upgrade in place: PG-wire's SSLRequest/'S' exchange
+		// is a plaintext STARTTLS-style negotiation -- everything from here
+		// on is a normal TLS handshake on the same socket. The SslHandler
+		// must go at the very front of the pipeline (ahead of
+		// PgMessageDecoder) so it decrypts inbound bytes before anything
+		// else sees them.
 		ByteBuf buf = ctx.alloc().buffer(1);
-		buf.writeByte('N');
+		buf.writeByte('S');
 		ctx.writeAndFlush(buf);
+		ctx.pipeline().addFirst("ssl", sslContext.newHandler(ctx.alloc()));
+		tlsNegotiated = true;
 	}
 
 	private void handleStartup(ChannelHandlerContext ctx, PgMessageDecoder.StartupMessage startup) {
+		// A StartupMessage arriving without a prior SSLRequest means this
+		// client never negotiated TLS at all -- reject outright when TLS is
+		// configured and plaintext isn't explicitly allowed, mirroring
+		// PostgreSQL's own hostssl/ssl=on. A client that *did* negotiate
+		// TLS reaches this normally, decrypted, with tlsNegotiated already
+		// true from handleSSLRequest.
+		if (sslContext != null && !allowPlaintext && !tlsNegotiated) {
+			write(ctx, ErrorResponse.builder()
+				.severity("FATAL")
+				.code("08004")
+				.message("SSL/TLS required")
+				.build());
+			ctx.flush();
+			ctx.close();
+			return;
+		}
+
 		log.debug("Startup: version={}.{}, params={}", startup.majorVersion(), startup.minorVersion(), startup.params());
 
 		this.user = startup.params().get("user");
 		this.database = startup.params().get("database");
 
-		if (requiredPassword != null && !requiredPassword.isEmpty()) {
-			// Request password authentication
+		if (ucanEntityResolver != null || (requiredPassword != null && !requiredPassword.isEmpty())) {
+			// Request the client to send credentials in the PasswordMessage
+			// slot -- a shared password, or (UCAN mode) a JWT-encoded UCAN.
 			write(ctx, AuthenticationCleartextPassword.INSTANCE);
 			ctx.flush();
 		} else {
@@ -107,6 +365,16 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void handlePassword(ChannelHandlerContext ctx, PgMessageDecoder.PasswordMessage pwd) {
+		if (ucanEntityResolver != null) {
+			if (authenticateUcan(pwd.password())) {
+				completeAuthentication(ctx);
+			} else {
+				write(ctx, ErrorResponse.authenticationFailed(user));
+				ctx.flush();
+				ctx.close();
+			}
+			return;
+		}
 		if (requiredPassword != null && requiredPassword.equals(pwd.password())) {
 			completeAuthentication(ctx);
 		} else {
@@ -116,12 +384,67 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		}
 	}
 
+	/**
+	 * Verifies {@code bearerToken} as a JWT-encoded UCAN and resolves its
+	 * issuer DID to an application entity. Sets {@link #entityDid} /
+	 * {@link #entityId} on success. Never throws — any problem is a
+	 * rejected authentication.
+	 */
+	private boolean authenticateUcan(String bearerToken) {
+		try {
+			if (bearerToken == null || bearerToken.isEmpty()) return false;
+			long nowSeconds = System.currentTimeMillis() / 1000L;
+			UCAN token = UCANValidator.validateJWT(Strings.create(bearerToken), nowSeconds, DIDVerifier.CONVEX);
+			if (token == null) {
+				log.info("UCAN auth rejected: token failed verification (signature / expiry / chain)");
+				return false;
+			}
+			AString issuer = token.getIssuer();
+			String did = (issuer == null) ? null : issuer.toString();
+			if (did == null) return false;
+			Long resolved = ucanEntityResolver.apply(did);
+			if (resolved == null) {
+				if (guestStatementFilter == null) {
+					log.info("UCAN auth rejected: DID {} not bound to any active entity", did);
+					return false;
+				}
+				// The token proves control of the key; the key just is not
+				// (or no longer) bound. Let it in as a guest: every
+				// statement goes through guestRefusal() first.
+				this.entityDid = did;
+				this.entityId = convex.db.CurrentEntity.GUEST_ENTITY_ID;
+				log.info("UCAN auth ok as guest: DID {} not bound to any active entity", did);
+				return true;
+			}
+			this.entityDid = did;
+			this.entityId = resolved;
+			log.info("UCAN auth ok: entity {} ({})", resolved, did);
+			return true;
+		} catch (Exception e) {
+			log.warn("UCAN auth error", e);
+			return false;
+		}
+	}
+
 	private void completeAuthentication(ChannelHandlerContext ctx) {
 		authenticated = true;
 
-		// Get a connection
+		// Get a connection, honouring whichever database this client requested
 		try {
-			connection = connectionSupplier.get();
+			// The supplier decides what this connection may see from who logged in;
+			// channelRead clears this again when the message is done.
+			convex.db.CurrentEntity.set(entityId);
+			connection = connectionSupplier.apply(database);
+			// Marks this connection's Avatica id as ours, not a direct
+			// jdbc:convex: caller's -- see QueryLog.markPgwireConnection's own
+			// javadoc for why this distinction can't be made any other way.
+			// instanceof, not a bare cast: connectionSupplier is pluggable
+			// (e.g. PgServer.builder().connectionSupplier(...) in tests), so a
+			// non-Avatica Connection is a legitimate possibility here.
+			if (connection instanceof AvaticaConnection avaticaConn) {
+				QueryLog.markPgwireConnection(avaticaConn.id);
+				avaticaConnectionId = avaticaConn.id;
+			}
 		} catch (Exception e) {
 			log.error("Failed to get connection", e);
 			write(ctx, ErrorResponse.fromException(e));
@@ -140,6 +463,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		write(ctx, ParameterStatus.timeZone("UTC"));
 		write(ctx, ParameterStatus.integerDatetimes(true));
 		write(ctx, new ParameterStatus("standard_conforming_strings", "on"));
+		write(ctx, new ParameterStatus("session_authorization", sessionAuthorizationLabel()));
 
 		// Send backend key data
 		write(ctx, new BackendKeyData(processId, secretKey));
@@ -147,6 +471,77 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		// Ready for query
 		write(ctx, ReadyForQuery.IDLE_INSTANCE);
 		ctx.flush();
+	}
+
+	/** The real transaction-status byte for the next {@code ReadyForQuery}, per {@link #inTransaction}/{@link #transactionFailed}. */
+	private ReadyForQuery currentReadyState() {
+		if (transactionFailed) return new ReadyForQuery(ReadyForQuery.FAILED_TRANSACTION);
+		if (inTransaction) return new ReadyForQuery(ReadyForQuery.IN_TRANSACTION);
+		return ReadyForQuery.IDLE_INSTANCE;
+	}
+
+	/** Matches the wire-text forms pgjdbc (and psql) send for {@code setAutoCommit(false)}. */
+	private static boolean isBeginStatement(String upperSql) {
+		return upperSql.equals("BEGIN") || upperSql.startsWith("BEGIN ")
+			|| upperSql.startsWith("START TRANSACTION");
+	}
+
+	/** Matches the wire-text forms sent for {@code commit()}. */
+	private static boolean isCommitStatement(String upperSql) {
+		return upperSql.equals("COMMIT") || upperSql.startsWith("COMMIT ")
+			|| upperSql.equals("END") || upperSql.startsWith("END ");
+	}
+
+	/** Matches the wire-text forms sent for {@code rollback()}. */
+	private static boolean isRollbackStatement(String upperSql) {
+		return upperSql.equals("ROLLBACK") || upperSql.startsWith("ROLLBACK ")
+			|| upperSql.equals("ABORT") || upperSql.startsWith("ABORT ");
+	}
+
+	/**
+	 * Executes {@code sql} as a transaction-control statement (BEGIN/COMMIT/
+	 * ROLLBACK) if it matches one, translating it onto the backing {@link
+	 * #connection}'s real {@code setAutoCommit}/{@code commit}/{@code
+	 * rollback} and updating {@link #inTransaction}/{@link
+	 * #transactionFailed}. Returns false (nothing written, caller should run
+	 * {@code sql} as ordinary SQL instead) if it isn't one.
+	 *
+	 * <p>Must be checked from <em>both</em> {@link #handleQuery} (the simple
+	 * "Q" message path) and {@link #executeWithParameters} (the extended
+	 * Parse/Bind/Execute path) — checked live 2026-08-12: a literal {@code
+	 * Statement.execute("BEGIN")} (e.g. from {@code psql -c} or a plain
+	 * pgjdbc {@code Statement}) arrives via simple query, but pgjdbc's own
+	 * {@code Connection.commit()}/{@code rollback()} send their literal
+	 * {@code "COMMIT"}/{@code "ROLLBACK"} text via the extended protocol
+	 * instead, even though there are no bind parameters. Missing either path
+	 * means half of an ordinary JDBC transaction silently falls through to
+	 * Calcite's parser, which has no grammar for any of these three words.
+	 */
+	private boolean handleTransactionControl(ChannelHandlerContext ctx, String upperSql) throws SQLException {
+		if (isBeginStatement(upperSql)) {
+			connection.setAutoCommit(false);
+			inTransaction = true;
+			transactionFailed = false;
+			write(ctx, CommandComplete.begin());
+			return true;
+		}
+		if (isCommitStatement(upperSql)) {
+			connection.commit();
+			connection.setAutoCommit(true);
+			inTransaction = false;
+			transactionFailed = false;
+			write(ctx, CommandComplete.commit());
+			return true;
+		}
+		if (isRollbackStatement(upperSql)) {
+			connection.rollback();
+			connection.setAutoCommit(true);
+			inTransaction = false;
+			transactionFailed = false;
+			write(ctx, CommandComplete.rollback());
+			return true;
+		}
+		return false;
 	}
 
 	private void handleQuery(ChannelHandlerContext ctx, PgMessageDecoder.Query query) {
@@ -165,61 +560,118 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 		if (fullSql.isEmpty()) {
 			write(ctx, new EmptyQueryResponse());
-			write(ctx, ReadyForQuery.IDLE_INSTANCE);
+			write(ctx, currentReadyState());
 			ctx.flush();
 			return;
 		}
 
 		// Split on semicolons and execute each statement
 		// Note: This is a simple split - doesn't handle semicolons in strings
-		String[] statements = fullSql.split(";");
+		String[] statements = splitStatements(fullSql);
 
 		for (String sql : statements) {
 			sql = sql.trim();
 			if (sql.isEmpty()) {
 				continue;
 			}
+			String upperSql = sql.toUpperCase();
+
+			String refusal = guestRefusal(sql);
+			if (refusal != null) {
+				log.info("Guest statement refused: {}", sql.length() > 80 ? sql.substring(0, 80) + "..." : sql);
+				write(ctx, ErrorResponse.fromException(new SQLException(refusal, "42501")));
+				break;
+			}
 
 			// Handle special commands
-			if (sql.toUpperCase().startsWith("SET ")) {
+			if (upperSql.startsWith("SET ")) {
 				// Ignore SET commands for now
 				write(ctx, CommandComplete.set());
 				continue;
 			}
 
+			// DEALLOCATE [PREPARE] <name> | ALL -- what a client sends to drop a
+			// named prepared statement (PHP's PDO does after every prepared
+			// statement). Not SQL the engine parses: it used to fail with
+			// "Incorrect syntax near the keyword 'DEALLOCATE'", and since a
+			// failed statement is always written to the query log, every
+			// prepared statement from PHP produced a log row (found live
+			// 2026-10-06 -- the bulk of the store's growth). Handled here like
+			// the Close message of the extended protocol.
+			if (upperSql.startsWith("DEALLOCATE ") || upperSql.equals("DEALLOCATE")) {
+				String target = sql.substring("DEALLOCATE".length()).trim();
+				if (target.toUpperCase().startsWith("PREPARE ")) target = target.substring("PREPARE".length()).trim();
+				if (target.endsWith(";")) target = target.substring(0, target.length() - 1).trim();
+				if (target.equalsIgnoreCase("ALL")) {
+					for (PreparedStmt removed : this.statements.values()) evictCachedStatement(removed);
+					this.statements.clear();
+				} else {
+					if (target.length() > 1 && target.startsWith("\"") && target.endsWith("\"")) {
+						target = target.substring(1, target.length() - 1);
+					}
+					evictCachedStatement(this.statements.remove(target));
+				}
+				write(ctx, new CommandComplete(target.equalsIgnoreCase("ALL") ? "DEALLOCATE ALL" : "DEALLOCATE"));
+				continue;
+			}
+
 			try {
-				executeQuery(ctx, sql);
+				if (!handleTransactionControl(ctx, upperSql)) {
+					executeQuery(ctx, sql);
+				}
 			} catch (SQLException e) {
-				log.warn("Query error: {}", e.getMessage(), e);
+				// Expected client-caused error (bad SQL, missing table, etc.) — the
+				// client already gets the real message via ErrorResponse below;
+				// a stack trace here would just be log noise for an ordinary typo.
+				if (inTransaction) transactionFailed = true;
+				log.warn("Query error: {}", e.getMessage());
 				write(ctx, ErrorResponse.fromException(e));
 				// Stop processing on error
 				break;
 			} catch (RuntimeException e) {
 				// Runtime exceptions from Calcite (type coercion, etc.) are query errors
-				log.warn("Query execution error: {}", e.getMessage(), e);
+				if (inTransaction) transactionFailed = true;
+				log.warn("Query execution error: {}", e.getMessage());
 				write(ctx, ErrorResponse.fromException(e));
 				break;
 			} catch (Exception e) {
+				// Not a recognised query-error type — genuinely unexpected, so the
+				// stack trace is worth keeping here.
+				if (inTransaction) transactionFailed = true;
 				log.error("Unexpected error", e);
 				write(ctx, ErrorResponse.fromException(e));
 				break;
 			}
 		}
 
-		write(ctx, ReadyForQuery.IDLE_INSTANCE);
+		write(ctx, currentReadyState());
 		ctx.flush();
 	}
 
 	private void executeQuery(ChannelHandlerContext ctx, String sql) throws SQLException {
-		executeQuery(ctx, sql, true);
+		executeQuery(ctx, sql, true, true, null);
 	}
 
 	/**
-	 * @param describeRows Whether a result set is preceded by its RowDescription. True for
-	 *        the simple query protocol. False for Execute in the extended protocol, which
-	 *        never sends one: there the client asks for it with Describe.
+	 * @param includeRowDescription Whether to send a RowDescription before the
+	 *   data rows. Must be false when called from the extended-protocol Execute
+	 *   path for a statement that already had one sent (see {@code
+	 *   describedStatements}'s own doc — resending desyncs pgjdbc's internal
+	 *   bookkeeping, manifesting client-side as a NoSuchElementException in
+	 *   QueryExecutorImpl.processResults).
+	 * @param sendTimingNotice Whether to send the "N rows in set (X sec)" /
+	 *   "Query OK, N rows affected (X sec)" NoticeResponse footer. True only
+	 *   for the simple-query path (psql, or any literal-text client) — the
+	 *   footer exists purely for a human reading a terminal. Every extended-
+	 *   protocol caller (a bound PreparedStatement, i.e. always a program, never
+	 *   a person typing at psql) passes false: that caller has to receive and
+	 *   discard the message for zero benefit, once per row for a bulk insert.
+	 * @param resultFormats Bind's own per-column result-format request (see
+	 *   {@code DataRow.fromResultSet}'s own doc); null for the simple-query
+	 *   path, which has no Bind and is always text.
 	 */
-	private void executeQuery(ChannelHandlerContext ctx, String sql, boolean describeRows) throws SQLException {
+	private void executeQuery(ChannelHandlerContext ctx, String sql, boolean includeRowDescription,
+			boolean sendTimingNotice, short[] resultFormats) throws SQLException {
 		sql = rewriteQuery(sql);
 
 		// Null means return empty result (e.g., for system catalog queries)
@@ -228,12 +680,18 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			return;
 		}
 
+		long startNanos = System.nanoTime();
 		try (Statement stmt = connection.createStatement()) {
 			boolean hasResultSet = stmt.execute(sql);
 
 			if (hasResultSet) {
+				long rowCount;
 				try (ResultSet rs = stmt.getResultSet()) {
-					sendResultSet(ctx, rs, describeRows);
+					rowCount = sendResultSet(ctx, rs, includeRowDescription, resultFormats);
+				}
+				if (sendTimingNotice) {
+					write(ctx, NoticeResponse.timing(
+						rowCount + " " + rowsWord(rowCount) + " in set (" + formatElapsed(startNanos) + ")"));
 				}
 			} else {
 				int updateCount = stmt.getUpdateCount();
@@ -251,6 +709,10 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 					write(ctx, CommandComplete.dropTable());
 				} else {
 					write(ctx, new CommandComplete("OK"));
+				}
+				if (sendTimingNotice) {
+					write(ctx, NoticeResponse.timing("Query OK, " + updateCount + " " + rowsWord(updateCount)
+						+ " affected (" + formatElapsed(startNanos) + ")"));
 				}
 			}
 		}
@@ -360,24 +822,50 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		return CAST.matcher(sql).replaceAll("");
 	}
 
-	private void sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean describeRows) throws SQLException {
+	private long sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean includeRowDescription) throws SQLException {
+		return sendResultSet(ctx, rs, includeRowDescription, null);
+	}
+
+	/**
+	 * @param resultFormats Bind's own per-column result-format request (see
+	 *        {@code DataRow.fromResultSet}'s own doc); null/empty for the
+	 *        simple-query path, which has no Bind and is always text.
+	 */
+	private long sendResultSet(ChannelHandlerContext ctx, ResultSet rs, boolean includeRowDescription,
+			short[] resultFormats) throws SQLException {
 		ResultSetMetaData meta = rs.getMetaData();
 		int columnCount = meta.getColumnCount();
 
 		// Send row description
-		if (describeRows) {
+		if (includeRowDescription) {
 			write(ctx, RowDescription.fromMetaData(meta));
 		}
 
 		// Send data rows
 		long rowCount = 0;
 		while (rs.next()) {
-			write(ctx, DataRow.fromResultSet(rs, columnCount));
+			write(ctx, DataRow.fromResultSet(rs, columnCount, meta, resultFormats));
 			rowCount++;
 		}
 
 		// Send command complete
 		write(ctx, CommandComplete.select(rowCount));
+		return rowCount;
+	}
+
+	/**
+	 * Formats elapsed time since {@code startNanos} the same way MySQL's CLI
+	 * reports it ("0.008 sec") — a first step towards surfacing
+	 * replication-staleness timing (sync time vs. query time) once that
+	 * mechanism exists; for now this is just the query's own execution time.
+	 */
+	private static String formatElapsed(long startNanos) {
+		double seconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
+		return String.format("%.3f sec", seconds);
+	}
+
+	private static String rowsWord(long count) {
+		return count == 1 ? "row" : "rows";
 	}
 
 	// ========== Extended Query Protocol ==========
@@ -392,10 +880,111 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	 */
 	private record Portal(PreparedStmt stmt, byte[][] paramValues, short[] paramFormats, short[] resultFormats) {}
 
+	/**
+	 * Splits a simple-query string into its statements at each ";" that is
+	 * not inside a quoted string ('...', with '' as an escaped quote) or a
+	 * quoted identifier ("...").
+	 *
+	 * <p>This used to be a bare {@code split(";")}: found live 2026-10-06,
+	 * an INSERT whose text value contained a semicolon ("Description: a ->
+	 * b; Status: 0 -> 1") was cut in two and failed to parse. Any client
+	 * that sends values as literals rather than bind parameters hits this.
+	 */
+	static String[] splitStatements(String sql) {
+		java.util.List<String> parts = new java.util.ArrayList<>();
+		StringBuilder current = new StringBuilder();
+		char quote = 0;
+		for (int i = 0; i < sql.length(); i++) {
+			char c = sql.charAt(i);
+			if (quote != 0) {
+				if (c == quote) quote = 0; // a doubled quote closes and immediately reopens: same result
+			} else if (c == '\'' || c == '"') {
+				quote = c;
+			} else if (c == ';') {
+				parts.add(current.toString());
+				current.setLength(0);
+				continue;
+			}
+			current.append(c);
+		}
+		parts.add(current.toString());
+		return parts.toArray(new String[0]);
+	}
+
 	// Statements are named prepared statements (Parse creates these)
 	private final Map<String, PreparedStmt> statements = new java.util.HashMap<>();
 	// Portals are bound statements ready to execute (Bind creates these)
 	private final Map<String, Portal> portals = new java.util.HashMap<>();
+
+	/**
+	 * Real, reusable JDBC {@link PreparedStatement}s, one per still-live
+	 * {@link PreparedStmt} (keyed by identity, not content -- exactly one
+	 * real statement per wire-level Parse, which is what we actually want to
+	 * reuse). Absent until first bound+executed (see {@link
+	 * #executeWithParameters}), then kept for the wire-level statement's
+	 * whole lifetime.
+	 *
+	 * <p>Fixes a real perf bug (found live 2026-08-12 investigating why an
+	 * explicit-transaction benchmark barely sped up after fixing {@code
+	 * BEGIN}/{@code COMMIT} interception): {@code executeWithParameters} used
+	 * to call {@code connection.prepareStatement(jdbcSql)} fresh on
+	 * <em>every single Bind+Execute</em>, throwing the statement away in a
+	 * try-with-resources right after. A real, wire-level "prepared"
+	 * statement therefore never actually reused Calcite's parse/plan/codegen
+	 * across repeated executions with different bound values -- exactly the
+	 * scenario a JDBC {@code PreparedStatement} exists to make cheap. {@code
+	 * ConvexMeta.execute(StatementHandle, List, int)} already implements the
+	 * fast "just bind and run" path Avatica expects for a reused statement
+	 * (as opposed to {@code prepareAndExecute}, which does the full parse);
+	 * this cache is what actually lets the wire protocol reach it.
+	 */
+	private final Map<PreparedStmt, PreparedStatement> preparedStatementCache = new java.util.IdentityHashMap<>();
+
+	/**
+	 * Wire-level statements (identity-keyed, same reasoning as {@link
+	 * #preparedStatementCache}'s own doc) that have ever had a {@code
+	 * RowDescription} sent to the client — whether via an explicit {@code
+	 * Describe} message or a prior {@code Execute} that included one.
+	 *
+	 * <p>Found live 2026-08-25: the previous tracking (a plain {@code
+	 * Set<String>} of portal names, cleared and re-populated on every single
+	 * Bind/Describe/Execute cycle) assumed the client sends {@code Describe}
+	 * before every {@code Execute} it wants metadata for. Real pgjdbc clients
+	 * don't: {@code PgPreparedStatement} only describes a statement for its
+	 * first few executions (governed by pgjdbc's own {@code prepareThreshold},
+	 * default 5) — once it has the {@code RowDescription} cached client-side,
+	 * later executions of the *same* {@code PreparedStatement} object send only
+	 * Bind+Execute, no Describe at all. Against the old per-portal tracking,
+	 * that made {@code handleExecute} conclude "not described" on every one of
+	 * those later executions and resend a {@code RowDescription} the client
+	 * never asked for and wasn't expecting mid-stream — desyncing pgjdbc's own
+	 * response-message bookkeeping (surfaces client-side as {@code
+	 * java.util.NoSuchElementException} at {@code ArrayDeque.removeFirst} deep
+	 * in {@code QueryExecutorImpl.processResults}, confirmed reproducing via a
+	 * SELECT reused across 10,000 executions of one {@code PreparedStatement} —
+	 * exactly pgjdbc's own optimization path, exactly where it stops
+	 * describing). Tracking is per *statement* (persists across every
+	 * Bind/Execute cycle that reuses it, unlike a portal, which {@link
+	 * #handleBind} recreates every cycle) and, once true, stays true for that
+	 * statement's lifetime — a client that already has the shape cached is
+	 * never sent it again, matching what real clients actually expect.
+	 */
+	private final java.util.Set<PreparedStmt> describedStatements =
+		java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
+	/** Evicts and closes the cached real statement for a wire-level statement being replaced or dropped, if any. */
+	private void evictCachedStatement(PreparedStmt removed) {
+		if (removed == null) return;
+		describedStatements.remove(removed);
+		PreparedStatement cached = preparedStatementCache.remove(removed);
+		if (cached != null) {
+			try {
+				cached.close();
+			} catch (SQLException e) {
+				log.debug("Error closing cached prepared statement", e);
+			}
+		}
+	}
 
 	private void handleParse(ChannelHandlerContext ctx, PgMessageDecoder.Parse parse) {
 		if (!authenticated) {
@@ -408,15 +997,21 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			String query = parse.query();
 			log.debug("Parse: name='{}', query='{}'", name, query);
 
+			String refusal = guestRefusal(query);
+			if (refusal != null) {
+				write(ctx, ErrorResponse.fromException(new SQLException(refusal, "42501")));
+				return;
+			}
+
 			// Close existing statement with same name (PostgreSQL behavior)
-			statements.remove(name);
+			evictCachedStatement(statements.remove(name));
 
 			// Store the prepared statement
 			statements.put(name, new PreparedStmt(query, parse.paramTypes()));
 
 			write(ctx, ParseComplete.INSTANCE);
 		} catch (Exception e) {
-			log.warn("Parse error: {}", e.getMessage(), e);
+			log.warn("Parse error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		}
 	}
@@ -443,7 +1038,11 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				return;
 			}
 
-			// Close existing portal with same name (PostgreSQL behavior)
+			// Close existing portal with same name (PostgreSQL behavior). Note:
+			// unlike the portal map itself, describedStatements is NOT touched
+			// here — it tracks the underlying statement, not this transient
+			// portal, and must survive across every rebind of it (see its own
+			// doc).
 			portals.remove(portalName);
 
 			// Create the portal with bound parameters
@@ -451,8 +1050,24 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 			write(ctx, BindComplete.INSTANCE);
 		} catch (Exception e) {
-			log.warn("Bind error: {}", e.getMessage(), e);
+			log.warn("Bind error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
+		}
+	}
+
+	/**
+	 * The columns a SELECT will return, for a Describe: the query is only
+	 * prepared (planned), never run. Running it here -- as this did until
+	 * 2026-10-25 -- made every prepared SELECT run twice, Describe and
+	 * Execute, and be logged twice. {@code $N} parameters become NULL, as
+	 * the plan needs no values to know its columns.
+	 */
+	private RowDescription describeColumns(String query) throws SQLException {
+		String metaQuery = query.replaceAll("\\$\\d+", "NULL");
+		try (java.sql.PreparedStatement ps = connection.prepareStatement(metaQuery)) {
+			java.sql.ResultSetMetaData md = ps.getMetaData();
+			if (md == null) throw new SQLException("no result columns known for: " + metaQuery);
+			return RowDescription.fromMetaData(md);
 		}
 	}
 
@@ -482,11 +1097,9 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 				String query = rewriteQuery(stmt.query());
 				if (query != null && query.toUpperCase().trim().startsWith("SELECT")) {
-					// Execute to get metadata (substitute $N with NULL for metadata query)
-					String metaQuery = query.replaceAll("\\$\\d+", "NULL");
-					try (Statement s = connection.createStatement();
-						 ResultSet rs = s.executeQuery(metaQuery)) {
-						write(ctx, RowDescription.fromMetaData(rs.getMetaData()));
+					try {
+						write(ctx, describeColumns(query));
+						describedStatements.add(stmt);
 					} catch (SQLException e) {
 						// If metadata query fails, return NoData
 						write(ctx, NoData.INSTANCE);
@@ -508,10 +1121,9 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 
 				String query = rewriteQuery(portal.stmt().query());
 				if (query != null && query.toUpperCase().trim().startsWith("SELECT")) {
-					String metaQuery = query.replaceAll("\\$\\d+", "NULL");
-					try (Statement s = connection.createStatement();
-						 ResultSet rs = s.executeQuery(metaQuery)) {
-						write(ctx, RowDescription.fromMetaData(rs.getMetaData()));
+					try {
+						write(ctx, describeColumns(query));
+						describedStatements.add(portal.stmt());
 					} catch (SQLException e) {
 						write(ctx, NoData.INSTANCE);
 					}
@@ -520,7 +1132,7 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				}
 			}
 		} catch (Exception e) {
-			log.warn("Describe error: {}", e.getMessage(), e);
+			log.warn("Describe error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		}
 	}
@@ -551,15 +1163,27 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 				return;
 			}
 
-			executeWithParameters(ctx, query, portal.paramValues(), portal.paramFormats(), portal.stmt().paramTypes());
+			// If this STATEMENT (not just this one portal instance -- see
+			// describedStatements' own doc) has ever had its RowDescription
+			// sent already, Execute must not resend it — doing so desyncs
+			// pgjdbc's client-side bookkeeping.
+			PreparedStmt stmt = portal.stmt();
+			boolean alreadyDescribed = describedStatements.contains(stmt);
+			if (!alreadyDescribed) describedStatements.add(stmt);
+			executeWithParameters(ctx, stmt, portal.paramValues(), portal.paramFormats(), !alreadyDescribed, portal.resultFormats());
 		} catch (SQLException e) {
-			log.warn("Execute error: {}", e.getMessage(), e);
+			if (inTransaction) transactionFailed = true;
+			log.warn("Execute error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		} catch (RuntimeException e) {
 			// Runtime exceptions from Calcite (type coercion, etc.) are query errors
-			log.warn("Query execution error: {}", e.getMessage(), e);
+			if (inTransaction) transactionFailed = true;
+			log.warn("Query execution error: {}", e.getMessage());
 			write(ctx, ErrorResponse.fromException(e));
 		} catch (Exception e) {
+			// Not a recognised query-error type — genuinely unexpected, so the
+			// stack trace is worth keeping here.
+			if (inTransaction) transactionFailed = true;
 			log.error("Unexpected error during execute", e);
 			write(ctx, ErrorResponse.fromException(e));
 		}
@@ -568,17 +1192,29 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	/**
 	 * Execute a query with bound parameters.
 	 */
-	private void executeWithParameters(ChannelHandlerContext ctx, String sql, byte[][] paramValues, short[] paramFormats, int[] paramTypes) throws SQLException {
-		sql = rewriteQuery(sql);
+	private void executeWithParameters(ChannelHandlerContext ctx, PreparedStmt stmt, byte[][] paramValues,
+			short[] paramFormats, boolean includeRowDescription, short[] resultFormats) throws SQLException {
+		String sql = rewriteQuery(stmt.query());
 
 		if (sql == null) {
 			write(ctx, CommandComplete.select(0));
 			return;
 		}
 
-		// If no parameters, execute directly
+		// pgjdbc's own Connection.commit()/rollback() send their literal
+		// "COMMIT"/"ROLLBACK" text via this extended-protocol path (not the
+		// simple one handleQuery covers) even though there are no bind
+		// parameters -- see handleTransactionControl's own doc.
+		if (handleTransactionControl(ctx, sql.toUpperCase())) {
+			return;
+		}
+
+		// If no parameters, execute directly. sendTimingNotice=false: this is
+		// always the extended protocol (a bound PreparedStatement), i.e.
+		// always a program, never a person typing at psql -- see
+		// executeQuery's own doc.
 		if (paramValues == null || paramValues.length == 0) {
-			executeQuery(ctx, sql, false);
+			executeQuery(ctx, sql, includeRowDescription, false, resultFormats);
 			return;
 		}
 
@@ -590,41 +1226,119 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			lowerSql.contains("pg_namespace") || lowerSql.contains("pg_attribute") ||
 			lowerSql.contains("pg_tables")) {
 			String substituted = substituteParameters(sql, paramValues, paramFormats);
-			executeQuery(ctx, substituted, false);
+			executeQuery(ctx, substituted, includeRowDescription, false, resultFormats);
 			return;
 		}
 
 		// Convert $1, $2 to ? for JDBC
 		String jdbcSql = sql.replaceAll("\\$\\d+", "?");
 
-		try (PreparedStatement pstmt = connection.prepareStatement(jdbcSql)) {
-			// Bind parameters
+		// Reuse the real JDBC PreparedStatement across every Bind+Execute for
+		// this wire-level statement (see preparedStatementCache's own doc) --
+		// deliberately NOT try-with-resources: closing it here would defeat
+		// the whole point, throwing away the cached query plan right after
+		// paying to build it. It's closed instead when the wire-level
+		// statement is replaced/closed (evictCachedStatement) or the
+		// connection tears down (closeConnection).
+		{
+			PreparedStatement pstmt = preparedStatementCache.get(stmt);
+			if (pstmt == null) {
+				long prepareStart = System.nanoTime();
+				try {
+					pstmt = connection.prepareStatement(jdbcSql);
+				} catch (SQLException e) {
+					// A statement that fails while being prepared never runs, so
+					// ConvexMeta never sees it: log the failure here
+					QueryLog.fire(jdbcSql, (System.nanoTime() - prepareStart) / 1_000_000, null, e.getMessage(),
+						avaticaConnectionId);
+					throw e;
+				}
+				preparedStatementCache.put(stmt, pstmt);
+			}
+			// Bind parameters. Every text-format value arrives here as a
+			// byte[] with no type of its own (the pg wire protocol's text
+			// format is just the value's string representation) — binding
+			// it via setString() unconditionally, regardless of the target
+			// column's real type, used to be the only thing this did. That
+			// silently broke every non-VARCHAR column: a bound value ends up
+			// as a Java String sitting where ConvexTable.executeInsert (and
+			// friends) expect the real typed value (e.g. Number for
+			// INTEGER), so it fails with a ClassCastException at execution
+			// time — not at bind time, so it looked like an "execute" bug
+			// until traced back here. The same applies to a bound NULL: an
+			// untyped java.sql.Types.NULL flows into Avatica as a ByteString
+			// placeholder, which fails the identical cast. getParameterType
+			// gives us the real target type so both cases can be bound
+			// correctly; a lookup failure falls back to the old
+			// string/generic-NULL behavior (correct only for VARCHAR
+			// columns, same as before this fix).
+			ParameterMetaData paramMeta = null;
+			try {
+				paramMeta = pstmt.getParameterMetaData();
+			} catch (SQLException ignore) {
+				// no metadata available -- every param falls back to VARCHAR below
+			}
 			for (int i = 0; i < paramValues.length; i++) {
 				byte[] value = paramValues[i];
+				int sqlType = java.sql.Types.VARCHAR;
+				if (paramMeta != null) {
+					try {
+						sqlType = paramMeta.getParameterType(i + 1);
+					} catch (SQLException ignore) {
+						// keep the VARCHAR fallback
+					}
+				}
 				if (value == null) {
-					pstmt.setNull(i + 1, java.sql.Types.NULL);
+					pstmt.setNull(i + 1, sqlType);
 				} else {
-					// Determine format: 0 = text, 1 = binary
+					// Determine format: 0 = text, 1 = binary. The real
+					// postgresql JDBC driver defaults to BINARY for numeric
+					// setInt/setLong/etc. bind calls (confirmed live: a
+					// bound int arrives here as a raw 4-byte big-endian
+					// value, e.g. [0,0,0,42], not the digit string "42") —
+					// text format is really only guaranteed for setString.
 					short format = (paramFormats != null && paramFormats.length > 0)
 						? (paramFormats.length == 1 ? paramFormats[0] : paramFormats[i])
 						: 0;
 
 					if (format == 0) {
-						// Text format - convert bytes to string
+						// Text format - convert bytes to string, then bind
+						// using the target column's real type.
 						String strValue = new String(value, java.nio.charset.StandardCharsets.UTF_8);
-						pstmt.setString(i + 1, strValue);
+						bindTextValue(pstmt, i + 1, strValue, sqlType);
 					} else {
-						// Binary format - decode by the type the client declared in Parse
-						int oid = (paramTypes != null && i < paramTypes.length) ? paramTypes[i] : 0;
-						bindBinaryParameter(pstmt, i + 1, value, oid);
+						// Binary format - decode per the target column's
+						// real type (was previously always setBytes(),
+						// which is only correct for an actual BLOB column —
+						// for anything else, e.g. INTEGER, that binds the
+						// raw wire bytes as a byte[], which Avatica
+						// represents as a ByteString and which then fails
+						// to cast to the real target type at execution).
+						bindBinaryValue(pstmt, i + 1, value, sqlType);
 					}
 				}
 			}
 
+			// No timing NoticeResponse here (unlike executeQuery's simple-
+			// query path) -- this bound-PreparedStatement path is always the
+			// extended protocol, i.e. always a program, never a person
+			// reading a terminal. Sending it per row was pure waste on a
+			// bulk insert: the client has to receive and discard a message
+			// with zero value to it. See executeQuery's own doc.
+			//
+			// Opens (or extends) a deferred-sync window for this connection --
+			// see BatchSyncDeferral's own doc: without this, ConvexMeta synced
+			// (announce+persist+broadcast) after EVERY row of a JDBC batch,
+			// giving executeBatch() zero throughput benefit over an unbatched
+			// loop. handleSync (the wire protocol's own pipeline-flush point,
+			// always sent after however many Binds+Executes the client
+			// pipelined) closes the window and performs one real sync if
+			// anything was dirty.
+			BatchSyncDeferral.begin(avaticaConnectionId);
 			boolean hasResultSet = pstmt.execute();
 			if (hasResultSet) {
 				try (ResultSet rs = pstmt.getResultSet()) {
-					sendResultSet(ctx, rs, false);
+					sendResultSet(ctx, rs, includeRowDescription, resultFormats);
 				}
 			} else {
 				int updateCount = pstmt.getUpdateCount();
@@ -643,34 +1357,84 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	/**
-	 * Binds a parameter that arrived in binary format, decoding it by the type OID the
-	 * client declared for it in the Parse message.
-	 *
-	 * <p>The PostgreSQL JDBC driver sends numbers in binary format: setLong arrives as
-	 * the 8 bytes of an int8, not as the digits of the number. Binding those bytes as
-	 * they are hands Calcite a byte string where it expects a number, and the statement
-	 * fails. Types without a decoding here, and parameters the client declared no type
-	 * for, are bound as bytes as before.
+	 * Binds a text-format wire value (already decoded to its string form) as
+	 * the real Java type its target column expects, instead of always as a
+	 * String — see the comment at this method's one call site for why that
+	 * distinction matters. {@code sqlType} unrecognized here falls through to
+	 * {@code setString}, which is correct for VARCHAR and a reasonable
+	 * default for anything not explicitly handled.
 	 */
-	static void bindBinaryParameter(PreparedStatement pstmt, int index, byte[] value, int oid) throws SQLException {
-		java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(value);
-		switch (oid) {
-			case PgType.INT2 -> { requireLength(value, 2, "int2"); pstmt.setLong(index, buf.getShort()); }
-			case PgType.INT4 -> { requireLength(value, 4, "int4"); pstmt.setLong(index, buf.getInt()); }
-			case PgType.OID -> { requireLength(value, 4, "oid"); pstmt.setLong(index, Integer.toUnsignedLong(buf.getInt())); }
-			case PgType.INT8 -> { requireLength(value, 8, "int8"); pstmt.setLong(index, buf.getLong()); }
-			case PgType.FLOAT4 -> { requireLength(value, 4, "float4"); pstmt.setDouble(index, buf.getFloat()); }
-			case PgType.FLOAT8 -> { requireLength(value, 8, "float8"); pstmt.setDouble(index, buf.getDouble()); }
-			case PgType.BOOL -> { requireLength(value, 1, "bool"); pstmt.setBoolean(index, value[0] != 0); }
-			case PgType.TEXT, PgType.VARCHAR, PgType.CHAR, PgType.NAME ->
-				pstmt.setString(index, new String(value, java.nio.charset.StandardCharsets.UTF_8));
-			default -> pstmt.setBytes(index, value);
+	private void bindTextValue(PreparedStatement pstmt, int index, String strValue, int sqlType) throws SQLException {
+		switch (sqlType) {
+			case java.sql.Types.INTEGER, java.sql.Types.SMALLINT, java.sql.Types.TINYINT ->
+				pstmt.setInt(index, Integer.parseInt(strValue));
+			case java.sql.Types.BIGINT ->
+				pstmt.setLong(index, Long.parseLong(strValue));
+			case java.sql.Types.DOUBLE, java.sql.Types.FLOAT ->
+				pstmt.setDouble(index, Double.parseDouble(strValue));
+			case java.sql.Types.REAL ->
+				pstmt.setFloat(index, Float.parseFloat(strValue));
+			case java.sql.Types.DECIMAL, java.sql.Types.NUMERIC ->
+				pstmt.setBigDecimal(index, new java.math.BigDecimal(strValue));
+			case java.sql.Types.BOOLEAN, java.sql.Types.BIT ->
+				pstmt.setBoolean(index, "t".equalsIgnoreCase(strValue) || "true".equalsIgnoreCase(strValue) || "1".equals(strValue));
+			case java.sql.Types.TIMESTAMP ->
+				pstmt.setTimestamp(index, parseTimestampText(strValue));
+			default ->
+				pstmt.setString(index, strValue);
 		}
 	}
 
-	private static void requireLength(byte[] value, int expected, String type) throws SQLException {
-		if (value.length != expected) {
-			throw new SQLException("Binary " + type + " parameter has " + value.length + " bytes, expected " + expected, "08P01");
+	/**
+	 * Binds a binary-format wire value (raw pg wire encoding, per
+	 * https://www.postgresql.org/docs/current/protocol-message-formats.html)
+	 * as the real Java type its target column expects — see the comment at
+	 * this method's one call site for why {@code setBytes} unconditionally
+	 * was wrong. Only the numeric/boolean encodings actually needed by this
+	 * codebase's own tables are implemented; anything else (including
+	 * NUMERIC/DECIMAL's variable-length base-10000 wire format, and genuine
+	 * BLOB columns) falls through to the original setBytes behavior.
+	 *
+	 * <p>Integer/float widths are picked from the actual byte length
+	 * received, not from {@code sqlType} — confirmed live: Convex's own
+	 * "INTEGER" columns are backed by a 64-bit CVMLong, so
+	 * getParameterMetaData() reports BIGINT for them, but a real postgres
+	 * client's setInt() still wire-encodes as a plain 4-byte int4 regardless
+	 * (the client has no way to know the server treats the column as
+	 * 64-bit). Trusting sqlType's width there throws BufferUnderflowException
+	 * reading 8 bytes out of a 4-byte buffer.
+	 */
+	private void bindBinaryValue(PreparedStatement pstmt, int index, byte[] value, int sqlType) throws SQLException {
+		java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(value);
+		switch (sqlType) {
+			case java.sql.Types.SMALLINT, java.sql.Types.TINYINT, java.sql.Types.INTEGER, java.sql.Types.BIGINT -> {
+				long longValue = switch (value.length) {
+					case 2 -> buf.getShort();
+					case 4 -> buf.getInt();
+					case 8 -> buf.getLong();
+					default -> throw new SQLException("Unexpected integer wire width: " + value.length + " bytes");
+				};
+				pstmt.setLong(index, longValue);
+			}
+			case java.sql.Types.REAL, java.sql.Types.DOUBLE, java.sql.Types.FLOAT -> {
+				double doubleValue = switch (value.length) {
+					case 4 -> buf.getFloat();
+					case 8 -> buf.getDouble();
+					default -> throw new SQLException("Unexpected float wire width: " + value.length + " bytes");
+				};
+				pstmt.setDouble(index, doubleValue);
+			}
+			case java.sql.Types.BOOLEAN, java.sql.Types.BIT ->
+				pstmt.setBoolean(index, value.length > 0 && value[0] != 0);
+			case java.sql.Types.VARCHAR, java.sql.Types.CHAR, java.sql.Types.LONGVARCHAR ->
+				pstmt.setString(index, new String(value, java.nio.charset.StandardCharsets.UTF_8));
+			case java.sql.Types.TIMESTAMP -> {
+				if (value.length != 8) throw new SQLException("Unexpected timestamp wire width: " + value.length + " bytes");
+				long microsSincePgEpoch = buf.getLong();
+				pstmt.setTimestamp(index, new Timestamp(PgType.BINARY_EPOCH_MILLIS + microsSincePgEpoch / 1000L));
+			}
+			default ->
+				pstmt.setBytes(index, value);
 		}
 	}
 
@@ -736,8 +1500,12 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		log.debug("Close: type={}, name='{}'", (char) close.type(), close.name());
 
 		if (close.type() == 'S') {
-			statements.remove(close.name());
+			evictCachedStatement(statements.remove(close.name()));
 		} else {
+			// describedStatements tracks the underlying statement, not this
+			// portal (see its own doc) -- closing a portal leaves it alone,
+			// since the statement may still be bound to other portals or
+			// rebound later.
 			portals.remove(close.name());
 		}
 
@@ -755,7 +1523,17 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void handleSync(ChannelHandlerContext ctx) {
-		write(ctx, ReadyForQuery.IDLE_INSTANCE);
+		// The wire protocol's own pipeline-flush point -- closes out
+		// whatever deferred-sync window executeWithParameters opened (see
+		// BatchSyncDeferral's own doc), performing exactly one real sync if
+		// anything was actually written since the last Sync. A no-op for a
+		// connection that never opened one (e.g. the simple-query path, or a
+		// read-only pipeline).
+		ConvexMeta meta = ConvexMetaAccess.metaOf(connection);
+		if (meta != null) {
+			meta.flushDeferredSync(avaticaConnectionId);
+		}
+		write(ctx, currentReadyState());
 		ctx.flush();
 	}
 
@@ -772,7 +1550,26 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 	}
 
 	private void closeConnection() {
+		for (PreparedStatement cached : preparedStatementCache.values()) {
+			try {
+				cached.close();
+			} catch (SQLException e) {
+				log.debug("Error closing cached prepared statement", e);
+			}
+		}
+		preparedStatementCache.clear();
+		describedStatements.clear();
 		if (connection != null) {
+			if (connection instanceof AvaticaConnection avaticaConn) {
+				QueryLog.unmarkPgwireConnection(avaticaConn.id);
+			}
+			// Discards, not flushes -- a connection tearing down (client
+			// disconnect, error) mid-pipeline never sent the final Sync that
+			// would normally trigger flushDeferredSync; whatever was pending
+			// is abandoned along with the connection itself, same as any
+			// other in-flight work at teardown. See BatchSyncDeferral's own
+			// doc.
+			BatchSyncDeferral.discard(avaticaConnectionId);
 			try {
 				connection.close();
 			} catch (SQLException e) {

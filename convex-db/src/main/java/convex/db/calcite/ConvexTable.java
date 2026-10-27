@@ -1,7 +1,9 @@
 package convex.db.calcite;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.calcite.adapter.java.AbstractQueryableTable;
 import org.apache.calcite.linq4j.Enumerable;
@@ -17,11 +19,16 @@ import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.schema.ColumnStrategy;
 import org.apache.calcite.schema.ModifiableTable;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.schema.Statistic;
 import org.apache.calcite.schema.Statistics;
 import org.apache.calcite.schema.TranslatableTable;
+import org.apache.calcite.sql.SqlFunction;
+import org.apache.calcite.sql2rel.InitializerContext;
+import org.apache.calcite.sql2rel.InitializerExpressionFactory;
+import org.apache.calcite.sql2rel.NullInitializerExpressionFactory;
 import org.apache.calcite.util.ImmutableBitSet;
 
 import convex.core.data.ACell;
@@ -40,9 +47,13 @@ import convex.db.lattice.SQLTable;
  * table scan. This ensures PK lookups use the index, not full scans.
  *
  * <p>Implements ModifiableTable for INSERT, UPDATE, DELETE operations.
+ *
+ * <p>Implements {@link InitializerExpressionFactory} solely to mark {@link
+ * SQLSchema#OWNERID_COLUMN} as {@link ColumnStrategy#STORED} — see {@link
+ * #generationStrategy}'s own doc for why.
  */
 public class ConvexTable extends AbstractQueryableTable
-		implements TranslatableTable, ModifiableTable {
+		implements TranslatableTable, ModifiableTable, InitializerExpressionFactory {
 
 	private final ConvexSchema schema;
 	private final String tableName;
@@ -96,7 +107,7 @@ public class ConvexTable extends AbstractQueryableTable
 	 * <p>Provides:
 	 * <ul>
 	 *   <li>Row count from the Index (O(1), may include tombstones)
-	 *   <li>Primary key declaration (column 0 is unique)
+	 *   <li>Primary key declaration (its leading columns together are unique)
 	 *   <li>Sort order (rows are sorted by PK via the radix tree Index)
 	 * </ul>
 	 */
@@ -109,8 +120,12 @@ public class ConvexTable extends AbstractQueryableTable
 			rowCount = (double) table.getRowCount();
 		}
 
-		// PK is column 0
-		List<ImmutableBitSet> keys = List.of(ImmutableBitSet.of(0));
+		// The primary key: its leading columns together. Declaring column 0
+		// alone made a composite-key table (e.g. perf.querylog, key NODEID,
+		// LOGID) look unique on NODEID, so the planner dropped a GROUP BY
+		// that included it -- one group per row (found 2026-10-25).
+		int pkCount = (table != null) ? Math.max(1, table.getPkCount()) : 1;
+		List<ImmutableBitSet> keys = List.of(ImmutableBitSet.range(0, pkCount));
 
 		// TODO: declare PK collation once trait propagation is implemented
 		// TODO: add column cardinality for selectivity estimation
@@ -159,7 +174,47 @@ public class ConvexTable extends AbstractQueryableTable
 
 	// ========== DML Operations (called from generated code) ==========
 
+	/**
+	 * Schemas that reject a direct SQL write (INSERT/UPDATE/DELETE) from any
+	 * connection that resolved to a real, non-ROOT entity — see {@link
+	 * #checkWriteAllowed()}. Round C of `PLAN_access_rights.md` (`dbase`
+	 * repo): catalog data in these schemas is meant to be written only
+	 * through purpose-built handler statements (e.g. a future {@code LINK
+	 * DID}/{@code REVOKE DID}) that can verify a signature/capability first
+	 * — those handlers call the Java API ({@code SQLSchema}) directly and
+	 * never go through this class, so they are unaffected by this guard.
+	 * {@code SELECT} is untouched; only the three DML entry points below
+	 * check this.
+	 */
+	private static final Set<String> PROTECTED_SCHEMAS = Set.of("auth");
+
+	/**
+	 * Sentinel entity id for the system/admin ROOT entity — an admin
+	 * override for {@link #PROTECTED_SCHEMAS}, mirroring the identical
+	 * override in {@code DbaseServer}'s {@code TRANSFER} authorization
+	 * check. Duplicated here (not imported) because {@code convex-db} has
+	 * no dependency on {@code dbase-meta}, where the real constant lives:
+	 * {@code dbase.meta.auth.Entity.ROOT_ENTITYID}. Must stay in sync with
+	 * that value if it ever changes.
+	 */
+	private static final long ROOT_ENTITY_ID = 0L;
+
+	/**
+	 * Rejects a DML statement against a {@link #PROTECTED_SCHEMAS} schema
+	 * unless the connection is trust (no UCAN token — {@link
+	 * convex.db.CurrentEntity#get()} is null) or resolved to {@link
+	 * #ROOT_ENTITY_ID}. Called once per statement, not per row.
+	 */
+	private void checkWriteAllowed() {
+		if (!PROTECTED_SCHEMAS.contains(schema.getName())) return;
+		Long entityId = convex.db.CurrentEntity.get();
+		if (entityId == null || entityId == ROOT_ENTITY_ID) return;
+		throw new RuntimeException("Direct writes to protected schema '" + schema.getName() +
+			"' are not permitted; use the appropriate handler statement instead.");
+	}
+
 	public long executeInsert(Enumerable<?> input) {
+		checkWriteAllowed();
 		try {
 			long count = 0;
 			for (Object value : input) {
@@ -175,6 +230,14 @@ public class ConvexTable extends AbstractQueryableTable
 	}
 
 	public long executeUpdate(Enumerable<?> input, int columnCount, int[] updateIndices) {
+		checkWriteAllowed();
+		int createdIdx = columnIndex(SQLSchema.CREATEDT_COLUMN);
+		for (int idx : updateIndices) {
+			if (idx >= 0 && idx == createdIdx) {
+				throw new IllegalArgumentException("Column '" + SQLSchema.CREATEDT_COLUMN
+					+ "' cannot be changed -- it holds the time the row was created");
+			}
+		}
 		try {
 			boolean pkBeingUpdated = false;
 			for (int idx : updateIndices) {
@@ -205,18 +268,30 @@ public class ConvexTable extends AbstractQueryableTable
 					}
 				}
 
-				ACell oldPk = toCell(row[0], 0);
-				ACell newPk = toCell(updatedRow[0], 0);
+				List<ACell> oldPk = primaryKeyCells(row);
+				List<ACell> newPk = primaryKeyCells(updatedRow);
+				boolean pkChanged = pkBeingUpdated && !oldPk.equals(newPk);
 
-				if (pkBeingUpdated && !oldPk.equals(newPk)) {
+				// Only delete-then-insert when the pk itself is actually
+				// changing (a genuine "move" to a new key). Found live
+				// 2026-08-10: this used to unconditionally deleteByKey then
+				// insertRow for EVERY update, even ordinary non-pk column
+				// updates -- insertRow already upserts an existing pk in
+				// place (see SQLTable.insertRow), so the delete was not just
+				// redundant but actively wrong for versioned tables: it
+				// recorded a spurious DELETE history entry (pk only, no
+				// values) immediately followed by a fresh INSERT, so a plain
+				// "UPDATE t SET name = ... WHERE id = ..." never produced a
+				// CT_UPDATE history entry, only ever DELETE+INSERT pairs --
+				// surprising and misleading when reading <table>_HISTORY.
+				if (pkChanged) {
 					if (schema.getTables().selectByKey(tableName, newPk) != null) {
 						throw new RuntimeException("Unique constraint violation: primary key '" +
 							newPk + "' already exists in table '" + tableName + "'");
 					}
+					schema.getTables().deleteByKey(tableName, oldPk);
 				}
-
-				schema.getTables().deleteByKey(tableName, oldPk);
-				if (insertRow(updatedRow)) {
+				if (insertRow(updatedRow, false)) {
 					count++;
 				}
 			}
@@ -227,12 +302,13 @@ public class ConvexTable extends AbstractQueryableTable
 	}
 
 	public long executeDelete(Enumerable<?> input) {
+		checkWriteAllowed();
 		try {
 			long count = 0;
 			for (Object value : input) {
 				Object[] row=normaliseRow(value);
 				if (row != null && row.length > 0) {
-					ACell pk = toCell(row[0], 0);
+					List<ACell> pk = primaryKeyCells(row);
 					if (schema.getTables().deleteByKey(tableName, pk)) {
 						count++;
 					}
@@ -262,8 +338,27 @@ public class ConvexTable extends AbstractQueryableTable
 		return new RuntimeException(message, e);
 	}
 
+	/** Genuine new row (INSERT) — stamps {@code OWNERID} from the current entity. */
 	private boolean insertRow(Object[] row) {
+		return insertRow(row, true);
+	}
+
+	/**
+	 * @param stampOwner true for a genuine new row (INSERT); false for the
+	 *        upsert-in-place path inside {@link #executeUpdate} — an UPDATE
+	 *        never changes ownership (that's what {@code TRANSFER} is for),
+	 *        and {@code updatedRow}'s {@code OWNERID} slot already carries
+	 *        over the target row's real, already-stamped value from the old
+	 *        row it was copied from. Re-stamping there would both be wrong
+	 *        (silently reassigning ownership to whoever ran the UPDATE) and
+	 *        throw outright, since {@link #stampOwnerId} rejects a non-null
+	 *        incoming value as a client trying to set it directly — found
+	 *        live while building Round C's {@code PROTECTED_SCHEMAS} tests:
+	 *        any UPDATE against a row an entity actually owns hit this.
+	 */
+	private boolean insertRow(Object[] row, boolean stampOwner) {
 		if (row == null || row.length < 1) return false;
+		if (stampOwner) stampOwnerId(row);
 		ConvexColumnType[] types = getColumnTypes();
 		ACell[] cells = new ACell[row.length];
 		for (int i = 0; i < row.length; i++) {
@@ -273,9 +368,132 @@ public class ConvexTable extends AbstractQueryableTable
 		return schema.getTables().insert(tableName, Vectors.of(cells));
 	}
 
+	/**
+	 * Stamps the row's {@code OWNERID} slot (see {@link SQLSchema#OWNERID_COLUMN}
+	 * / PLAN_access_rights.md's "Ownership" section) with the connection's
+	 * resolved entity, in place — mutates {@code row} directly, since it's a
+	 * freshly-built array local to this one insert, not shared state.
+	 *
+	 * <p>A client naming {@code OWNERID} explicitly in an INSERT column list is
+	 * already rejected earlier, at SQL validation time, by Calcite itself —
+	 * {@link ColumnStrategy#STORED} (see {@link #generationStrategy}) makes
+	 * {@code INSERT INTO t (..., OWNERID) VALUES (..., v)} throw {@code
+	 * insertIntoAlwaysGenerated} before this method (or even {@link
+	 * #insertRow}) is ever reached, for any {@code v} including {@code NULL}.
+	 * The non-null check below is only a defensive backstop for any insert
+	 * path that could somehow bypass that validation, not the primary
+	 * enforcement.
+	 *
+	 * <p>No entity resolved for this connection (trust/no-password: bootstrap
+	 * self-registration, admin {@code psql}, every direct {@code jdbc:convex:}
+	 * caller) stamps {@code null} — "system-owned", per the same section.
+	 */
+	private void stampOwnerId(Object[] row) {
+		int ownerIdx = ownerIdColumnIndex();
+		if (ownerIdx < 0 || ownerIdx >= row.length) return;
+		if (row[ownerIdx] != null) {
+			throw new IllegalArgumentException(
+				"Column '" + SQLSchema.OWNERID_COLUMN + "' cannot be set directly on INSERT — "
+				+ "it is stamped automatically from the connection's authenticated entity");
+		}
+		row[ownerIdx] = convex.db.CurrentEntity.get();
+	}
+
+	/** This table's physical {@code OWNERID} column index, or -1 if not present. */
+	private int ownerIdColumnIndex() {
+		return columnIndex(SQLSchema.OWNERID_COLUMN);
+	}
+
+	/** The physical index of a column, by name in any case, or -1 if not present. */
+	private int columnIndex(String column) {
+		String[] columnNames = schema.getTables().getColumnNames(tableName);
+		if (columnNames == null) return -1;
+		for (int i = 0; i < columnNames.length; i++) {
+			if (column.equalsIgnoreCase(columnNames[i])) return i;
+		}
+		return -1;
+	}
+
+	// ========== InitializerExpressionFactory (marks OWNERID as STORED) ==========
+	// Making OWNERID a Calcite ColumnStrategy#STORED column (rather than the
+	// default NULLABLE every other column here gets) does two things at once,
+	// both wanted: (1) a column-list-less "INSERT INTO t VALUES (...)" no
+	// longer needs to supply a value for it -- Calcite's own field-count
+	// validation excludes STORED/VIRTUAL columns from the implicit target row
+	// type (see SqlValidatorImpl#checkFieldCount's own "real target row type"
+	// filtering) -- so every pre-existing bare-VALUES INSERT against an
+	// already-existing table keeps working unchanged even though the table
+	// just grew a trailing column; (2) a client explicitly naming OWNERID in
+	// an INSERT column list is rejected outright at validation time
+	// ("insertIntoAlwaysGenerated"), before the row ever reaches insertRow --
+	// a stronger, earlier guarantee than the row-value check in
+	// stampOwnerId alone would give.
+	//
+	// Every other method below delegates to NullInitializerExpressionFactory
+	// (this schema declares no other generated/non-nullable columns).
+
+	@SuppressWarnings("deprecation")
+	@Override
+	public boolean isGeneratedAlways(RelOptTable table, int iColumn) {
+		switch (generationStrategy(table, iColumn)) {
+			case VIRTUAL:
+			case STORED:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	@Override
+	public ColumnStrategy generationStrategy(RelOptTable table, int iColumn) {
+		if (iColumn == ownerIdColumnIndex()) return ColumnStrategy.STORED;
+		// CREATEDT may be left out (SQLSchema stamps a new row with the current
+		// time) or given (a restore keeps the real creation time); an UPDATE
+		// may not change it (executeUpdate)
+		if (iColumn == columnIndex(SQLSchema.CREATEDT_COLUMN)) return ColumnStrategy.DEFAULT;
+		return NullInitializerExpressionFactory.INSTANCE.generationStrategy(table, iColumn);
+	}
+
+	@Override
+	public RexNode newColumnDefaultValue(RelOptTable table, int iColumn, InitializerContext context) {
+		// STORED's "computed" value is filled in for real by stampOwnerId once
+		// the row reaches insertRow -- a NULL literal here just satisfies
+		// Calcite's own row-completion machinery in the meantime.
+		return NullInitializerExpressionFactory.INSTANCE.newColumnDefaultValue(table, iColumn, context);
+	}
+
+	@Override
+	public java.util.function.BiFunction<InitializerContext, RelNode, RelNode> postExpressionConversionHook() {
+		return NullInitializerExpressionFactory.INSTANCE.postExpressionConversionHook();
+	}
+
+	@Override
+	public RexNode newAttributeInitializer(RelDataType type, SqlFunction constructor, int iAttribute,
+			List<RexNode> constructorArgs, InitializerContext context) {
+		return NullInitializerExpressionFactory.INSTANCE
+			.newAttributeInitializer(type, constructor, iAttribute, constructorArgs, context);
+	}
+
 	private ACell toCell(Object v, int columnIndex) {
 		ConvexColumnType[] types = getColumnTypes();
 		ConvexColumnType type = (types != null && columnIndex < types.length) ? types[columnIndex] : ConvexColumnType.of(ConvexType.ANY);
 		return type.toCell(v);
+	}
+
+	/**
+	 * Converts the leading PK columns of a row into ACells, in column order —
+	 * one per column of the table's actual primary key (composite or not).
+	 * Used to build the exact same key shape {@link SQLSchema#insert} uses,
+	 * so UPDATE/DELETE can locate a row by key regardless of whether the PK
+	 * spans one column or several.
+	 */
+	private List<ACell> primaryKeyCells(Object[] row) {
+		SQLTable table = schema.getTables().getLiveTable(tableName);
+		int pkCount = (table != null) ? table.getPkCount() : 1;
+		List<ACell> keyCells = new ArrayList<>(pkCount);
+		for (int i = 0; i < pkCount; i++) {
+			keyCells.add(toCell(row[i], i));
+		}
+		return keyCells;
 	}
 }

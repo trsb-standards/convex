@@ -2,6 +2,7 @@ package convex.db.calcite;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.calcite.schema.Schema;
 import org.apache.calcite.schema.Table;
@@ -10,6 +11,7 @@ import org.apache.calcite.schema.impl.AbstractSchema;
 import convex.db.calcite.pgcatalog.PgCatalogSchema;
 import convex.db.lattice.SQLDatabase;
 import convex.db.lattice.SQLSchema;
+import convex.db.lattice.VersionedSQLTable;
 
 /**
  * Calcite Schema backed by a Convex {@link SQLDatabase}.
@@ -26,6 +28,12 @@ public class ConvexSchema extends AbstractSchema {
 	private final SQLDatabase database;
 	private final SQLSchema tables;
 	private final String name;
+
+	/**
+	 * Registry of SQL index names to (tableName, columnName) pairs.
+	 * Populated by CREATE INDEX DDL; used to resolve DROP INDEX by name.
+	 */
+	final ConcurrentHashMap<String, String[]> indexRegistry = new ConcurrentHashMap<>();
 
 	/**
 	 * Creates a new ConvexSchema backed by the given database.
@@ -53,13 +61,39 @@ public class ConvexSchema extends AbstractSchema {
 		return true; // Allow DDL modifications
 	}
 
+	/**
+	 * Functions visible unqualified from this schema — just {@code
+	 * current_entity()} for now. See {@link ConvexFunctions}'s own doc for why
+	 * this is registered identically on every {@code ConvexSchema} instance
+	 * rather than on one central root schema. {@link AbstractSchema}'s own
+	 * {@code getFunctionNames()}/{@code getFunctions(String)} are {@code
+	 * final} and delegate here.
+	 */
+	@Override
+	protected com.google.common.collect.Multimap<String, org.apache.calcite.schema.Function> getFunctionMultimap() {
+		com.google.common.collect.ImmutableMultimap.Builder<String, org.apache.calcite.schema.Function> builder =
+			com.google.common.collect.ImmutableMultimap.builder();
+		builder.put(ConvexFunctions.CURRENT_ENTITY_NAME, ConvexFunctions.CURRENT_ENTITY_FUNCTION);
+		return builder.build();
+	}
+
 	@Override
 	protected Map<String, Table> getTableMap() {
 		Map<String, Table> tableMap = new HashMap<>();
 		String[] tableNames = tables.getTableNames();
 		for (String tableName : tableNames) {
 			tableMap.put(tableName, new ConvexTable(this, tableName));
+			// A "<table>_HISTORY" virtual table is only meaningful (and only
+			// registered) for versioned tables -- a plain table has no
+			// history to show. See ConvexHistoryTable's own class doc.
+			if (tables.getTable(tableName) instanceof VersionedSQLTable) {
+				tableMap.put(tableName + ConvexHistoryTable.SUFFIX, new ConvexHistoryTable(this, tableName));
+			}
 		}
+		// FILES is schema-wide (backed by the node's single shared BlobCAS
+		// store, not any one table) -- registered once, unconditionally, not
+		// per base table. See ConvexFilesTable's own class doc.
+		tableMap.put("FILES", new ConvexFilesTable());
 		return tableMap;
 	}
 
@@ -129,5 +163,71 @@ public class ConvexSchema extends AbstractSchema {
 	 */
 	public ConvexTable getConvexTable(String tableName) {
 		return new ConvexTable(this, tableName);
+	}
+
+	/**
+	 * Creates a secondary index via DDL.
+	 *
+	 * <p>Table/column existence is checked explicitly rather than relying on
+	 * {@link convex.db.lattice.SQLSchema#createIndex}'s return value — that
+	 * method returns {@code false} both when the table doesn't exist in
+	 * *this* schema (e.g. the client's connection default schema isn't the
+	 * one actually holding the table — an easy mistake, since CREATE INDEX
+	 * here has no qualified-name support, see {@code ConvexMeta}) and,
+	 * ambiguously, would otherwise be indistinguishable from a genuine no-op.
+	 * Silently reporting success for the former case previously left a
+	 * client believing an index existed when nothing had actually happened.
+	 *
+	 * @param indexName  SQL index name (for later DROP INDEX lookup)
+	 * @param tableName  Table to index
+	 * @param columnName Column to index
+	 * @param ifNotExists if true, silently succeed if already exists
+	 * @return true if index was created
+	 */
+	public boolean createIndex(String indexName, String tableName, String columnName,
+			boolean ifNotExists) {
+		if (!tables.tableExists(tableName)) {
+			throw new IllegalStateException(
+					"Table \"" + tableName + "\" does not exist in schema \"" + name + "\"");
+		}
+		String[] columnNames = tables.getColumnNames(tableName);
+		boolean columnFound = false;
+		for (String c : columnNames) {
+			if (c.equalsIgnoreCase(columnName)) {
+				columnFound = true;
+				break;
+			}
+		}
+		if (!columnFound) {
+			throw new IllegalStateException(
+					"Column \"" + columnName + "\" does not exist on table \"" + tableName + "\"");
+		}
+
+		if (tables.hasIndex(tableName, columnName)) {
+			if (ifNotExists) return false;
+			throw new IllegalStateException(
+					"Index on " + tableName + "(" + columnName + ") already exists");
+		}
+		boolean created = tables.createIndex(tableName, columnName);
+		if (created) {
+			indexRegistry.put(indexName.toUpperCase(), new String[]{tableName, columnName});
+		}
+		return created;
+	}
+
+	/**
+	 * Drops a secondary index by its SQL name.
+	 *
+	 * @param indexName SQL index name
+	 * @param ifExists  if true, silently succeed if not found
+	 * @return true if index was dropped
+	 */
+	public boolean dropIndex(String indexName, boolean ifExists) {
+		String[] pair = indexRegistry.remove(indexName.toUpperCase());
+		if (pair == null) {
+			if (ifExists) return false;
+			throw new IllegalStateException("Index not found: " + indexName);
+		}
+		return tables.dropIndex(pair[0], pair[1]);
 	}
 }

@@ -47,4 +47,17 @@ public class PgProtocolHandlerTest {
 		// ... but an operator alongside such a literal still counts
 		assertTrue(PgProtocolHandler.hasRegexOperator("SELECT * FROM t WHERE path = '~/data' AND name ~ 'x'"));
 	}
+
+	/** A ";" inside a string literal or a quoted identifier does not end the statement. */
+	@org.junit.jupiter.api.Test
+	void splitStatementsRespectsQuotes() {
+		org.junit.jupiter.api.Assertions.assertArrayEquals(
+			new String[] {"SELECT 1", " SELECT 2"}, PgProtocolHandler.splitStatements("SELECT 1; SELECT 2"));
+		org.junit.jupiter.api.Assertions.assertArrayEquals(
+			new String[] {"INSERT INTO t (NOTE) VALUES ('a -> b; c -> d')"},
+			PgProtocolHandler.splitStatements("INSERT INTO t (NOTE) VALUES ('a -> b; c -> d')"));
+		org.junit.jupiter.api.Assertions.assertArrayEquals(
+			new String[] {"SELECT 'it''s; fine'", " SELECT \"odd;name\" FROM t", ""},
+			PgProtocolHandler.splitStatements("SELECT 'it''s; fine'; SELECT \"odd;name\" FROM t;"));
+	}
 }

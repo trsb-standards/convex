@@ -59,9 +59,10 @@ public class SQLDatabaseTest {
 		boolean duplicate = tables.createTable("users", new String[]{"id"});
 		assertFalse(duplicate);
 
-		// Check schema
+		// Check schema (OWNERID is auto-appended to every table -- see
+		// SQLSchema#OWNERID_COLUMN)
 		String[] columns = tables.getColumnNames("users");
-		assertArrayEquals(new String[]{"id", "name", "email"}, columns);
+		assertArrayEquals(new String[]{"id", "name", "email", "OWNERID"}, columns);
 	}
 
 	@Test
