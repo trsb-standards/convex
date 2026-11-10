@@ -38,8 +38,8 @@ public class ConvexMeta extends CalciteMetaImpl {
 	/** The forked database for the current transaction, or null if not in a transaction. */
 	private SQLDatabase txDatabase;
 
-	/** The original ConvexSchema to restore on commit/rollback. */
-	private ConvexSchema originalSchema;
+	/** The connection's ConvexSchema bound to {@link #txDatabase}, to unbind on commit/rollback. */
+	private ConvexSchema txSchema;
 
 	/** JDBC-level autoCommit state. Initialised to true (JDBC default).
 	 *  Transitions detected from connProps (not result) since Calcite's
@@ -150,7 +150,7 @@ public class ConvexMeta extends CalciteMetaImpl {
 		return result;
 	}
 
-	/** Forks the SQLDatabase and swaps the connection's schema to the fork. */
+	/** Forks the SQLDatabase and binds the connection's schema to the fork. */
 	private void beginTransaction() {
 		SQLDatabase db = findDatabase();
 		if (db == null) return;
@@ -161,23 +161,21 @@ public class ConvexMeta extends CalciteMetaImpl {
 		ConvexSchema currentSchema = findConvexSchema(schemaName);
 		if (currentSchema == null) return;
 
-		originalSchema = currentSchema;
+		// The connection's own schema is bound to the fork, not replaced by a schema
+		// over it: a statement prepared before the transaction, or in an earlier one,
+		// holds this schema's tables and so writes into the current fork (#835, #798)
+		txSchema = currentSchema;
 		txDatabase = db.fork();
-
-		ConvexSchema txSchema = new ConvexSchema(txDatabase, schemaName);
-		calciteConnection.getRootSchema().add(schemaName, txSchema);
+		txSchema.bindTransaction(txDatabase);
 	}
 
-	/** Restores the original schema and discards the fork. */
+	/** Binds the connection's schema back to its database and discards the fork. */
 	private void endTransaction() {
 		if (txDatabase == null) return;
 
-		String schemaName = getSchemaName();
-		if (schemaName != null && originalSchema != null) {
-			calciteConnection.getRootSchema().add(schemaName, originalSchema);
-		}
+		if (txSchema != null) txSchema.bindTransaction(null);
 		txDatabase = null;
-		originalSchema = null;
+		txSchema = null;
 	}
 
 	private String getSchemaName() {

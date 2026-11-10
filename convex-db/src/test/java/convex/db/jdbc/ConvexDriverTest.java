@@ -358,6 +358,70 @@ public class ConvexDriverTest {
 		}
 	}
 
+	/** Rows of t, by id, as "id:v". */
+	private static List<String> rowsOf(Statement stmt) throws SQLException {
+		List<String> rows = new ArrayList<>();
+		try (ResultSet rs = stmt.executeQuery("SELECT id, v FROM t ORDER BY id")) {
+			while (rs.next()) rows.add(rs.getLong(1) + ":" + rs.getString(2));
+		}
+		return rows;
+	}
+
+	/** #835: a statement prepared in a transaction keeps writing after its commit. */
+	@Test
+	public void testPreparedStatementReusedAfterCommitKeepsItsWrites() throws Exception {
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:reuse_after_commit");
+				Statement stmt = conn.createStatement()) {
+			stmt.execute("CREATE TABLE t (id INTEGER, v VARCHAR)");
+			conn.setAutoCommit(false);
+			java.sql.PreparedStatement insert = conn.prepareStatement("INSERT INTO t VALUES (?, ?)");
+			for (int i = 1; i <= 3; i++) {
+				insert.setLong(1, i);
+				insert.setString(2, "v" + i);
+				assertEquals(1, insert.executeUpdate());
+				conn.commit();
+			}
+			java.sql.PreparedStatement update = conn.prepareStatement("UPDATE t SET v = ? WHERE id = ?");
+			update.setString(1, "a");
+			update.setLong(2, 1);
+			update.executeUpdate();
+			conn.commit();
+			update.setString(1, "b");
+			update.setLong(2, 2);
+			update.executeUpdate();
+			conn.commit();
+			java.sql.PreparedStatement delete = conn.prepareStatement("DELETE FROM t WHERE id = ?");
+			delete.setLong(1, 3);
+			delete.executeUpdate();
+			conn.commit();
+			conn.setAutoCommit(true);
+			assertEquals(List.of("1:a", "2:b"), rowsOf(stmt));
+		}
+	}
+
+	/** #798: a statement prepared before a transaction runs in it, and a rollback discards its write. */
+	@Test
+	public void testPreparedStatementRunsInTheTransactionOpenWhenItRuns() throws Exception {
+		try (Connection conn = DriverManager.getConnection("jdbc:convex:prepared_before_tx");
+				Connection other = DriverManager.getConnection("jdbc:convex:prepared_before_tx");
+				Statement stmt = conn.createStatement();
+				Statement otherStmt = other.createStatement()) {
+			stmt.execute("CREATE TABLE t (id INTEGER, v VARCHAR)");
+			java.sql.PreparedStatement insert = conn.prepareStatement("INSERT INTO t VALUES (?, ?)");
+			conn.setAutoCommit(false);
+			insert.setLong(1, 1);
+			insert.setString(2, "x");
+			insert.executeUpdate();
+			assertEquals(List.of(), rowsOf(otherStmt), "not visible before the commit");
+			conn.rollback();
+			insert.setLong(1, 2);
+			insert.setString(2, "y");
+			insert.executeUpdate();
+			conn.commit();
+			assertEquals(List.of("2:y"), rowsOf(otherStmt), "the rolled back row is gone, the committed one is there");
+		}
+	}
+
 	// ========== Direct API ==========
 
 	@Test

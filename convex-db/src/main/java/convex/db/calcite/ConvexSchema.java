@@ -23,8 +23,15 @@ import convex.db.lattice.SQLSchema;
  */
 public class ConvexSchema extends AbstractSchema {
 
-	private final SQLDatabase database;
-	private final SQLSchema tables;
+	/** The database a schema reads and writes now, with its tables. */
+	private record Binding(SQLDatabase database, SQLSchema tables) {
+		Binding(SQLDatabase database) {
+			this(database, database.tables());
+		}
+	}
+
+	private final SQLDatabase base;
+	private volatile Binding binding;
 	private final String name;
 
 	/**
@@ -34,18 +41,42 @@ public class ConvexSchema extends AbstractSchema {
 	 * @param name Schema name
 	 */
 	public ConvexSchema(SQLDatabase database, String name) {
-		this.database = database;
-		this.tables = database.tables();
+		this.base = database;
+		this.binding = new Binding(database);
 		this.name = name;
 	}
 
 	/**
-	 * Gets the underlying SQLDatabase.
+	 * Gets the SQLDatabase this schema reads and writes now: a transaction's
+	 * fork while one is open on it ({@link #bindTransaction}), else the
+	 * database it was made with.
 	 *
 	 * @return The SQLDatabase backing this schema
 	 */
 	public SQLDatabase getDatabase() {
-		return database;
+		return binding.database();
+	}
+
+	/**
+	 * Binds this schema to a transaction's fork of its database, or back to
+	 * the database itself. A plan prepared on this schema reaches its tables
+	 * when it runs, not when it is prepared, so a statement prepared before a
+	 * transaction, or in an earlier one, runs in the current transaction.
+	 *
+	 * @param fork Fork of this schema's database, or null to end the transaction
+	 */
+	public void bindTransaction(SQLDatabase fork) {
+		this.binding = new Binding((fork == null) ? base : fork);
+	}
+
+	/**
+	 * Gets the database this schema was made with, whichever transaction it
+	 * is bound to.
+	 *
+	 * @return The SQLDatabase this schema was created with
+	 */
+	public SQLDatabase getBaseDatabase() {
+		return base;
 	}
 
 	@Override
@@ -56,7 +87,7 @@ public class ConvexSchema extends AbstractSchema {
 	@Override
 	protected Map<String, Table> getTableMap() {
 		Map<String, Table> tableMap = new HashMap<>();
-		String[] tableNames = tables.getTableNames();
+		String[] tableNames = getTables().getTableNames();
 		for (String tableName : tableNames) {
 			tableMap.put(tableName, new ConvexTable(this, tableName));
 		}
@@ -76,7 +107,7 @@ public class ConvexSchema extends AbstractSchema {
 	 * @return SQLSchema backing store
 	 */
 	public SQLSchema getTables() {
-		return tables;
+		return binding.tables();
 	}
 
 	/**
@@ -96,7 +127,7 @@ public class ConvexSchema extends AbstractSchema {
 	 * @return true if table was created, false if it already exists
 	 */
 	public boolean createTable(String tableName, String... columnNames) {
-		return tables.createTable(tableName, columnNames);
+		return getTables().createTable(tableName, columnNames);
 	}
 
 	/**
@@ -108,7 +139,7 @@ public class ConvexSchema extends AbstractSchema {
 	 * @return true if table was dropped, false if it didn't exist
 	 */
 	public boolean dropTable(String tableName) {
-		return tables.dropTable(tableName);
+		return getTables().dropTable(tableName);
 	}
 
 	/**
@@ -118,7 +149,7 @@ public class ConvexSchema extends AbstractSchema {
 	 * @return true if table exists
 	 */
 	public boolean tableExists(String tableName) {
-		return tables.tableExists(tableName);
+		return getTables().tableExists(tableName);
 	}
 
 	/**
