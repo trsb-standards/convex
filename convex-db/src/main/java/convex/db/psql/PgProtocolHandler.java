@@ -730,6 +730,14 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		}
 
 		String jdbcSql = jdbcSql(sql);
+		if (!isNamed(stmt)) {
+			// A portal of a statement since parsed again under its name: as in PostgreSQL it
+			// runs the old query, on a JDBC statement kept for no one, so closed after it (#801)
+			try (PreparedStatement once = connection.prepareStatement(jdbcSql)) {
+				writeExecuted(ctx, once, bindAndExecute(once, paramValues, paramFormats, paramTypes), sql, resultFormats);
+			}
+			return;
+		}
 		boolean kept = jdbcStatements.containsKey(stmt);
 		PreparedStatement pstmt = keptStatement(stmt, jdbcSql);
 		boolean hasResultSet;
@@ -741,6 +749,20 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 			pstmt = prepareAgain(stmt, pstmt, jdbcSql);
 			hasResultSet = bindAndExecute(pstmt, paramValues, paramFormats, paramTypes);
 		}
+		writeExecuted(ctx, pstmt, hasResultSet, sql, resultFormats);
+	}
+
+	/** Whether a statement is still the one its name maps to, not one parsed again since. */
+	private boolean isNamed(PreparedStmt stmt) {
+		for (PreparedStmt named : statements.values()) {
+			if (named == stmt) return true;
+		}
+		return false;
+	}
+
+	/** Answers an executed statement: its rows, or the command and the rows it changed. */
+	private void writeExecuted(ChannelHandlerContext ctx, PreparedStatement pstmt, boolean hasResultSet, String sql,
+			short[] resultFormats) throws SQLException {
 		if (hasResultSet) {
 			try (ResultSet rs = pstmt.getResultSet()) {
 				sendResultSet(ctx, rs, false, resultFormats);
@@ -846,6 +868,12 @@ public class PgProtocolHandler extends ChannelInboundHandlerAdapter {
 		}
 		String jdbcSql = jdbcSql(sql);
 		if (!returnsRows(jdbcSql)) return null;
+		if (!isNamed(stmt)) {
+			// A portal of a replaced statement keeps no JDBC statement (#801)
+			try (PreparedStatement once = connection.prepareStatement(jdbcSql)) {
+				return describe(once);
+			}
+		}
 		return describe(keptStatement(stmt, jdbcSql));
 	}
 

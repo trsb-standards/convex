@@ -175,6 +175,26 @@ public class PgExtendedQueryTest {
 		assertEquals(0, openStatements.get());
 	}
 
+	/** #801: a portal of a replaced statement runs the old query on a JDBC statement that is closed after it. */
+	@Test
+	public void testPortalOfReplacedStatementKeepsNoStatement() {
+		parse("s1", "SELECT name FROM users WHERE id = $1", PgType.INT8);
+		channel.writeInbound(new PgMessageDecoder.Bind("p", "s1", new short[] {0},
+			new byte[][] {"2".getBytes(StandardCharsets.UTF_8)}, new short[0]));
+		channel.writeInbound(new PgMessageDecoder.Parse("s1", "SELECT email FROM users WHERE id = $1", new int[] {PgType.INT8}));
+		channel.writeInbound(new PgMessageDecoder.Execute("p", 0));
+		channel.writeInbound(PgMessageDecoder.Sync.INSTANCE);
+		assertEquals("21D[Bob]CZ", responses(), "the portal runs the query it was bound to");
+		assertEquals(0, openStatements.get(), "and keeps no JDBC statement for it");
+
+		assertEquals("2D[bob@example.com]CZ", run("s1", "2"));
+		assertEquals(1, openStatements.get(), "the statement now named s1 keeps its own");
+		channel.writeInbound(new PgMessageDecoder.Close((byte) 'S', "s1"));
+		channel.writeInbound(PgMessageDecoder.Sync.INSTANCE);
+		assertEquals("3Z", responses());
+		assertEquals(0, openStatements.get());
+	}
+
 	/** A later execution binds only its own values: a parameter it does not supply is not the previous one. */
 	@Test
 	public void testParametersClearedBetweenExecutions() {
